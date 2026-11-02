@@ -4,7 +4,9 @@ A local CLI bridge that connects your AI command-line tools (Codex, Claude, Gemi
 
 ## Quick Start
 
-The **connection token** is generated from the web application that uses the AI Bridge server package (for example, `php artisan ai-bridge:token` for Laravel apps). The **server URL** is the WebSocket server address provided by that application (typically `wss://your-app.com/api/ai-bridge/ws`).
+**You need** Node 20 or newer with `npm`, and at least one of the Claude, Codex or Gemini CLIs installed and signed in. Without a browser on the machine, see [A server nobody signs into in a browser](#running-in-the-background).
+
+The **connection token** and **server URL** come from the web application that uses the bridge. **On Engram, you do not assemble anything:** Settings, Machines gives you the whole command, and every Engram has a step-by-step guide at `/connect-your-machine`. On an application using the AI Bridge server package, `php artisan ai-bridge:token` (Laravel) makes the token, and the URL is typically `wss://your-app.com/api/ai-bridge/ws`.
 
 ```bash
 npx @tetrixdev/ai-bridge --server wss://your-app.com/api/ai-bridge/ws --token YOUR_CONNECTION_TOKEN
@@ -25,10 +27,14 @@ usually wants to start when the machine does. `install` sets that up — a user
 service on Linux, a launch agent on macOS:
 
 ```bash
-ai-bridge install --server wss://your-app.com/api/ai-bridge/ws --token YOUR_TOKEN --allow-dir ~/work
-ai-bridge list
-ai-bridge uninstall your-app-com
+npx @tetrixdev/ai-bridge install --server wss://your-app.com/api/ai-bridge/ws --token YOUR_TOKEN --allow-dir ~/work
+npx @tetrixdev/ai-bridge list
+npx @tetrixdev/ai-bridge uninstall your-app-com
 ```
+
+(`ai-bridge` alone works only after a global install; the tables below shorten it to that.)
+
+The service's `PATH` is its own: `~/.local/bin`, `~/.nvm/versions/node/current/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`. A Node that only your shell finds is not the one it will run on.
 
 **Every install has a name, and more than one can run at once.** The name
 defaults to the server's hostname, so pointing this machine at a second
