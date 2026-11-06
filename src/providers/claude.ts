@@ -1076,6 +1076,12 @@ export class ClaudeAdapter extends ProviderAdapter {
 
             return;
           }
+          // A helper's streamed chunk is not forwarded (the mapper skips it,
+          // and its whole `assistant` twin carries the content), but it is
+          // still the helper talking: it counts as activity for the silence
+          // clock, exactly as the whole message does when it is emitted. The
+          // same test as the mapper's guard, so what it skips is what counts.
+          if (parsed['parent_tool_use_id'] != null) timeouts?.notice();
           const mainEvent = acceptsInput && parentOf(parsed).parent_tool_use_id === undefined
             ? parsed['event'] as Record<string, unknown> | undefined
             : undefined;
