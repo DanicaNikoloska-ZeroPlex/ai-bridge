@@ -477,6 +477,12 @@ export class ClaudeAdapter extends ProviderAdapter {
        * ended any other way than `completed` never gets one.
        */
       const waitingHelpers = new Map<string, number | null>();
+      /**
+       * The last closing report (`summary`) a waiting helper sent, on the
+       * frame forwarded as `updated` `waiting`. Carried on the end the bridge
+       * sends when no resume comes, so the report is not lost.
+       */
+      const waitingSummaries = new Map<string, string>();
       /** Main-assistant background helpers, kept past their end so a resumed one is counted again. */
       const mainBackgroundHelpers = new Set<string>();
       const resumeWindowMs = this.helperResumeWindowMs();
@@ -605,6 +611,7 @@ export class ClaudeAdapter extends ProviderAdapter {
         if (task.phase === 'started') {
           runningTasks.add(task.task_id);
           if (waitingHelpers.delete(task.task_id)) {
+            waitingSummaries.delete(task.task_id);
             // The CLI woke a waiting helper: it runs again, and if the main
             // assistant started it, the CLI owes it a turn again when it ends.
             log.info('A waiting helper was resumed', { requestId, taskId: task.task_id });
@@ -629,10 +636,16 @@ export class ClaudeAdapter extends ProviderAdapter {
                 log.info('A helper stopped while its own work runs — waiting for it', { requestId, taskId: task.task_id });
               }
               // Its second ending frame (`updated`, then `finished`) too.
-              if (waitingHelpers.has(task.task_id)) shown = 'waiting';
-            } else if (waitingHelpers.delete(task.task_id) && waitingHelpers.size === 0) {
-              // Failed, killed, stopped: nothing will resume it.
-              clearResumeTimer();
+              if (waitingHelpers.has(task.task_id)) {
+                shown = 'waiting';
+                if (typeof task.summary === 'string' && task.summary !== '') waitingSummaries.set(task.task_id, task.summary);
+              }
+            } else {
+              waitingSummaries.delete(task.task_id);
+              if (waitingHelpers.delete(task.task_id) && waitingHelpers.size === 0) {
+                // Failed, killed, stopped: nothing will resume it.
+                clearResumeTimer();
+              }
             }
           }
           openResumeWindows();
@@ -806,8 +819,11 @@ export class ClaudeAdapter extends ProviderAdapter {
             if (deadline !== null && deadline <= now) {
               log.info('No resume of a waiting helper within the window', { requestId, taskId: helperId });
               waitingHelpers.delete(helperId);
-              // It was shown as waiting; this is its real end.
+              // It was shown as waiting; this is its real end, with the last
+              // report it sent while waiting (PROTOCOL.md, `task`).
               const started = startedTasks.get(helperId);
+              const summary = waitingSummaries.get(helperId);
+              waitingSummaries.delete(helperId);
               emitWholeMessage({
                 event: 'task',
                 data: {
@@ -816,6 +832,7 @@ export class ClaudeAdapter extends ProviderAdapter {
                   ...(started?.toolUseId !== undefined ? { tool_use_id: started.toolUseId } : {}),
                   ...(started?.taskType !== undefined ? { task_type: started.taskType } : {}),
                   status: 'completed',
+                  ...(summary !== undefined ? { summary } : {}),
                 },
               });
             } else if (deadline !== null) {

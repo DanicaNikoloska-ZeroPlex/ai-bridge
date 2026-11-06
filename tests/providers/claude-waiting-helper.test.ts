@@ -238,4 +238,46 @@ describe('a helper waiting on its own work', () => {
     expect(last.data).toMatchObject({ phase: 'updated', task_id: 'a1', tool_use_id: 'toolu_a1', task_type: 'local_agent', status: 'completed' });
     expect(turn.events.indexOf(last)).toBeLessThan(turn.events.findIndex((e) => e.event === 'input_closed'));
   });
+
+  it('carries the last report it sent while waiting on that end', async () => {
+    const steps: Step[] = [
+      echo('go'), init,
+      helperStarted('a1'), text('Launched.'), result(),
+      helperCalls('a1', 'b1', 'Bash'), helperCommand('b1'),
+      ...ended('a1'),
+      ...notificationTurn('Waiting.'),
+      ...ended('b1'),
+      { waitEof: true },
+    ];
+    const turn = await run(steps, 300);
+    const a1 = of(turn.events, 'task')
+      .map((e) => e.data as { task_id: string; phase: string; status?: string; summary?: string })
+      .filter((d) => d.task_id === 'a1')
+      .map((d) => [d.phase, d.status, d.summary]);
+
+    expect(a1).toEqual([
+      ['started', undefined, undefined],
+      ['updated', 'waiting', undefined], ['updated', 'waiting', 'a1'],
+      ['updated', 'completed', 'a1'],
+    ]);
+  });
+
+  it('carries no report on that end when it sent none', async () => {
+    const steps: Step[] = [
+      echo('go'), init,
+      helperStarted('a1'), text('Launched.'), result(),
+      helperCalls('a1', 'b1', 'Bash'), helperCommand('b1'),
+      line({ type: 'system', subtype: 'task_updated', task_id: 'a1', patch: { status: 'completed', end_time: 1 } }),
+      line({ type: 'system', subtype: 'task_notification', task_id: 'a1', tool_use_id: 'toolu_a1', status: 'completed' }),
+      ...notificationTurn('Waiting.'),
+      ...ended('b1'),
+      { waitEof: true },
+    ];
+    const turn = await run(steps, 300);
+    const a1 = turn.events.filter((e) => e.event === 'task' && (e.data as { task_id?: string }).task_id === 'a1');
+    const last = a1[a1.length - 1]!;
+
+    expect(last.data).toMatchObject({ phase: 'updated', status: 'completed' });
+    expect(last.data).not.toHaveProperty('summary');
+  });
 });

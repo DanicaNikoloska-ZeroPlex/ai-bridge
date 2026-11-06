@@ -1550,8 +1550,10 @@ export interface TaskData {
   /** How it went: `completed`, `failed`, `stopped`, `killed`… Updated and finished only. */
   status?: string;
   /**
-   * The helper's closing report. Finished only. Bounded to 8 KB, cut on a
-   * character boundary and marked as cut.
+   * The helper's closing report. Finished only, and on the frames a waiting
+   * helper's `finished` is forwarded as (`updated` `waiting`) and on the
+   * `updated` `completed` the bridge ends it with when no resume comes.
+   * Bounded to 8 KB, cut on a character boundary and marked as cut.
    */
   summary?: string;
   /** Running totals. Progress and finished only. */
