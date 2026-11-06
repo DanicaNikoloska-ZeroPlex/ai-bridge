@@ -1281,6 +1281,11 @@ export interface StreamAckMessage {
   type: 'stream_ack';
   request_id: string;
   seq: number;
+  /**
+   * The turn is over on the server's side: the bridge drops what it keeps of
+   * it, and stops it, silently, if it still runs.
+   */
+  closed?: boolean;
 }
 
 export type ServerToBridgeMessage =

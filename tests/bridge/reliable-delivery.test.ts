@@ -11,11 +11,14 @@ import { WebSocketServer, type WebSocket as WsSocket } from 'ws';
 import { Bridge } from '../../src/bridge.js';
 import { ProviderAdapter, type AdapterStreamEvent, type ExecutionContext } from '../../src/providers/base.js';
 import type { ModelInfo } from '../../src/protocol/types.js';
+import { StreamOutbox } from '../../src/protocol/outbox.js';
 
 /** Emits what the test tells it to, and runs until finished or aborted. */
 class StepAdapter extends ProviderAdapter {
   readonly providerName = 'fake';
   aborted = false;
+  /** False: an abort only marks it, and the test ends it with finish(), like a CLI winding down. */
+  finishOnAbort = true;
   emit: (e: AdapterStreamEvent) => void = () => {};
   finish: () => void = () => {};
 
@@ -30,7 +33,7 @@ class StepAdapter extends ProviderAdapter {
         onEvent({ event: 'done', data: {} });
         resolve('sess-1');
       };
-      context.signal.addEventListener('abort', () => { this.aborted = true; this.finish(); }, { once: true });
+      context.signal.addEventListener('abort', () => { this.aborted = true; if (this.finishOnAbort) this.finish(); }, { once: true });
     });
   }
   delta(text: string): void {
@@ -261,7 +264,7 @@ describe('against a server with reliable delivery', () => {
     const inFlight = internals.toolResolver.call(() => {}, 'req_1', 'tc-1', 'lookup', {});
 
     await drop();
-    await expect(inFlight).rejects.toThrow(/result was lost.*not sent again/);
+    await expect(inFlight).rejects.toThrow(/Result unknown.*may or may not have run.*not called again/);
 
     let reached = false;
     void internals.serverReachable().then(() => { reached = true; });
@@ -286,7 +289,7 @@ describe('against a server with reliable delivery', () => {
     // The reconnect comes, but the server does not answer within the grace.
     const hello = await nextConnection();
     expect(hello['running_turns']).toEqual([{ request_id: 'req_1', last_acked_seq: 0 }]);
-    await expect(waiting).rejects.toThrow(/grace period ended/);
+    await expect(waiting).rejects.toThrow(/Not done: .*nothing was sent/);
     expect(adapter.aborted).toBe(true);
 
     welcome(2);
@@ -365,6 +368,132 @@ describe('against a server with reliable delivery', () => {
 
     expect(streamOf('req_1').slice(before)[0]).toMatchObject({ event: 'block_delta', seq: 1 });
   });
+});
+
+describe('turn messages, final frames, closed turns and bounds', () => {
+  const closedAck = (id: string, seq: number): void => socket.send(JSON.stringify({ type: 'stream_ack', request_id: id, seq, closed: true }));
+  const indexOf = (match: (f: Frame) => boolean, conn: number): number => frames.findIndex((f) => f.conn === conn && match(f.frame));
+
+  it('keeps a cancelled that is due during a drop, and sends it after the turn\'s re-sent frames', async () => {
+    await start(120);
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    adapter.finishOnAbort = false;
+    socket.send(JSON.stringify({ type: 'cancel', request_id: 'req_1' }));
+    await sleep(30);
+    expect(adapter.aborted).toBe(true);
+
+    await drop();
+    adapter.finish(); // done (kept), then cancelled (held)
+    await sleep(20);
+    await nextConnection();
+    welcome(120);
+
+    await waitFor((f, c) => c === 2 && f['type'] === 'cancelled', 'the kept cancelled');
+    expect(indexOf((f) => f['event'] === 'done', 2)).toBeLessThan(indexOf((f) => f['type'] === 'cancelled', 2));
+    expect(frames.filter((f) => f.frame['type'] === 'cancelled')).toHaveLength(1);
+  }, 10_000);
+
+  it('never gives up on a finished answer the server is slow to confirm: it sends it again', async () => {
+    await start(120, 200);
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    await drop();
+    adapter.delta('a');
+    adapter.finish();
+    await nextConnection();
+    welcome(120);
+    await waitFor((f, c) => c === 2 && f['event'] === 'done', 'the re-sent done');
+
+    // No ack for well past the re-attach timeout: written again, not aborted.
+    await sleep(500);
+    expect(streamOf('req_1', 2).filter((f) => f['event'] === 'done').length).toBeGreaterThanOrEqual(2);
+    expect(frames.some((f) => f.frame['code'] === 'bridge_disconnected')).toBe(false);
+
+    ack('req_1', 2);
+    await sleep(30);
+    expect(bridge!.isIdle()).toBe(true);
+  }, 10_000);
+
+  it('stops a running turn when the server says it is closed: no more stream frames, one cancelled', async () => {
+    await start(120);
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    adapter.delta('a');
+    await waitFor((f) => f['seq'] === 1, 'frame 1');
+    const before = frames.length;
+
+    closedAck('req_1', 1);
+    await sleep(50);
+    expect(adapter.aborted).toBe(true);
+    // No more stream frames (no done), and exactly one unnumbered cancelled.
+    const after = frames.slice(before).filter((f) => f.frame['request_id'] === 'req_1').map((f) => f.frame);
+    expect(after).toEqual([{ type: 'cancelled', request_id: 'req_1' }]);
+    expect(bridge!.isIdle()).toBe(true);
+  });
+
+  it('drops the cancelled of a closed turn that stops while the connection is down', async () => {
+    await start(120);
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    adapter.finishOnAbort = false;
+    closedAck('req_1', 0);
+    await sleep(30);
+    expect(adapter.aborted).toBe(true);
+    await drop();
+    adapter.finish();
+    await nextConnection();
+    welcome(120);
+    await sleep(100);
+
+    expect(frames.filter((f) => f.conn === 2 && f.frame['request_id'] === 'req_1')).toEqual([]);
+    expect(bridge!.isIdle()).toBe(true);
+  }, 10_000);
+
+  it('releases a turn whose re-sent frames are answered closed after a reconnect', async () => {
+    await start(120, 200);
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    adapter.finish();
+    await waitFor((f) => f['event'] === 'done', 'done');
+    expect(bridge!.isIdle()).toBe(false);
+
+    await drop();
+    await nextConnection();
+    welcome(120);
+    await waitFor((f, c) => c === 2 && f['event'] === 'done', 'the re-sent done');
+    closedAck('req_1', 0);
+    await sleep(400);
+
+    expect(bridge!.isIdle()).toBe(true);
+    expect(streamOf('req_1', 2)).toHaveLength(1); // not sent again after the close
+    expect(frames.some((f) => f.frame['code'] === 'bridge_disconnected')).toBe(false);
+  }, 10_000);
+
+  it('stops a turn whose kept output outgrows the bound during a drop, and says so after the reconnect', async () => {
+    await start(120);
+    (bridge as unknown as { outbox: StreamOutbox }).outbox = new StreamOutbox({
+      turnBytes: 1_000_000, turnFrames: 3, totalBytes: 1_000_000, totalFrames: 100,
+    });
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    await drop();
+    for (const t of ['a', 'b', 'c', 'd']) adapter.delta(t);
+    expect(adapter.aborted).toBe(true);
+
+    await nextConnection();
+    welcome(120);
+    const report = await waitFor((f) => f['code'] === 'bridge_disconnected', 'the report');
+    expect(report['request_id']).toBe('req_1');
+    expect(report['message']).toMatch(/grew larger than this machine keeps.*Send the message again/);
+    expect(bridge!.isIdle()).toBe(true);
+  }, 10_000);
 });
 
 describe('against a server without reliable delivery', () => {

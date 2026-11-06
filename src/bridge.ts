@@ -210,12 +210,47 @@ export interface BridgeOptions {
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
 
-/** `welcome.config.reconnect_grace_seconds` when the value is not a number. */
+/**
+ * `welcome.config.reconnect_grace_seconds` when the value is not a number.
+ * The two minutes the deliverable names as a short drop: a laptop lid closed
+ * and opened, a Wi-Fi switch, a server deploy. Only used for a malformed
+ * value; a server that sends a number gets that number.
+ */
 const DEFAULT_RECONNECT_GRACE_SECONDS = 120;
-/** No turn is kept waiting for a server longer than this, whatever it asks. */
+/**
+ * No turn is kept waiting for a server longer than this, whatever it asks.
+ * Not a tuning value but a backstop against a bad one: it matches the longest
+ * the bridge ever waits for a server's answer to a tool call
+ * (TOOL_RESOLVE_TIMEOUT_MAX_S), and the outbox bounds (DEFAULT_OUTBOX_LIMITS)
+ * keep memory in check for that long.
+ */
 const MAX_RECONNECT_GRACE_SECONDS = 3600;
-/** See BridgeOptions.reattachAckTimeoutMs. */
+/**
+ * See BridgeOptions.reattachAckTimeoutMs. The server acks each frame as it
+ * stores it, so a server that holds the turn answers within one round trip;
+ * 30 s is the bridge's own heartbeat interval, which is the time it already
+ * gives a quiet server before thinking anything of it. A turn whose final
+ * frame is still unconfirmed is never given up on this clock (see
+ * armReattachCheck()).
+ */
 const DEFAULT_REATTACH_ACK_TIMEOUT_MS = 30_000;
+/*
+ * What the assistant is told when work that needs the server cannot happen.
+ * These strings are what it acts on, so each says whether the action
+ * happened and what to do next, in words it can pass on to the person.
+ */
+/** Work that waited for the reconnect (a tool call, a file handed back): never sent. */
+const NOT_DONE_DROP = 'Not done: the connection to the server was lost and did not come back in time, so nothing was sent '
+  + '(no tool was called, no file was handed over). Tell the person it did not happen, and offer to try again once the connection is back.';
+const NOT_DONE_SHUTDOWN = 'Not done: the bridge on this machine is shutting down, so nothing was sent '
+  + '(no tool was called, no file was handed over). Tell the person it did not happen; it can be tried again once the bridge runs again.';
+/** A tool call already sent: the server may have run it, and its answer is gone. */
+const RESULT_UNKNOWN_DROP = 'Result unknown: the connection to the server was lost while this tool call was running, so its answer never arrived. '
+  + 'The tool may or may not have run, and it was not called again. Check its effect before repeating it, and tell the person if you cannot.';
+const RESULT_UNKNOWN_SHUTDOWN = 'Result unknown: the bridge on this machine is shutting down while this tool call was running, so its answer never arrived. '
+  + 'The tool may or may not have run. Tell the person, and check its effect before repeating it.';
+/** Turn-scoped messages kept through a drop (see heldMessages); the oldest go first past this. */
+const MAX_HELD_MESSAGES = 1000;
 
 /**
  * The wall-clock backstop for a turn.
@@ -251,6 +286,8 @@ interface DisconnectedTurn {
   ended: boolean;
   /** The server is back and waiting to hear about it. */
   due: boolean;
+  /** Why it is reported: the connection dropped (default), or it outgrew the outbox. */
+  reason?: 'outbox_full';
 }
 
 const MAX_RECONNECT_ATTEMPTS = 100;
@@ -563,6 +600,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   /** Re-attached turns waiting for their first confirmation on the new connection. */
   private readonly reattachTimers = new Map<string, ReturnType<typeof setTimeout> | null>();
   private readonly reattachAckTimeoutMs: number;
+  /**
+   * Turns the server said are over on its side (`stream_ack` with `closed`):
+   * nothing more of them is sent, until the server starts the id again.
+   */
+  private readonly closedTurns = new Set<string>();
+  /**
+   * Turn-scoped messages other than stream frames (`cancelled`,
+   * `turn_input_ack`, a turn's `error`, ...) produced while the connection is
+   * down in the grace period. Written, in order, after the next welcome.
+   */
+  private heldMessages: BridgeToServerMessage[] = [];
 
   constructor(options: BridgeOptions) {
     super();
@@ -1216,9 +1264,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.stopHeartbeat();
     this.clearReconnectTimer();
     this.clearGraceTimer();
-    this.rejectServerWaiters(new Error('the bridge is shutting down'));
+    this.rejectServerWaiters(new Error(NOT_DONE_SHUTDOWN));
     this.clearReattachTimers();
-    this.toolResolver.cancelAll();
+    this.toolResolver.cancelAll(RESULT_UNKNOWN_SHUTDOWN);
     for (const upload of this.incomingUploads.values()) upload.abort.abort(new Error('the bridge is shutting down'));
     // A file being handed back streams over its own HTTP request, which would
     // otherwise keep going after the socket that asked for it is gone.
@@ -1507,10 +1555,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // the server answers a call over the connection it came in on, so the
     // answer to one in flight is gone with it. Asking again could run the tool
     // twice, so the call fails, and says why.
-    this.toolResolver.cancelAll(keepTurns
-      ? 'Tool call failed: the connection to the server dropped while it was running, so its result was lost. '
-        + 'It was not sent again, because the server may already have run it.'
-      : undefined);
+    this.toolResolver.cancelAll(RESULT_UNKNOWN_DROP);
 
     // An upload cannot be confirmed over a socket that is gone, so its partial
     // file is removed now rather than when a stall timer notices.
@@ -1597,7 +1642,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private endGrace(why: string): void {
     this.clearGraceTimer();
     log.warn('Stopping the turns kept through the drop', { reason: why, turns: this.outbox.requestIds() });
-    this.rejectServerWaiters(new Error(`the connection to the server is gone: ${why}`));
+    this.rejectServerWaiters(new Error(NOT_DONE_DROP));
     this.abortTurnsForDisconnect();
   }
 
@@ -1650,11 +1695,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * `stream_ack`: the server stored a turn's frames up to `seq`. Trims the
    * outbox, and lets go of a turn the server has ended once it has ended here.
    */
-  private handleStreamAck(message: { request_id?: unknown; seq?: unknown }): void {
+  private handleStreamAck(message: { request_id?: unknown; seq?: unknown; closed?: unknown }): void {
     const requestId = message.request_id;
     const seq = message.seq;
     if (typeof requestId !== 'string' || typeof seq !== 'number' || !Number.isInteger(seq) || seq < 0) {
       log.warn('Dropping a malformed stream_ack');
+
+      return;
+    }
+
+    if (message.closed === true) {
+      this.closeTurnForServer(requestId);
 
       return;
     }
@@ -1671,33 +1722,85 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   }
 
   /**
+   * `stream_ack` with `closed: true`: the turn is over on the server's side
+   * (it ended it, or no longer holds it). Nothing of it is kept or sent any
+   * more; a turn still running here is stopped the way a cancel stops it,
+   * sends no further stream frames, and ends with one unnumbered `cancelled`
+   * naming its unread messages (see the request's finally). A turn that had
+   * already finished sends nothing.
+   */
+  private closeTurnForServer(requestId: string): void {
+    log.info('The server says this turn is over; letting go of it', { requestId });
+    this.outbox.forget(requestId);
+    this.clearReattachTimer(requestId);
+    this.disconnectedTurns = this.disconnectedTurns.filter((t) => t.requestId !== requestId);
+    this.heldMessages = this.heldMessages.filter((m) => (m as { request_id?: unknown }).request_id !== requestId);
+    this.cancelledRequests.delete(requestId);
+    const controller = this.activeRequests.get(requestId);
+    if (controller === undefined) return;
+    this.closedTurns.add(requestId);
+    controller.abort();
+  }
+
+  private clearReattachTimer(requestId: string): void {
+    const timer = this.reattachTimers.get(requestId);
+    if (timer !== undefined && timer !== null) clearTimeout(timer);
+    this.reattachTimers.delete(requestId);
+  }
+
+  /**
    * A re-attached turn just had a frame written on the new connection: if the
    * server does not confirm it in time, it no longer holds the turn (its own
    * grace period ran out first, say), and the turn is stopped and reported.
+   *
+   * Except a turn whose final frame (`done` / `error`) is among the
+   * unconfirmed ones: that is a finished answer, and giving up on it would
+   * replace the answer with an abort. Its frames are written again on every
+   * run-out instead, until the server confirms them or says the turn is
+   * closed (`stream_ack` `closed`), or the connection drops again.
    */
   private armReattachCheck(requestId: string): void {
     if (this.reattachTimers.get(requestId) !== null) return;
     this.reattachTimers.set(requestId, setTimeout(() => {
       this.reattachTimers.delete(requestId);
-      log.warn('The server did not take this turn back after the reconnect; stopping it', { requestId });
-      this.outbox.forget(requestId);
-      this.lostTurns.add(requestId);
-      const controller = this.activeRequests.get(requestId);
-      if (controller !== undefined) {
-        controller.abort();
-        this.activeRequests.delete(requestId);
+      if (this.outbox.holdsFinal(requestId)) {
+        if (!this.canWriteStream()) return;
+        log.warn('The server has not confirmed this turn\'s final frames yet; sending them again', { requestId });
+        this.reattachTimers.set(requestId, null);
+        for (const frame of this.outbox.pending(requestId)) this.ws!.send(frame.payload);
+        this.armReattachCheck(requestId);
+
+        return;
       }
-      // Reported like any turn a drop aborted: at once, or for a turn with its
-      // input open once its CLI has stopped (see replayDisconnectedTurn()).
-      const turn: DisconnectedTurn = {
-        requestId,
-        turnInput: controller !== undefined ? this.turnInputs.get(requestId) ?? null : null,
-        ended: controller === undefined,
-        due: true,
-      };
-      this.disconnectedTurns.push(turn);
-      if (turn.turnInput === null || turn.ended) this.replayDisconnectedTurn(turn);
+      log.warn('The server did not take this turn back after the reconnect; stopping it', { requestId });
+      this.giveUpTurn(requestId);
     }, this.reattachAckTimeoutMs));
+  }
+
+  /**
+   * Stop a turn reliable delivery can no longer carry, drop what was kept for
+   * it, and report it as `bridge_disconnected` (`reason` says why): at once
+   * when connected, else after the next welcome; for a turn with its input
+   * open, once its CLI has stopped (see replayDisconnectedTurn()).
+   */
+  private giveUpTurn(requestId: string, reason?: DisconnectedTurn['reason']): void {
+    this.outbox.forget(requestId);
+    this.clearReattachTimer(requestId);
+    this.lostTurns.add(requestId);
+    const controller = this.activeRequests.get(requestId);
+    if (controller !== undefined) {
+      controller.abort();
+      this.activeRequests.delete(requestId);
+    }
+    const turn: DisconnectedTurn = {
+      requestId,
+      turnInput: controller !== undefined ? this.turnInputs.get(requestId) ?? null : null,
+      ended: controller === undefined,
+      due: this.sessionId !== null,
+      ...(reason !== undefined ? { reason } : {}),
+    };
+    this.disconnectedTurns.push(turn);
+    if (turn.due && (turn.turnInput === null || turn.ended)) this.replayDisconnectedTurn(turn);
   }
 
   private onError(err: Error): void {
@@ -2141,10 +2244,15 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
     this.reconnectGraceSeconds = grace;
 
-    if (this.graceTimer === null) return;
+    if (this.graceTimer === null) {
+      this.flushHeldMessages();
+
+      return;
+    }
 
     if (grace === null) {
       this.endGrace('the server that answered does not keep turns through a drop');
+      this.flushHeldMessages();
 
       return;
     }
@@ -2161,7 +2269,16 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       for (const frame of frames) this.ws!.send(frame.payload);
       if (frames.length > 0) this.armReattachCheck(id);
     }
+    // After the frames: a `cancelled` follows the turn's last frame.
+    this.flushHeldMessages();
     this.releaseServerWaiters();
+  }
+
+  /** Write the turn-scoped messages kept through a drop, in order. */
+  private flushHeldMessages(): void {
+    const held = this.heldMessages;
+    this.heldMessages = [];
+    for (const message of held) this.send(message);
   }
 
   /**
@@ -2181,7 +2298,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       type: 'error',
       request_id: turn.requestId,
       code: 'bridge_disconnected',
-      message: 'Request aborted: the bridge connection dropped while the response was streaming.',
+      message: turn.reason === 'outbox_full'
+        ? 'Request stopped: the connection to the server dropped and the answer grew larger than this machine '
+          + 'keeps while waiting for it to come back, so the rest of it was lost. Send the message again to retry.'
+        : 'Request aborted: the bridge connection dropped while the response was streaming.',
       fatal: false,
       ...(turn.turnInput !== null ? { pending_inputs: turn.turnInput.pending() } : {}),
     });
@@ -2272,6 +2392,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // frames are numbered from 1 again (PROTOCOL.md, "Short drops", allows 1
     // or the error frame's seq + 1; this bridge restarts).
     this.lostTurns.delete(request_id);
+    this.closedTurns.delete(request_id);
     if (this.outbox.has(request_id)) this.outbox.restart(request_id);
     else if (this.numbersFramesOf(request_id)) this.outbox.open(request_id);
 
@@ -2528,6 +2649,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         // them again.
         if (this.cancelledRequests.delete(request_id)) {
           this.send({
+            type: 'cancelled',
+            request_id,
+            ...(turnInput !== null ? { pending_inputs: turnInput.pending() } : {}),
+          });
+        }
+        // A turn the server closed: no stream frames, only one `cancelled` so
+        // the messages it never read are named. Fire-and-forget: unnumbered,
+        // not kept, and dropped if the connection is down.
+        if (this.activeRequests.get(request_id) === undefined && this.closedTurns.delete(request_id)) {
+          this.outbox.forget(request_id);
+          this.sendOnce({
             type: 'cancelled',
             request_id,
             ...(turnInput !== null ? { pending_inputs: turnInput.pending() } : {}),
@@ -3008,10 +3140,32 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       if (ui) message = { ...message, data: { ...data, ui } } as BridgeToServerMessage;
     }
 
+    const turnId = (message as { request_id?: unknown }).request_id;
+    // The server said this turn is over (`stream_ack` `closed`): nothing more of it.
+    if (typeof turnId === 'string' && this.closedTurns.has(turnId)) {
+      log.debug('Not sending for a turn the server closed', { type: message.type, requestId: turnId });
+
+      return;
+    }
+
     // A turn's frames against a server with reliable delivery: numbered, kept
     // until confirmed, and never dropped for want of a connection.
     if (message.type === 'stream' && this.numbersFramesOf(message.request_id)) {
       this.sendNumbered(message);
+
+      return;
+    }
+
+    // Its other messages (`cancelled`, `turn_input_ack`, an `error`...) are
+    // not numbered, but in the grace period they wait for the reconnect too,
+    // rather than go to a dead connection. The server ignores a duplicate.
+    if (message.type !== 'stream' && typeof turnId === 'string' && this.graceTimer !== null && !this.canWriteStream()) {
+      this.heldMessages.push(message);
+      if (this.heldMessages.length > MAX_HELD_MESSAGES) {
+        const dropped = this.heldMessages.shift()!;
+        log.warn('Too many messages kept through the drop; dropping the oldest', { type: dropped.type });
+      }
+      log.debug('Connection down — message kept for the reconnect', { type: message.type, requestId: turnId });
 
       return;
     }
@@ -3026,6 +3180,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
     this.ws.send(encoded.payload);
     log.debug('Message sent', { type: message.type, bytes: Buffer.byteLength(encoded.payload, 'utf8') });
+  }
+
+  /** Write a message now if connected and welcomed, else drop it: never numbered or kept. */
+  private sendOnce(message: BridgeToServerMessage): void {
+    if (!this.canWriteStream()) {
+      log.warn('Not connected — message dropped', { type: message.type });
+
+      return;
+    }
+    const encoded = this.encode(message);
+    if (encoded !== null) this.ws!.send(encoded.payload);
   }
 
   /**
@@ -3045,11 +3210,20 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (encoded === null) return;
 
     this.outbox.allocate(requestId);
-    const kept = this.outbox.keep(requestId, {
+    const result = this.outbox.keep(requestId, {
       seq,
       payload: encoded.payload,
       terminal: encoded.event === 'done' || encoded.event === 'error',
     });
+    if (result === 'full') {
+      // Bounded, so a long grace period with a chatty turn cannot exhaust
+      // memory: the turn is stopped and reported as lost to the drop.
+      log.error('Too much unconfirmed output kept for this turn; stopping it', { requestId, seq });
+      this.giveUpTurn(requestId, 'outbox_full');
+
+      return;
+    }
+    const kept = result === 'kept';
 
     if (!this.canWriteStream()) {
       if (kept) {

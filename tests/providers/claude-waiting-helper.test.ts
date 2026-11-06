@@ -192,4 +192,50 @@ describe('a helper waiting on its own work', () => {
     expect(turn.record.eofAt).toBe(linesBefore(steps, steps.length - 1));
     expect(closed - endedAt).toBeLessThan(1000);
   });
+
+  it('is forwarded as waiting, then running on its resume, then completed when it really ends', async () => {
+    const steps: Step[] = [
+      echo('go'), init,
+      helperStarted('a1'), text('Launched.'), result(),
+      helperCalls('a1', 'b1', 'Bash'), helperCommand('b1'),
+      ...ended('a1'),
+      ...notificationTurn('The helper is waiting on its check.'),
+      ...ended('b1'),
+      { sleep: 200 },
+      helperStarted('a1'), helperSays('a1', 'Check passed.'),
+      ...ended('a1'),
+      ...notificationTurn('The helper is done.'),
+      { waitEof: true },
+    ];
+    const turn = await run(steps, 3000);
+    const a1 = of(turn.events, 'task')
+      .map((e) => e.data as { task_id: string; phase: string; status?: string })
+      .filter((d) => d.task_id === 'a1')
+      .map((d) => [d.phase, d.status]);
+
+    expect(a1).toEqual([
+      ['started', undefined],
+      ['updated', 'waiting'], ['updated', 'waiting'],
+      ['updated', 'running'],
+      ['updated', 'completed'], ['finished', 'completed'],
+    ]);
+  });
+
+  it('is forwarded as completed when the window passes without a resume', async () => {
+    const steps: Step[] = [
+      echo('go'), init,
+      helperStarted('a1'), text('Launched.'), result(),
+      helperCalls('a1', 'b1', 'Bash'), helperCommand('b1'),
+      ...ended('a1'),
+      ...notificationTurn('Waiting.'),
+      ...ended('b1'),
+      { waitEof: true },
+    ];
+    const turn = await run(steps, 300);
+    const a1 = turn.events.filter((e) => e.event === 'task' && (e.data as { task_id?: string }).task_id === 'a1');
+    const last = a1[a1.length - 1]!;
+
+    expect(last.data).toMatchObject({ phase: 'updated', task_id: 'a1', tool_use_id: 'toolu_a1', task_type: 'local_agent', status: 'completed' });
+    expect(turn.events.indexOf(last)).toBeLessThan(turn.events.findIndex((e) => e.event === 'input_closed'));
+  });
 });

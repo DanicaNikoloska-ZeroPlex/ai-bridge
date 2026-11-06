@@ -593,13 +593,22 @@ export class ClaudeAdapter extends ProviderAdapter {
        * Keep count of what is still running, for the terminal rule. Only tasks
        * started in this turn reach here (taskEventFrom() drops the rest).
        */
-      const trackTask = (task: TaskData, frame: Record<string, unknown>): void => {
+      /**
+       * Returns the `status` the forwarded `task` event carries instead of the
+       * CLI's own, when it differs: `waiting` for a helper that reported
+       * `completed` while work it owns still runs (it is not done), `running`
+       * for its resume, a new `task_started` for the same task_id (PROTOCOL.md,
+       * `task`). Undefined: forward the frame as it is.
+       */
+      const trackTask = (task: TaskData, frame: Record<string, unknown>): 'waiting' | 'running' | undefined => {
+        let shown: 'waiting' | 'running' | undefined;
         if (task.phase === 'started') {
           runningTasks.add(task.task_id);
           if (waitingHelpers.delete(task.task_id)) {
             // The CLI woke a waiting helper: it runs again, and if the main
             // assistant started it, the CLI owes it a turn again when it ends.
             log.info('A waiting helper was resumed', { requestId, taskId: task.task_id });
+            shown = 'running';
             if (mainBackgroundHelpers.has(task.task_id)) mainBackgroundTasks.add(task.task_id);
             if (waitingHelpers.size === 0) clearResumeTimer();
           }
@@ -619,6 +628,8 @@ export class ClaudeAdapter extends ProviderAdapter {
                 waitingHelpers.set(task.task_id, null);
                 log.info('A helper stopped while its own work runs — waiting for it', { requestId, taskId: task.task_id });
               }
+              // Its second ending frame (`updated`, then `finished`) too.
+              if (waitingHelpers.has(task.task_id)) shown = 'waiting';
             } else if (waitingHelpers.delete(task.task_id) && waitingHelpers.size === 0) {
               // Failed, killed, stopped: nothing will resume it.
               clearResumeTimer();
@@ -633,6 +644,8 @@ export class ClaudeAdapter extends ProviderAdapter {
             notificationsOwed++;
           }
         }
+
+        return shown;
       };
 
       /**
@@ -793,6 +806,18 @@ export class ClaudeAdapter extends ProviderAdapter {
             if (deadline !== null && deadline <= now) {
               log.info('No resume of a waiting helper within the window', { requestId, taskId: helperId });
               waitingHelpers.delete(helperId);
+              // It was shown as waiting; this is its real end.
+              const started = startedTasks.get(helperId);
+              emitWholeMessage({
+                event: 'task',
+                data: {
+                  phase: 'updated',
+                  task_id: helperId,
+                  ...(started?.toolUseId !== undefined ? { tool_use_id: started.toolUseId } : {}),
+                  ...(started?.taskType !== undefined ? { task_type: started.taskType } : {}),
+                  status: 'completed',
+                },
+              });
             } else if (deadline !== null) {
               next = Math.min(next, deadline);
             }
@@ -1081,8 +1106,10 @@ export class ClaudeAdapter extends ProviderAdapter {
 
               return;
             }
-            emitWholeMessage({ event: 'task', data: task });
-            trackTask(task, parsed);
+            // Tracked first: a waiting helper's `completed`, and its resume,
+            // are forwarded as `updated` `waiting` / `running` (see trackTask).
+            const shown = trackTask(task, parsed);
+            emitWholeMessage({ event: 'task', data: shown === undefined ? task : { ...task, phase: 'updated', status: shown } });
 
             return;
           }

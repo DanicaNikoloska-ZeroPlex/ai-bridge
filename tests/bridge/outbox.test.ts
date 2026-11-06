@@ -56,7 +56,7 @@ describe('StreamOutbox', () => {
 
     expect(box.ack('a', 1).ended).toBe(true);
     expect(box.pending('a')).toEqual([]);
-    expect(box.keep('a', { seq: box.allocate('a'), payload: '{}', terminal: false })).toBe(false);
+    expect(box.keep('a', { seq: box.allocate('a'), payload: '{}', terminal: false })).toBe('ended');
   });
 
   it('ignores an ack for a turn it does not know', () => {
@@ -79,5 +79,37 @@ describe('StreamOutbox', () => {
     // The new run's own acks work as usual.
     box.ack('a', 1);
     expect(box.pending('a').map((f) => f.seq)).toEqual([2]);
+  });
+
+  it('refuses a frame past a per-turn bound, and frees room as acks come in', () => {
+    const box = new StreamOutbox({ turnBytes: 1_000_000, turnFrames: 2, totalBytes: 1_000_000, totalFrames: 100 });
+    const frame = (seq: number) => ({ seq, payload: 'x'.repeat(10), terminal: false });
+    expect(box.keep('a', frame(box.allocate('a')))).toBe('kept');
+    expect(box.keep('a', frame(box.allocate('a')))).toBe('kept');
+    expect(box.keep('a', frame(box.allocate('a')))).toBe('full');
+    // Another turn has its own allowance.
+    expect(box.keep('b', frame(box.allocate('b')))).toBe('kept');
+    box.ack('a', 1);
+    expect(box.keep('a', frame(4))).toBe('kept');
+  });
+
+  it('refuses a frame past the byte bound across all turns, and frees it on forget', () => {
+    const box = new StreamOutbox({ turnBytes: 100, turnFrames: 100, totalBytes: 150, totalFrames: 100 });
+    const frame = (seq: number, bytes: number) => ({ seq, payload: 'x'.repeat(bytes), terminal: false });
+    expect(box.keep('a', frame(box.allocate('a'), 101))).toBe('full'); // over the turn's bytes
+    expect(box.keep('a', frame(box.allocate('a'), 80))).toBe('kept');
+    expect(box.keep('b', frame(box.allocate('b'), 80))).toBe('full'); // over the total
+    box.forget('a');
+    expect(box.keep('b', frame(box.allocate('b'), 80))).toBe('kept');
+  });
+
+  it('says whether a turn\'s final frame is still unconfirmed', () => {
+    const box = new StreamOutbox();
+    push(box, 'a', 'block_delta');
+    expect(box.holdsFinal('a')).toBe(false);
+    push(box, 'a', 'done');
+    expect(box.holdsFinal('a')).toBe(true);
+    box.ack('a', 2);
+    expect(box.holdsFinal('a')).toBe(false);
   });
 });

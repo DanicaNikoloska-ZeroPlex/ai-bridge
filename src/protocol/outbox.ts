@@ -10,7 +10,45 @@
  * is exactly one more than the last it stored, so writing one twice is safe.
  *
  * Pure bookkeeping: no socket, no timers. The bridge decides when to write.
+ *
+ * Bounded (see OutboxLimits): the server picks the grace period, up to an
+ * hour, and a chatty turn kept that long would otherwise grow without limit.
+ * A frame that would go over a bound is not kept, and the bridge stops that
+ * turn and reports it as lost rather than let the process run out of memory.
  */
+
+/** How much the outbox keeps before it refuses a frame. */
+export interface OutboxLimits {
+  /** Unconfirmed bytes one turn may hold. */
+  turnBytes: number;
+  /** Unconfirmed frames one turn may hold. */
+  turnFrames: number;
+  /** Unconfirmed bytes all turns together may hold. */
+  totalBytes: number;
+  /** Unconfirmed frames all turns together may hold. */
+  totalFrames: number;
+}
+
+/**
+ * Far above what a turn normally holds unconfirmed (the server acks as it
+ * stores; one frame is at most 900 KB), small enough that a bridge on a
+ * laptop keeps working when they are reached.
+ */
+export const DEFAULT_OUTBOX_LIMITS: OutboxLimits = {
+  turnBytes: 32 * 1024 * 1024,
+  turnFrames: 20_000,
+  totalBytes: 128 * 1024 * 1024,
+  totalFrames: 80_000,
+};
+
+/** What keep() did with a frame. */
+export type KeepResult =
+  /** Kept until a `stream_ack` covers it. */
+  | 'kept'
+  /** Not kept: the server has ended the turn (or already has this seq). */
+  | 'ended'
+  /** Not kept: it would go over a bound. The turn must be stopped. */
+  | 'full';
 
 /** One numbered frame, already encoded exactly as it goes on the wire. */
 export interface OutboxFrame {
@@ -20,6 +58,8 @@ export interface OutboxFrame {
   terminal: boolean;
 }
 
+const bytesOf = (frame: OutboxFrame): number => Buffer.byteLength(frame.payload, 'utf8');
+
 interface TurnOutbox {
   /** The seq the next frame of this turn gets. */
   nextSeq: number;
@@ -27,6 +67,8 @@ interface TurnOutbox {
   acked: number;
   /** Written but not yet confirmed, in seq order. */
   frames: OutboxFrame[];
+  /** The UTF-8 size of `frames`. */
+  bytes: number;
   /**
    * The server confirmed a `done` or `error` of this turn: it has ended the
    * turn, so later frames are still numbered and written but not kept.
@@ -48,6 +90,10 @@ export interface RunningTurn {
 
 export class StreamOutbox {
   private readonly turns = new Map<string, TurnOutbox>();
+  private totalBytes = 0;
+  private totalFrames = 0;
+
+  constructor(private readonly limits: OutboxLimits = DEFAULT_OUTBOX_LIMITS) {}
 
   /**
    * A turn started: listed in `running_turns` from now on, even before its
@@ -70,16 +116,27 @@ export class StreamOutbox {
   }
 
   /**
-   * Keep a numbered frame until it is confirmed. Returns false when the
-   * server has already ended the turn: the frame is not kept, because nothing
-   * would ever confirm it.
+   * Keep a numbered frame until it is confirmed. Not kept when the server
+   * has already ended the turn, because nothing would ever confirm it
+   * (`ended`), or when it would take the turn or the whole outbox over a
+   * bound (`full`).
    */
-  keep(requestId: string, frame: OutboxFrame): boolean {
+  keep(requestId: string, frame: OutboxFrame): KeepResult {
     const turn = this.turnFor(requestId);
-    if (turn.serverEnded || frame.seq <= turn.acked) return false;
+    if (turn.serverEnded || frame.seq <= turn.acked) return 'ended';
+    const bytes = bytesOf(frame);
+    if (turn.frames.length + 1 > this.limits.turnFrames
+      || turn.bytes + bytes > this.limits.turnBytes
+      || this.totalFrames + 1 > this.limits.totalFrames
+      || this.totalBytes + bytes > this.limits.totalBytes) {
+      return 'full';
+    }
     turn.frames.push(frame);
+    turn.bytes += bytes;
+    this.totalFrames++;
+    this.totalBytes += bytes;
 
-    return true;
+    return 'kept';
   }
 
   /**
@@ -102,10 +159,13 @@ export class StreamOutbox {
     if (seq > turn.acked) turn.acked = seq;
     let ended = turn.serverEnded;
     while (turn.frames.length > 0 && turn.frames[0]!.seq <= turn.acked) {
-      if (turn.frames.shift()!.terminal) ended = true;
+      const frame = turn.frames.shift()!;
+      this.release(turn, [frame]);
+      if (frame.terminal) ended = true;
     }
     if (ended) {
       turn.serverEnded = true;
+      this.release(turn, turn.frames);
       turn.frames = [];
     }
 
@@ -121,10 +181,12 @@ export class StreamOutbox {
   restart(requestId: string): void {
     const old = this.turns.get(requestId);
     const lastFrame = old?.frames[old.frames.length - 1];
+    if (old !== undefined) this.release(old, old.frames);
     this.turns.set(requestId, {
       nextSeq: 1,
       acked: 0,
       frames: [],
+      bytes: 0,
       serverEnded: false,
       staleAck: lastFrame !== undefined && lastFrame.terminal ? lastFrame.seq : null,
     });
@@ -133,6 +195,11 @@ export class StreamOutbox {
   /** The kept (unconfirmed) frames of a turn, in order. */
   pending(requestId: string): readonly OutboxFrame[] {
     return this.turns.get(requestId)?.frames ?? [];
+  }
+
+  /** Whether a turn's final frame (`done` / `error`) is among its unconfirmed ones. */
+  holdsFinal(requestId: string): boolean {
+    return this.pending(requestId).some((frame) => frame.terminal);
   }
 
   /** Whether a turn has numbered frames (kept, or still to come). */
@@ -173,21 +240,35 @@ export class StreamOutbox {
   }
 
   forget(requestId: string): void {
+    const turn = this.turns.get(requestId);
+    if (turn !== undefined) this.release(turn, turn.frames);
     this.turns.delete(requestId);
   }
 
   clear(): void {
     this.turns.clear();
+    this.totalBytes = 0;
+    this.totalFrames = 0;
   }
 
   get size(): number {
     return this.turns.size;
   }
 
+  /** Take frames that leave a turn off the byte and frame counts. */
+  private release(turn: TurnOutbox, frames: readonly OutboxFrame[]): void {
+    for (const frame of frames) {
+      const bytes = bytesOf(frame);
+      turn.bytes -= bytes;
+      this.totalBytes -= bytes;
+      this.totalFrames--;
+    }
+  }
+
   private turnFor(requestId: string): TurnOutbox {
     let turn = this.turns.get(requestId);
     if (turn === undefined) {
-      turn = { nextSeq: 1, acked: 0, frames: [], serverEnded: false, staleAck: null };
+      turn = { nextSeq: 1, acked: 0, frames: [], bytes: 0, serverEnded: false, staleAck: null };
       this.turns.set(requestId, turn);
     }
 

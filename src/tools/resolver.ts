@@ -145,7 +145,8 @@ export class ToolResolver {
   cancelAll(reason?: string): void {
     for (const [, pending] of this.pending) {
       clearTimeout(pending.timer);
-      pending.reject(new Error(reason ?? 'Tool call cancelled — bridge disconnected'));
+      pending.reject(new Error(reason ?? 'Result unknown: this tool call was cancelled before its answer arrived. '
+        + 'The tool may or may not have run: check its effect before repeating it.'));
     }
     const count = this.pending.size;
     this.pending.clear();
