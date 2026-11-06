@@ -103,6 +103,14 @@ describe('StreamOutbox', () => {
     expect(box.keep('b', frame(box.allocate('b'), 80))).toBe('kept');
   });
 
+  it('never refuses a turn\'s final frame for a bound', () => {
+    const box = new StreamOutbox({ turnBytes: 1_000_000, turnFrames: 1, totalBytes: 1_000_000, totalFrames: 1 });
+    expect(box.keep('a', { seq: box.allocate('a'), payload: 'x', terminal: false })).toBe('kept');
+    expect(box.keep('a', { seq: box.allocate('a'), payload: 'x', terminal: false })).toBe('full');
+    expect(box.keep('a', { seq: box.allocate('a'), payload: 'x', terminal: true })).toBe('kept');
+    expect(box.holdsFinal('a')).toBe(true);
+  });
+
   it('says whether a turn\'s final frame is still unconfirmed', () => {
     const box = new StreamOutbox();
     push(box, 'a', 'block_delta');

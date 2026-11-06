@@ -395,7 +395,7 @@ describe('turn messages, final frames, closed turns and bounds', () => {
     expect(frames.filter((f) => f.frame['type'] === 'cancelled')).toHaveLength(1);
   }, 10_000);
 
-  it('never gives up on a finished answer the server is slow to confirm: it sends it again', async () => {
+  it('does not give up on a finished answer the server is slow to confirm: it sends it again', async () => {
     await start(120, 200);
     request('req_1');
     await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
@@ -415,6 +415,28 @@ describe('turn messages, final frames, closed turns and bounds', () => {
     ack('req_1', 2);
     await sleep(30);
     expect(bridge!.isIdle()).toBe(true);
+  }, 10_000);
+
+  it('lets go of a finished answer the server never confirms after a bounded number of re-sends', async () => {
+    await start(120, 20);
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    await drop();
+    adapter.finish();
+    await nextConnection();
+    welcome(120);
+    await waitFor((f, c) => c === 2 && f['event'] === 'done', 'the re-sent done');
+    expect(bridge!.isIdle()).toBe(false);
+
+    // 20, 40, 80, 160, 320 ms: four re-sends, then released.
+    await sleep(1200);
+    const sent = streamOf('req_1', 2).filter((f) => f['event'] === 'done').length;
+    expect(sent).toBe(5); // the re-attach write plus four re-sends
+    expect(bridge!.isIdle()).toBe(true);
+    expect(frames.some((f) => f.frame['code'] === 'bridge_disconnected')).toBe(false);
+    await sleep(200);
+    expect(streamOf('req_1', 2).filter((f) => f['event'] === 'done').length).toBe(sent);
   }, 10_000);
 
   it('stops a running turn when the server says it is closed: no more stream frames, one cancelled', async () => {
@@ -491,8 +513,39 @@ describe('turn messages, final frames, closed turns and bounds', () => {
     welcome(120);
     const report = await waitFor((f) => f['code'] === 'bridge_disconnected', 'the report');
     expect(report['request_id']).toBe('req_1');
-    expect(report['message']).toMatch(/grew larger than this machine keeps.*Send the message again/);
+    expect(report['message']).toMatch(/connection to the server dropped.*grew larger than this machine keeps.*Send the message again/);
     expect(bridge!.isIdle()).toBe(true);
+  }, 10_000);
+
+  it('on a connection that is up, blames a slow server, not a drop, for outgrowing the bound', async () => {
+    await start(120);
+    (bridge as unknown as { outbox: StreamOutbox }).outbox = new StreamOutbox({
+      turnBytes: 1_000_000, turnFrames: 3, totalBytes: 1_000_000, totalFrames: 100,
+    });
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    for (const t of ['a', 'b', 'c', 'd']) adapter.delta(t);
+    expect(adapter.aborted).toBe(true);
+
+    const report = await waitFor((f) => f['code'] === 'bridge_disconnected', 'the report');
+    expect(report['message']).toMatch(/server was too slow to confirm/);
+    expect(report['message']).not.toMatch(/dropped/);
+  }, 10_000);
+
+  it('delivers the final frame of a turn whose earlier output filled the bound', async () => {
+    await start(120);
+    (bridge as unknown as { outbox: StreamOutbox }).outbox = new StreamOutbox({
+      turnBytes: 1_000_000, turnFrames: 3, totalBytes: 1_000_000, totalFrames: 100,
+    });
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    for (const t of ['a', 'b', 'c']) adapter.delta(t);
+    adapter.finish();
+    await waitFor((f) => f['event'] === 'done', 'done');
+    expect(streamOf('req_1').find((f) => f['event'] === 'done')!['seq']).toBe(4);
+    expect(frames.some((f) => f.frame['code'] === 'bridge_disconnected')).toBe(false);
   }, 10_000);
 });
 

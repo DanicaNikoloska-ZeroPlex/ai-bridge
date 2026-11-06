@@ -15,6 +15,8 @@
  * hour, and a chatty turn kept that long would otherwise grow without limit.
  * A frame that would go over a bound is not kept, and the bridge stops that
  * turn and reports it as lost rather than let the process run out of memory.
+ * A turn's final frame (`done` / `error`) is always kept: it is one frame
+ * (at most 900 KB), and refusing it would turn a finished answer into a lost one.
  */
 
 /** How much the outbox keeps before it refuses a frame. */
@@ -47,7 +49,7 @@ export type KeepResult =
   | 'kept'
   /** Not kept: the server has ended the turn (or already has this seq). */
   | 'ended'
-  /** Not kept: it would go over a bound. The turn must be stopped. */
+  /** Not kept: it would go over a bound (never for a final frame). The turn must be stopped. */
   | 'full';
 
 /** One numbered frame, already encoded exactly as it goes on the wire. */
@@ -119,16 +121,16 @@ export class StreamOutbox {
    * Keep a numbered frame until it is confirmed. Not kept when the server
    * has already ended the turn, because nothing would ever confirm it
    * (`ended`), or when it would take the turn or the whole outbox over a
-   * bound (`full`).
+   * bound (`full`). A final frame is never refused for a bound.
    */
   keep(requestId: string, frame: OutboxFrame): KeepResult {
     const turn = this.turnFor(requestId);
     if (turn.serverEnded || frame.seq <= turn.acked) return 'ended';
     const bytes = bytesOf(frame);
-    if (turn.frames.length + 1 > this.limits.turnFrames
+    if (!frame.terminal && (turn.frames.length + 1 > this.limits.turnFrames
       || turn.bytes + bytes > this.limits.turnBytes
       || this.totalFrames + 1 > this.limits.totalFrames
-      || this.totalBytes + bytes > this.limits.totalBytes) {
+      || this.totalBytes + bytes > this.limits.totalBytes)) {
       return 'full';
     }
     turn.frames.push(frame);

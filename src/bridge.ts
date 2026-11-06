@@ -234,6 +234,13 @@ const MAX_RECONNECT_GRACE_SECONDS = 3600;
  * armReattachCheck()).
  */
 const DEFAULT_REATTACH_ACK_TIMEOUT_MS = 30_000;
+/**
+ * How often a finished turn's unconfirmed final frames are written again
+ * before the bridge lets go of them (see armReattachCheck()). The wait doubles
+ * each time, from the re-attach timeout: 30 s, 1, 2, 4 and 8 minutes, so a
+ * server that never confirms is given about 15 minutes, not forever.
+ */
+const MAX_FINAL_RESENDS = 4;
 /*
  * What the assistant is told when work that needs the server cannot happen.
  * These strings are what it acts on, so each says whether the action
@@ -286,8 +293,12 @@ interface DisconnectedTurn {
   ended: boolean;
   /** The server is back and waiting to hear about it. */
   due: boolean;
-  /** Why it is reported: the connection dropped (default), or it outgrew the outbox. */
-  reason?: 'outbox_full';
+  /**
+   * Why it is reported: the connection dropped (default), or it outgrew the
+   * outbox while the connection was down (`outbox_full`) or while it was up
+   * and the server was slow to confirm (`outbox_unconfirmed`).
+   */
+  reason?: 'outbox_full' | 'outbox_unconfirmed';
 }
 
 const MAX_RECONNECT_ATTEMPTS = 100;
@@ -599,6 +610,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly lostTurns = new Set<string>();
   /** Re-attached turns waiting for their first confirmation on the new connection. */
   private readonly reattachTimers = new Map<string, ReturnType<typeof setTimeout> | null>();
+  /** How often a turn's unconfirmed final frames were written again on this connection. */
+  private readonly finalResends = new Map<string, number>();
   private readonly reattachAckTimeoutMs: number;
   /**
    * Turns the server said are over on its side (`stream_ack` with `closed`):
@@ -1656,6 +1669,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private clearReattachTimers(): void {
     for (const timer of this.reattachTimers.values()) if (timer !== null) clearTimeout(timer);
     this.reattachTimers.clear();
+    this.finalResends.clear();
   }
 
   /**
@@ -1718,6 +1732,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       if (timer !== null) clearTimeout(timer);
       this.reattachTimers.delete(requestId);
     }
+    this.finalResends.delete(requestId);
     if (ended && !this.activeRequests.has(requestId)) this.outbox.forget(requestId);
   }
 
@@ -1746,6 +1761,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     const timer = this.reattachTimers.get(requestId);
     if (timer !== undefined && timer !== null) clearTimeout(timer);
     this.reattachTimers.delete(requestId);
+    this.finalResends.delete(requestId);
   }
 
   /**
@@ -1756,16 +1772,30 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * Except a turn whose final frame (`done` / `error`) is among the
    * unconfirmed ones: that is a finished answer, and giving up on it would
    * replace the answer with an abort. Its frames are written again on every
-   * run-out instead, until the server confirms them or says the turn is
-   * closed (`stream_ack` `closed`), or the connection drops again.
+   * run-out instead, the wait doubling each time, until the server confirms
+   * them or says the turn is closed (`stream_ack` `closed`), or the connection
+   * drops again. After MAX_FINAL_RESENDS without a confirmation the bridge
+   * lets go of them (logged), so it can become idle again: nothing is
+   * reported, because the server may well have the answer.
    */
   private armReattachCheck(requestId: string): void {
     if (this.reattachTimers.get(requestId) !== null) return;
+    const resends = this.finalResends.get(requestId) ?? 0;
     this.reattachTimers.set(requestId, setTimeout(() => {
       this.reattachTimers.delete(requestId);
       if (this.outbox.holdsFinal(requestId)) {
         if (!this.canWriteStream()) return;
-        log.warn('The server has not confirmed this turn\'s final frames yet; sending them again', { requestId });
+        if (resends >= MAX_FINAL_RESENDS) {
+          log.warn('The server never confirmed this turn\'s final frames; letting go of them', { requestId, resends });
+          this.finalResends.delete(requestId);
+          this.outbox.forget(requestId);
+          // Anything the turn still sends goes out unnumbered, as for a lost turn.
+          this.lostTurns.add(requestId);
+
+          return;
+        }
+        log.warn('The server has not confirmed this turn\'s final frames yet; sending them again', { requestId, resend: resends + 1 });
+        this.finalResends.set(requestId, resends + 1);
         this.reattachTimers.set(requestId, null);
         for (const frame of this.outbox.pending(requestId)) this.ws!.send(frame.payload);
         this.armReattachCheck(requestId);
@@ -1774,7 +1804,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       }
       log.warn('The server did not take this turn back after the reconnect; stopping it', { requestId });
       this.giveUpTurn(requestId);
-    }, this.reattachAckTimeoutMs));
+    }, this.reattachAckTimeoutMs * 2 ** resends));
   }
 
   /**
@@ -2301,7 +2331,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       message: turn.reason === 'outbox_full'
         ? 'Request stopped: the connection to the server dropped and the answer grew larger than this machine '
           + 'keeps while waiting for it to come back, so the rest of it was lost. Send the message again to retry.'
-        : 'Request aborted: the bridge connection dropped while the response was streaming.',
+        : turn.reason === 'outbox_unconfirmed'
+          ? 'Request stopped: the server was too slow to confirm the answer, and it grew larger than this machine '
+            + 'keeps unconfirmed, so the rest of it was lost. Send the message again, or ask for a shorter answer.'
+          : 'Request aborted: the bridge connection dropped while the response was streaming.',
       fatal: false,
       ...(turn.turnInput !== null ? { pending_inputs: turn.turnInput.pending() } : {}),
     });
@@ -3217,9 +3250,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     });
     if (result === 'full') {
       // Bounded, so a long grace period with a chatty turn cannot exhaust
-      // memory: the turn is stopped and reported as lost to the drop.
-      log.error('Too much unconfirmed output kept for this turn; stopping it', { requestId, seq });
-      this.giveUpTurn(requestId, 'outbox_full');
+      // memory: the turn is stopped and reported as lost, saying whether the
+      // connection was down or the server just did not confirm in time.
+      const connected = this.canWriteStream();
+      log.error('Too much unconfirmed output kept for this turn; stopping it', { requestId, seq, connected });
+      this.giveUpTurn(requestId, connected ? 'outbox_unconfirmed' : 'outbox_full');
 
       return;
     }
