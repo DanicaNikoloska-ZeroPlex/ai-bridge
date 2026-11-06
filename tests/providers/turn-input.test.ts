@@ -261,6 +261,10 @@ describe('messages for a running turn', () => {
           taskFinished('b1'),
           { waitEof: true },
         ],
+        // The helper stopped while its command ran, so after the command the
+        // turn waits for it to be resumed (claude-waiting-helper.test.ts);
+        // kept short here, where nothing resumes it.
+        helperResumeWindowMs: 100,
       });
 
       // Lines: echo, init, helper, text, result (5) | command (6) | helper

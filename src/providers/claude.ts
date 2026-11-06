@@ -87,6 +87,22 @@ import { resolveClaudeEffort } from './claude-effort.js';
  */
 const NOTIFICATION_TURN_GRACE_MS = 10_000;
 
+/**
+ * How long a turn with its input open stays open for a helper that is WAITING,
+ * after the work it was waiting on has ended, so the CLI can resume it.
+ *
+ * A helper that stops while background work of its own still runs reports
+ * `completed` (`task_updated` and `task_notification`) like any finished
+ * helper; the stream says nothing about it waiting. When that work ends, the
+ * CLI wakes the helper: a NEW `task_started` for the same task_id, and it
+ * works on (captured on 2.1.287 with a helper's own background `sleep 40`).
+ * Between the work ending and that `task_started` nothing runs and the main
+ * assistant is idle, so without this window the terminal rule closed stdin
+ * just before the resume and the helper's remaining work never ran. With no
+ * resume inside the window the turn closes as before.
+ */
+export const HELPER_RESUME_WINDOW_MS = 30_000;
+
 /** A main-assistant `stop_reason` that ends its message rather than pausing it for a tool. */
 function endsMessage(stopReason: unknown): boolean {
   return typeof stopReason === 'string' && stopReason !== 'tool_use' && stopReason !== 'pause_turn';
@@ -442,6 +458,33 @@ export class ClaudeAdapter extends ProviderAdapter {
         requestId,
       });
       let graceTimer: ReturnType<typeof setTimeout> | null = null;
+      /**
+       * A helper's own tool calls, keyed by the call, naming the helper's
+       * spawning call: read off the helper's whole `assistant` frames
+       * (`parent_tool_use_id` + a `tool_use` block). A task the CLI starts for
+       * such a call — a shell command, or a helper the helper spawned — names
+       * the call as its `tool_use_id` and nothing else about who started it
+       * (a nested helper carries no `owned_by_subagent`). This is how the
+       * terminal rule tells whose work a running task is. See ownerOf().
+       */
+      const callParent = new Map<string, string>();
+      /**
+       * Helpers that reported `completed` while work they own still ran, and
+       * may be resumed by the CLI once it ends. The value is the deadline of
+       * the resume window (HELPER_RESUME_WINDOW_MS) once the owned work has
+       * ended, and null while it still runs. A new `task_started` for the
+       * task_id removes the entry (the helper runs again); a helper that
+       * ended any other way than `completed` never gets one.
+       */
+      const waitingHelpers = new Map<string, number | null>();
+      /** Main-assistant background helpers, kept past their end so a resumed one is counted again. */
+      const mainBackgroundHelpers = new Set<string>();
+      const resumeWindowMs = this.helperResumeWindowMs();
+      let resumeTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearResumeTimer = (): void => {
+        if (resumeTimer !== null) clearTimeout(resumeTimer);
+        resumeTimer = null;
+      };
       let stdinClosed = false;
       /** The CLI has not echoed the opening message yet. */
       let openingEchoPending = true;
@@ -553,20 +596,90 @@ export class ClaudeAdapter extends ProviderAdapter {
       const trackTask = (task: TaskData, frame: Record<string, unknown>): void => {
         if (task.phase === 'started') {
           runningTasks.add(task.task_id);
+          if (waitingHelpers.delete(task.task_id)) {
+            // The CLI woke a waiting helper: it runs again, and if the main
+            // assistant started it, the CLI owes it a turn again when it ends.
+            log.info('A waiting helper was resumed', { requestId, taskId: task.task_id });
+            if (mainBackgroundHelpers.has(task.task_id)) mainBackgroundTasks.add(task.task_id);
+            if (waitingHelpers.size === 0) clearResumeTimer();
+          }
           if (frame['is_backgrounded'] === true && frame['owned_by_subagent'] !== true) {
             mainBackgroundTasks.add(task.task_id);
+            if (task.task_type === 'local_agent') mainBackgroundHelpers.add(task.task_id);
           }
           taskOutput.started(frame);
         } else if (task.phase === 'finished'
           || (task.phase === 'updated' && task.status !== 'running' && task.status !== 'pending')) {
-          runningTasks.delete(task.task_id);
+          const wasRunning = runningTasks.delete(task.task_id);
           taskOutput.ended(task.task_id);
+          if (startedTasks.get(task.task_id)?.taskType === 'local_agent') {
+            if (task.status === 'completed') {
+              // Stopped with its own work still running: waiting, not done.
+              if (wasRunning && ownsRunningWork(task.task_id)) {
+                waitingHelpers.set(task.task_id, null);
+                log.info('A helper stopped while its own work runs — waiting for it', { requestId, taskId: task.task_id });
+              }
+            } else if (waitingHelpers.delete(task.task_id) && waitingHelpers.size === 0) {
+              // Failed, killed, stopped: nothing will resume it.
+              clearResumeTimer();
+            }
+          }
+          openResumeWindows();
           // The main assistant is told about its own background tasks in a
           // turn of the CLI's own, which is still to come. Whichever frame
           // says the task ended first counts: the CLI writes `updated` just
           // ahead of `finished`, and the rule is evaluated between the two.
           if (mainBackgroundTasks.delete(task.task_id)) {
             notificationsOwed++;
+          }
+        }
+      };
+
+      /**
+       * The helper (its task_id) whose own tool call started this task, or
+       * undefined when the frames do not say: the task's call must have shown
+       * up in a helper's `assistant` frame. On 2.1.287 that holds for the
+       * work of a top-level helper (spawn_depth 1); a nested helper's own
+       * frames are not written to stdout, so its commands are not attributed.
+       */
+      const ownerOf = (taskId: string): string | undefined => {
+        const call = startedTasks.get(taskId)?.toolUseId;
+        const parentCall = call === undefined ? undefined : callParent.get(call);
+        if (parentCall === undefined) return undefined;
+        for (const [id, task] of startedTasks) {
+          if (id !== taskId && task.toolUseId === parentCall) return id;
+        }
+
+        return undefined;
+      };
+
+      /**
+       * Whether a task this helper owns still runs: one attributed to it (a
+       * shell command or helper it started — and through those, theirs), or
+       * a helper's shell command (`owned_by_subagent`) that cannot be
+       * attributed to anyone, which counts for every helper because it may
+       * be this one's.
+       */
+      const ownsRunningWork = (helperId: string): boolean => {
+        for (const taskId of runningTasks) {
+          if (taskId === helperId) continue;
+          let owner = ownerOf(taskId);
+          if (owner === undefined && startedTasks.get(taskId)?.ownedBySubagent === true) return true;
+          // Up the chain: a command of a helper this helper started is its work too.
+          for (let hops = 0; owner !== undefined && hops < 16; hops++) {
+            if (owner === helperId) return true;
+            owner = ownerOf(owner);
+          }
+        }
+
+        return false;
+      };
+
+      /** Start the resume window of every waiting helper whose owned work has ended. */
+      const openResumeWindows = (): void => {
+        for (const [helperId, deadline] of waitingHelpers) {
+          if (deadline === null && !ownsRunningWork(helperId)) {
+            waitingHelpers.set(helperId, Date.now() + resumeWindowMs);
           }
         }
       };
@@ -600,6 +713,7 @@ export class ClaudeAdapter extends ProviderAdapter {
         stdinClosed = true;
         if (graceTimer !== null) clearTimeout(graceTimer);
         graceTimer = null;
+        clearResumeTimer();
         port?.end();
         log.info('Closing the CLI input — the turn is over', { requestId, why });
         // Said out loud, because the gap between this and `done` is not
@@ -654,7 +768,8 @@ export class ClaudeAdapter extends ProviderAdapter {
        * The terminal rule, for input-open turns: close stdin only when the main
        * assistant is idle, NO task it or a helper started is still running
        * (any task_type), and every accepted message has been read — the
-       * opening message too (see openingTakenIn). A `result`
+       * opening message too (see openingTakenIn) — and no helper is waiting
+       * to be resumed (see waitingHelpers). A `result`
        * is not the end: with stdin open the CLI writes one each time the main
        * assistant finishes a message, including while a background task works
        * on. Runs after every frame and on one event loop with offer(), so a
@@ -668,6 +783,31 @@ export class ClaudeAdapter extends ProviderAdapter {
         // close; checked here as well so the rule does not hinge on that.
         if (!openingTakenIn) return;
         if (mainState !== 'idle' || runningTasks.size > 0 || (port?.pendingCount() ?? 0) > 0) return;
+        // A helper waiting to be resumed holds the turn for its window. Not
+        // activity: the silence clock runs on, and the wall clock bounds it.
+        if (waitingHelpers.size > 0) {
+          openResumeWindows();
+          const now = Date.now();
+          let next = Infinity;
+          for (const [helperId, deadline] of waitingHelpers) {
+            if (deadline !== null && deadline <= now) {
+              log.info('No resume of a waiting helper within the window', { requestId, taskId: helperId });
+              waitingHelpers.delete(helperId);
+            } else if (deadline !== null) {
+              next = Math.min(next, deadline);
+            }
+          }
+          if (waitingHelpers.size > 0) {
+            clearResumeTimer();
+            resumeTimer = setTimeout(() => {
+              resumeTimer = null;
+              maybeClose();
+            }, Math.max(0, next - now));
+            resumeTimer.unref?.();
+
+            return;
+          }
+        }
         if (notificationsOwed > 0) {
           graceTimer ??= setTimeout(() => {
             graceTimer = null;
@@ -1120,6 +1260,16 @@ export class ClaudeAdapter extends ProviderAdapter {
           // assistant frames: the CLI emits no stream_event for a sidechain. A
           // blanket rule would drop that output entirely, and the turn would
           // read as the sub-agent having done nothing.
+          // A helper's own tool calls, so the tasks they start can be told
+          // apart by whose they are (see callParent). Before the twin check:
+          // this is bookkeeping, not output.
+          const caller = parentOf(parsed).parent_tool_use_id;
+          if (caller !== undefined && Array.isArray(message['content'])) {
+            for (const block of message['content'] as Array<Record<string, unknown>>) {
+              if (block?.['type'] === 'tool_use' && typeof block['id'] === 'string') callParent.set(block['id'], caller);
+            }
+          }
+
           const messageId = typeof message['id'] === 'string' ? message['id'] : undefined;
           if (mapper.wasStreamed(messageId)) {
             return;
@@ -1464,6 +1614,7 @@ export class ClaudeAdapter extends ProviderAdapter {
         port?.end();
         taskOutput.stop();
         if (graceTimer !== null) clearTimeout(graceTimer);
+        clearResumeTimer();
 
         if (!settled) {
           settled = true;
@@ -1500,9 +1651,15 @@ export class ClaudeAdapter extends ProviderAdapter {
         port?.end();
         taskOutput.stop();
         if (graceTimer !== null) clearTimeout(graceTimer);
+        clearResumeTimer();
         finalizer.onChildClose(code);
       });
     });
+  }
+
+  /** HELPER_RESUME_WINDOW_MS; a seam so tests need not wait 30 s. */
+  protected helperResumeWindowMs(): number {
+    return HELPER_RESUME_WINDOW_MS;
   }
 
   async listModels(): Promise<ModelInfo[]> {
