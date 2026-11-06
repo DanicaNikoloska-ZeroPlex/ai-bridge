@@ -123,6 +123,20 @@ The bridge implements exponential backoff reconnection:
 
 On reconnect, the bridge sends a new `hello` message. The server re-associates the connection with the user. The bridge holds no session state of its own — the server owns the `conversation_id → cli_session_id` mapping (see [Conversation Continuity](#conversation-continuity)), so a bridge restart loses nothing.
 
+### Short drops: reliable delivery
+
+A bridge sends `"reliable_delivery": true` in `hello` (flat, beside the other capability flags; the server also accepts it under `capabilities`). It is used **only** when the server's `welcome.config` carries [`reconnect_grace_seconds`](#server--bridge-welcome); a server that does not send it gets exactly the behaviour described above: no `seq`, and a drop stops every running turn and reports it as `bridge_disconnected` after the reconnect.
+
+With a server that does:
+
+- **Numbered frames.** Every `stream` frame of a turn carries `seq`: 1 for the first frame of that `request_id`, +1 per frame, up to and including the `done` or `error` frame. A frame that cannot be encoded at all takes no number, so there is never a gap. Other frames (`ai_request_ack`, `tool_call`, `cancelled`, `turn_input_ack`, ...) are not numbered.
+- **Receipts.** The server answers with `{"type": "stream_ack", "request_id": "…", "seq": N}`, meaning "everything up to N arrived" (cumulative). The bridge keeps every frame of a turn until an ack covers it, and lets go of the turn once a `done` or `error` of it is confirmed.
+- **The grace period.** On a drop the bridge does **not** stop its running turns. For `reconnect_grace_seconds` (default 120 for a value that is not a number, at most 3600) they keep working and their frames wait on the machine; frames produced before the next `welcome` are not written either. Work that needs the server waits for the reconnect instead of failing: a tool call the CLI makes during the drop, and a file handed back with `bridge__attach_file`. A tool call that was already waiting for its answer when the connection dropped fails at once: the server answers over the connection the call came in on, so that answer is gone, and the call is not sent again because the server may already have run it.
+- **After reconnecting**, `hello` lists what is still running or still holds unconfirmed frames: `"running_turns": [{"request_id": "…", "last_acked_seq": N}]`. After the `welcome` the bridge re-sends, per turn and in order, every frame after `last_acked_seq`, including a final frame that was never confirmed; then the waiting work goes ahead.
+- **Not taken back.** If the server does not confirm a re-attached turn's first frame on the new connection within 30 seconds, it no longer holds that turn (its own grace period ran out first, for instance): the bridge stops it and reports `bridge_disconnected`.
+- **Grace expired.** A turn still kept when the grace period ends, or when the server that answers the reconnect does not do reliable delivery, is stopped and reported as `bridge_disconnected` after the reconnect, as before.
+- **A `session_lost` re-issue** under the same `request_id` numbers its frames **from 1 again** (the server accepts 1 or the error frame's `seq` + 1; this bridge always restarts). The server's ack for the old error frame arrives after the re-issued `ai_request` and is not applied to the new run.
+
 ---
 
 ## Handshake
@@ -333,6 +347,14 @@ Since ai-bridge 0.33.0. This bridge honours [`ai_request.cli_isolation`](#additi
 
 This bridge sends the [`input_closed`](#input_closed) stream event when a turn with its input open stops taking messages. A bridge without it still closes the input by the terminal rule but says nothing — and it may close it too early, before the CLI has read the opening message (see the terminal rule under [`accepts_input`](#additive-option-accepts_input--a-turn-that-takes-messages-while-it-runs)). A server can then learn of the close only from a `turn_input` answered `turn_ending`, or from the terminal frame. An older server ignores the field and the event.
 
+#### Additive field: `reliable_delivery`
+
+```json
+{ "type": "hello", "...": "...", "reliable_delivery": true, "running_turns": [{ "request_id": "req_abc123", "last_acked_seq": 7 }] }
+```
+
+This bridge numbers its stream frames, keeps them until `stream_ack`, and keeps its turns running through a short drop, when the server's welcome says it does too. `running_turns` is present only on a reconnect during the grace period. See [Short drops](#short-drops-reliable-delivery). An older server ignores both fields.
+
 #### Additive field: `effort_levels`
 
 ```json
@@ -431,6 +453,10 @@ Sent whether or not the posture matches the request, so a server always knows wh
   "refreshed_token": "<new JWT>"
 }
 ```
+
+#### `config.reconnect_grace_seconds`
+
+How long, in seconds, a turn keeps running through a dropped connection. Its presence is what tells the bridge the server does reliable delivery; see [Short drops](#short-drops-reliable-delivery). Absent: a drop stops every running turn, as it always did.
 
 #### `cli_isolation`
 
@@ -1559,6 +1585,8 @@ Every streaming event follows this structure:
   "data": {}
 }
 ```
+
+`seq` (integer) is added to every stream frame of a turn against a server with reliable delivery, from 1 per `request_id`; see [Short drops](#short-drops-reliable-delivery).
 
 ### Block Model
 

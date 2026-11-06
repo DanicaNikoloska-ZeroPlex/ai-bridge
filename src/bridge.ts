@@ -26,6 +26,7 @@ import WebSocket from 'ws';
 import type {
   ProviderCapability,
   BridgeToServerMessage,
+  StreamMessage,
   ServerToBridgeMessage,
   AiRequestMessage,
   CliIsolation,
@@ -103,6 +104,7 @@ import { createLogger } from './utils/logger.js';
 import { clampRequestTimeout, clampSilenceTimeout, clampHeartbeat, toSeconds } from './utils/clamp.js';
 import { FatalBridgeError, RequestRefusal } from './errors.js';
 import { replaceLoneSurrogates } from './providers/result-text.js';
+import { StreamOutbox } from './protocol/outbox.js';
 
 export { FatalBridgeError } from './errors.js';
 
@@ -197,9 +199,23 @@ export interface BridgeOptions {
    * can send.
    */
   allowNative?: boolean;
+  /**
+   * How long a turn re-attached after a reconnect may wait for the server to
+   * confirm its first frame on the new connection before the bridge decides
+   * the server no longer holds it (PROTOCOL.md, "Short drops"). Default
+   * 30 s; exists so tests need not wait that long.
+   */
+  reattachAckTimeoutMs?: number;
 }
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
+
+/** `welcome.config.reconnect_grace_seconds` when the value is not a number. */
+const DEFAULT_RECONNECT_GRACE_SECONDS = 120;
+/** No turn is kept waiting for a server longer than this, whatever it asks. */
+const MAX_RECONNECT_GRACE_SECONDS = 3600;
+/** See BridgeOptions.reattachAckTimeoutMs. */
+const DEFAULT_REATTACH_ACK_TIMEOUT_MS = 30_000;
 
 /**
  * The wall-clock backstop for a turn.
@@ -527,9 +543,31 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
   private readonly selfUpdate: BridgeOptions['selfUpdate'];
 
+  // Reliable delivery (PROTOCOL.md, "Short drops"; src/protocol/outbox.ts).
+  /** Each turn's numbered frames until the server confirms them. */
+  private readonly outbox = new StreamOutbox();
+  /**
+   * The grace period the last welcome carried, in seconds; null when that
+   * server does not support reliable delivery, which is what turns it all off.
+   */
+  private reconnectGraceSeconds: number | null = null;
+  /** Running while the connection is down and turns are being kept alive. */
+  private graceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Work that needs the server and is waiting for the reconnect. */
+  private serverWaiters: { resolve: () => void; reject: (err: Error) => void }[] = [];
+  /**
+   * Turns given up on (grace expired, or the server did not take them back):
+   * whatever they still emit while unwinding goes out unnumbered, as before.
+   */
+  private readonly lostTurns = new Set<string>();
+  /** Re-attached turns waiting for their first confirmation on the new connection. */
+  private readonly reattachTimers = new Map<string, ReturnType<typeof setTimeout> | null>();
+  private readonly reattachAckTimeoutMs: number;
+
   constructor(options: BridgeOptions) {
     super();
     this.selfUpdate = options.selfUpdate;
+    this.reattachAckTimeoutMs = options.reattachAckTimeoutMs ?? DEFAULT_REATTACH_ACK_TIMEOUT_MS;
     // Refused rather than stripped (decision 0013): a token in --server would be
     // logged here and sent in the URL, which every access log on the way keeps.
     let carriesToken = false;
@@ -622,6 +660,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       }
       const refused = refusalReason(this.localExecution, tool);
       if (refused) log.warn('refusing a local tool', { name: toolName, reason: refused });
+
+      // A call made while the connection is down (a reliable session in its
+      // grace period) waits for the reconnect, then goes out once, on the new
+      // connection. It was never sent, so the server cannot run it twice.
+      await this.serverReachable();
 
       const toolCallId = `mcp-${requestId}-${++this.mcpToolCallSeq}`;
       return this.toolResolver.call(
@@ -716,6 +759,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return `Offered "${basename(path)}" in the chat. It stays on this machine and is sent only if they open it.`;
     }
 
+    // The upload goes to the server: during a drop it waits for the reconnect
+    // rather than failing against a server that is about to come back.
+    await this.serverReachable();
     const uploaded = await uploadAttachment(rawPath, description, ctx);
 
     this.sendStreamEvent(requestId, 'attachment', {
@@ -1169,6 +1215,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
     this.stopHeartbeat();
     this.clearReconnectTimer();
+    this.clearGraceTimer();
+    this.rejectServerWaiters(new Error('the bridge is shutting down'));
+    this.clearReattachTimers();
     this.toolResolver.cancelAll();
     for (const upload of this.incomingUploads.values()) upload.abort.abort(new Error('the bridge is shutting down'));
     // A file being handed back streams over its own HTTP request, which would
@@ -1208,7 +1257,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       && this.incomingUploads.size === 0
       && this.fileReads.size === 0
       && this.transfers.size === 0
-      && this.appSupervisor.inFlight() === 0;
+      && this.appSupervisor.inFlight() === 0
+      // Frames the server has not confirmed yet would be lost with a restart.
+      && !this.outbox.hasUnconfirmed();
   }
 
   /**
@@ -1249,6 +1300,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     switch (message.type) {
       case 'welcome':
         this.handleWelcome(message);
+        break;
+      case 'stream_ack':
+        this.handleStreamAck(message);
         break;
       case 'ai_request':
         this.handleAiRequest(message);
@@ -1440,28 +1494,47 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // reconnect correctly detects a missing welcome.
     this.sessionId = null;
 
+    this.clearReattachTimers();
+
+    // A server with reliable delivery keeps this machine's turns for the grace
+    // period, so they keep running here too: their frames wait in the outbox
+    // and go out again after the reconnect. Not on a rejected token (4001),
+    // which never reconnects.
+    const keepTurns = this.reconnectGraceSeconds !== null && !this.isShuttingDown && code !== 4001;
+
     // Cancel all pending tool resolvers immediately on WebSocket close to fail
-    // in-flight tool calls instead of letting them stall.
-    this.toolResolver.cancelAll();
+    // in-flight tool calls instead of letting them stall. On a kept turn too:
+    // the server answers a call over the connection it came in on, so the
+    // answer to one in flight is gone with it. Asking again could run the tool
+    // twice, so the call fails, and says why.
+    this.toolResolver.cancelAll(keepTurns
+      ? 'Tool call failed: the connection to the server dropped while it was running, so its result was lost. '
+        + 'It was not sent again, because the server may already have run it.'
+      : undefined);
 
     // An upload cannot be confirmed over a socket that is gone, so its partial
     // file is removed now rather than when a stall timer notices.
     for (const upload of this.incomingUploads.values()) upload.abort.abort(new Error('the connection to the server dropped'));
     for (const read of this.fileReads.values()) read.abort();
 
-    // Abort all active AI requests on unexpected disconnect so their CLI
-    // subprocesses are terminated; otherwise the server never receives a done
-    // event and the conversation slot stays blocked until its timeout fires.
-    if (!this.isShuttingDown) {
-      for (const [id, controller] of this.activeRequests) {
-        controller.abort();
-        // Record the aborted request so it can be replayed as a
-        // terminal error after reconnect — with its input port, if it had
-        // one, so the replay can say which accepted messages were never read.
-        this.disconnectedTurns.push({ requestId: id, turnInput: this.turnInputs.get(id) ?? null, ended: false, due: false });
-        log.debug('Aborted active request on disconnect', { requestId: id });
+    if (keepTurns) {
+      if (this.graceTimer === null) {
+        const seconds = this.reconnectGraceSeconds!;
+        log.info('Connection dropped; keeping running turns for the grace period', {
+          graceSeconds: seconds,
+          turns: [...this.activeRequests.keys()],
+        });
+        this.graceTimer = setTimeout(() => {
+          this.graceTimer = null;
+          this.endGrace('the grace period ended before the connection came back');
+        }, seconds * 1000);
+        this.graceTimer.unref?.();
       }
-      this.activeRequests.clear();
+    } else if (!this.isShuttingDown) {
+      // Abort all active AI requests on unexpected disconnect so their CLI
+      // subprocesses are terminated; otherwise the server never receives a done
+      // event and the conversation slot stays blocked until its timeout fires.
+      this.abortTurnsForDisconnect();
     }
 
     this.upstream?.serverDisconnected();
@@ -1489,6 +1562,144 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
   }
 
+  /**
+   * Stop every running turn because the connection is gone for good (as far
+   * as they are concerned), and remember each to be reported as
+   * `bridge_disconnected` once a server is back. What reliable delivery was
+   * still holding for them is dropped.
+   */
+  private abortTurnsForDisconnect(): void {
+    for (const [id, controller] of this.activeRequests) {
+      controller.abort();
+      // Record the aborted request so it can be replayed as a
+      // terminal error after reconnect — with its input port, if it had
+      // one, so the replay can say which accepted messages were never read.
+      this.disconnectedTurns.push({ requestId: id, turnInput: this.turnInputs.get(id) ?? null, ended: false, due: false });
+      this.lostTurns.add(id);
+      log.debug('Aborted active request on disconnect', { requestId: id });
+    }
+    this.activeRequests.clear();
+    // A turn that had already ended here but whose last frames were never
+    // confirmed is reported the same way: the server never heard it end.
+    for (const id of this.outbox.requestIds()) {
+      if (!this.outbox.serverEnded(id) && !this.disconnectedTurns.some((t) => t.requestId === id)) {
+        this.disconnectedTurns.push({ requestId: id, turnInput: null, ended: true, due: false });
+      }
+    }
+    this.outbox.clear();
+  }
+
+  /**
+   * The grace period is over without the server taking the turns back (it
+   * ran out, or the server that answered does not do reliable delivery):
+   * stop them and report them as today.
+   */
+  private endGrace(why: string): void {
+    this.clearGraceTimer();
+    log.warn('Stopping the turns kept through the drop', { reason: why, turns: this.outbox.requestIds() });
+    this.rejectServerWaiters(new Error(`the connection to the server is gone: ${why}`));
+    this.abortTurnsForDisconnect();
+  }
+
+  private clearGraceTimer(): void {
+    if (this.graceTimer !== null) {
+      clearTimeout(this.graceTimer);
+      this.graceTimer = null;
+    }
+  }
+
+  private clearReattachTimers(): void {
+    for (const timer of this.reattachTimers.values()) if (timer !== null) clearTimeout(timer);
+    this.reattachTimers.clear();
+  }
+
+  /**
+   * Resolves when the server can be reached: at once while connected (or when
+   * there is no grace period to wait in, which keeps the old behaviour), else
+   * at the next welcome. Rejects if the grace period ends first.
+   */
+  private serverReachable(): Promise<void> {
+    if (this.graceTimer === null || this.isShuttingDown) return Promise.resolve();
+
+    return new Promise((resolve, reject) => this.serverWaiters.push({ resolve, reject }));
+  }
+
+  private releaseServerWaiters(): void {
+    const waiters = this.serverWaiters;
+    this.serverWaiters = [];
+    for (const w of waiters) w.resolve();
+  }
+
+  private rejectServerWaiters(err: Error): void {
+    const waiters = this.serverWaiters;
+    this.serverWaiters = [];
+    for (const w of waiters) w.reject(err);
+  }
+
+  /** Whether a turn's stream frames are numbered and kept (reliable delivery). */
+  private numbersFramesOf(requestId: string): boolean {
+    return this.reconnectGraceSeconds !== null && !this.lostTurns.has(requestId);
+  }
+
+  /** Connected and welcomed: what a numbered frame needs to be written at once. */
+  private canWriteStream(): boolean {
+    return this.ws !== null && this.ws.readyState === WebSocket.OPEN && this.sessionId !== null;
+  }
+
+  /**
+   * `stream_ack`: the server stored a turn's frames up to `seq`. Trims the
+   * outbox, and lets go of a turn the server has ended once it has ended here.
+   */
+  private handleStreamAck(message: { request_id?: unknown; seq?: unknown }): void {
+    const requestId = message.request_id;
+    const seq = message.seq;
+    if (typeof requestId !== 'string' || typeof seq !== 'number' || !Number.isInteger(seq) || seq < 0) {
+      log.warn('Dropping a malformed stream_ack');
+
+      return;
+    }
+
+    const { ended, known } = this.outbox.ack(requestId, seq);
+    if (!known) return;
+    // The server holds this turn on the new connection.
+    const timer = this.reattachTimers.get(requestId);
+    if (timer !== undefined) {
+      if (timer !== null) clearTimeout(timer);
+      this.reattachTimers.delete(requestId);
+    }
+    if (ended && !this.activeRequests.has(requestId)) this.outbox.forget(requestId);
+  }
+
+  /**
+   * A re-attached turn just had a frame written on the new connection: if the
+   * server does not confirm it in time, it no longer holds the turn (its own
+   * grace period ran out first, say), and the turn is stopped and reported.
+   */
+  private armReattachCheck(requestId: string): void {
+    if (this.reattachTimers.get(requestId) !== null) return;
+    this.reattachTimers.set(requestId, setTimeout(() => {
+      this.reattachTimers.delete(requestId);
+      log.warn('The server did not take this turn back after the reconnect; stopping it', { requestId });
+      this.outbox.forget(requestId);
+      this.lostTurns.add(requestId);
+      const controller = this.activeRequests.get(requestId);
+      if (controller !== undefined) {
+        controller.abort();
+        this.activeRequests.delete(requestId);
+      }
+      // Reported like any turn a drop aborted: at once, or for a turn with its
+      // input open once its CLI has stopped (see replayDisconnectedTurn()).
+      const turn: DisconnectedTurn = {
+        requestId,
+        turnInput: controller !== undefined ? this.turnInputs.get(requestId) ?? null : null,
+        ended: controller === undefined,
+        due: true,
+      };
+      this.disconnectedTurns.push(turn);
+      if (turn.turnInput === null || turn.ended) this.replayDisconnectedTurn(turn);
+    }, this.reattachAckTimeoutMs));
+  }
+
   private onError(err: Error): void {
     log.error('WebSocket error', { error: err.message });
     this.emit('error', err);
@@ -1508,6 +1719,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // Advertise only providers whose CLI was actually detected — the server
     // should never offer the user a provider this machine cannot run.
     const availableProviders = this.providers.filter((p) => p.available);
+    const runningTurns = this.graceTimer !== null ? this.outbox.runningTurns() : [];
     const hello: BridgeToServerMessage = {
       type: 'hello',
       version: PROTOCOL_VERSION,
@@ -1565,12 +1777,19 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         max_total_bytes: this.attachmentLimits.maxTotalBytes,
         max_count: this.attachmentLimits.maxCount,
       },
+      // Numbered, confirmed stream frames, and turns kept through a short drop
+      // (PROTOCOL.md, "Short drops"). Used only if the welcome says the server
+      // does it too (`config.reconnect_grace_seconds`).
+      reliable_delivery: true,
+      // After a drop: what this machine still runs or still holds frames of.
+      ...(runningTurns.length > 0 ? { running_turns: runningTurns } : {}),
     };
     this.send(hello);
     log.info('Hello sent', {
       protocol: PROTOCOL_VERSION,
       providers: availableProviders.map((p) => p.name),
       workspaces: this.allowedRoots.map((r) => r.label),
+      ...(runningTurns.length > 0 ? { runningTurns } : {}),
     });
 
     // If no welcome arrives within 15s the server silently dropped our hello;
@@ -1764,6 +1983,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // CLI from a working one.
     adopt('silence_timeout', clampSilenceTimeout);
 
+    // Reliable delivery: on only when this server says it does it, by sending
+    // its grace period. Against any other server everything stays as before.
+    this.adoptReliableDelivery(message.config.reconnect_grace_seconds);
+
     // How long to wait for the server to answer a tool call: strictly below
     // whichever bound will actually end the turn FIRST.
     //
@@ -1892,6 +2115,56 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   }
 
   /**
+   * Adopt `welcome.config.reconnect_grace_seconds`, and when this welcome ends
+   * a drop the turns were kept through, take up where the old connection left
+   * off: every frame the server has not confirmed is written again, in order
+   * per turn (the server drops the ones it already has), then the work that
+   * waited for the server goes ahead.
+   *
+   * Absent means the server does not do reliable delivery: nothing is
+   * numbered, and if turns were being kept they are stopped and reported as
+   * `bridge_disconnected`, exactly as a drop always did.
+   */
+  private adoptReliableDelivery(raw: unknown): void {
+    let grace: number | null = null;
+    if (raw !== undefined && raw !== null) {
+      const seconds = toSeconds(raw);
+      if (seconds === null) {
+        log.warn('Server reconnect_grace_seconds is not a number — using the default', {
+          received: raw,
+          kept: DEFAULT_RECONNECT_GRACE_SECONDS,
+        });
+      }
+      grace = seconds === null
+        ? DEFAULT_RECONNECT_GRACE_SECONDS
+        : Math.min(Math.max(0, Math.floor(seconds)), MAX_RECONNECT_GRACE_SECONDS);
+    }
+    this.reconnectGraceSeconds = grace;
+
+    if (this.graceTimer === null) return;
+
+    if (grace === null) {
+      this.endGrace('the server that answered does not keep turns through a drop');
+
+      return;
+    }
+
+    this.clearGraceTimer();
+    const turns = this.outbox.requestIds().filter((id) => !this.outbox.serverEnded(id));
+    log.info('Reconnected within the grace period; sending what the server has not confirmed', {
+      turns: turns.map((id) => ({ requestId: id, lastAcked: this.outbox.lastAcked(id), unconfirmed: this.outbox.pending(id).length })),
+    });
+    for (const id of turns) {
+      // Armed by the first frame written for it on this connection.
+      this.reattachTimers.set(id, null);
+      const frames = this.outbox.pending(id);
+      for (const frame of frames) this.ws!.send(frame.payload);
+      if (frames.length > 0) this.armReattachCheck(id);
+    }
+    this.releaseServerWaiters();
+  }
+
+  /**
    * Tell the server a request aborted by a disconnect is over.
    *
    * On a turn with its input open, `pending_inputs` names every accepted
@@ -1994,6 +2267,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private handleAiRequest(message: AiRequestMessage): void {
     const { request_id } = message;
     const cliSessionId = message.cli_session_id ?? null;
+
+    // The same request id again is the server's `session_lost` re-issue. Its
+    // frames are numbered from 1 again (PROTOCOL.md, "Short drops", allows 1
+    // or the error frame's seq + 1; this bridge restarts).
+    this.lostTurns.delete(request_id);
+    if (this.outbox.has(request_id)) this.outbox.restart(request_id);
+    else if (this.numbersFramesOf(request_id)) this.outbox.open(request_id);
 
     // A contradictory bridge_prompt is refused before anything acts on it: a
     // turn whose instructions are not what either side believes is worse than
@@ -2220,7 +2500,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         this.sendStreamEvent(request_id, 'done', {});
       })
       .finally(() => {
-        this.activeRequests.delete(request_id);
+        // Only our own entry: a re-issue under the same id may own it by now.
+        if (this.activeRequests.get(request_id) === controller) this.activeRequests.delete(request_id);
+        if (this.activeRequests.get(request_id) === undefined) {
+          this.lostTurns.delete(request_id);
+          // Confirmed by the server already: nothing left to keep for it.
+          if (this.outbox.serverEnded(request_id)) this.outbox.forget(request_id);
+        }
         turnInput?.end();
         // An input turn a disconnect aborted is replayed only once it has
         // ended (see handleWelcome). If the server is back already, that is now.
@@ -2721,11 +3007,73 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       const ui = typeof data?.['tool_call_id'] === 'string' ? this.upstream.takeUi(data['tool_call_id'] as string) : undefined;
       if (ui) message = { ...message, data: { ...data, ui } } as BridgeToServerMessage;
     }
+
+    // A turn's frames against a server with reliable delivery: numbered, kept
+    // until confirmed, and never dropped for want of a connection.
+    if (message.type === 'stream' && this.numbersFramesOf(message.request_id)) {
+      this.sendNumbered(message);
+
+      return;
+    }
+
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       log.warn('Cannot send message — WebSocket not open', { type: message.type });
       return;
     }
 
+    const encoded = this.encode(message);
+    if (encoded === null) return;
+
+    this.ws.send(encoded.payload);
+    log.debug('Message sent', { type: message.type, bytes: Buffer.byteLength(encoded.payload, 'utf8') });
+  }
+
+  /**
+   * One stream frame of a turn under reliable delivery (PROTOCOL.md, "Short
+   * drops"). It gets the turn's next `seq` and stays in the outbox until a
+   * `stream_ack` covers it; while the connection is down (or not yet
+   * welcomed) it only waits there, and the next welcome writes it.
+   *
+   * The number is taken only once the frame has been encoded: a frame that
+   * cannot be sent at all must not leave a gap, because the server stores
+   * nothing after one.
+   */
+  private sendNumbered(message: StreamMessage): void {
+    const requestId = message.request_id;
+    const seq = this.outbox.peek(requestId);
+    const encoded = this.encode({ ...message, seq });
+    if (encoded === null) return;
+
+    this.outbox.allocate(requestId);
+    const kept = this.outbox.keep(requestId, {
+      seq,
+      payload: encoded.payload,
+      terminal: encoded.event === 'done' || encoded.event === 'error',
+    });
+
+    if (!this.canWriteStream()) {
+      if (kept) {
+        log.debug('Connection down — frame kept for the reconnect', { requestId, seq, event: encoded.event });
+      } else {
+        log.warn('Cannot send message — WebSocket not open', { type: message.type });
+      }
+
+      return;
+    }
+
+    this.ws!.send(encoded.payload);
+    if (kept) this.armReattachCheck(requestId);
+    log.debug('Message sent', { type: message.type, seq });
+  }
+
+  /**
+   * A frame as it goes on the wire, or something smaller that says why not;
+   * null when nothing that carries its request id fits.
+   *
+   * The single serialisation point, and so the single place a frame's size can
+   * be checked once for every field it carries — including fields added later.
+   */
+  private encode(message: BridgeToServerMessage): { payload: string; event: string | undefined } | null {
     // `JSON.stringify` throws on a circular structure or a BigInt. Nothing
     // reaching here should hold either — every field is parsed from CLI output
     // or built locally — but this runs inside a readline listener, where an
@@ -2744,9 +3092,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
     const bytes = payload === null ? -1 : Buffer.byteLength(payload, 'utf8');
 
-    // The one place a frame is serialised, and so the one place its size can be
-    // checked once for every field rather than at each producer.
-    //
     // Four review rounds of this change found four separate "field X was not
     // bounded" bugs — each a different producer, each missed the same way. The
     // per-field bounds stay, because a marked truncation is a better answer
@@ -2754,64 +3099,57 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // the cap, and the failure is a message the server can read rather than a
     // CLOSE_TOO_BIG that tears the connection down with every in-flight request
     // on it.
-    if (payload === null || bytes > MAX_FRAME_BYTES) {
-      if (payload !== null) log.error('Refusing to send an oversized frame', { type: message.type, bytes });
-
-      // A TERMINAL frame is never dropped. `done` is how the server learns the
-      // turn ended; withholding it hangs the request until a timeout, which is
-      // a worse outcome than the oversized frame this guard exists to prevent
-      // — and reachable, because `permission_denials` carries each refused
-      // call's whole input, so one denied large write is enough.
-      //
-      // Every fallback below goes through `trySend`, which measures. A guard
-      // that replaces one oversized frame with another it never measured is
-      // not a guard: `stripToEssentials` keeps `usage` and `cli_session_id`,
-      // both provider-supplied and neither bounded anywhere, so the stripped
-      // frame CAN still be over the cap — and then closes the connection
-      // exactly as if the guard were not here.
-      for (const fallback of this.fallbacksFor(message, bytes)) {
-        if (this.trySend(fallback)) {
-          log.warn('Sent a reduced frame in place of an oversized one', { type: message.type, bytes });
-
-          return;
-        }
-      }
-
-      // Nothing that carries the request id fits, which means the id itself is
-      // the size problem. There is no frame left to send — every one would be
-      // uncorrelatable or oversized — so the connection survives and the
-      // request times out, which is the least bad of three bad outcomes.
-      log.error('Could not reduce a frame to a sendable size', { type: message.type, bytes });
-
-      return;
+    if (payload !== null && bytes <= MAX_FRAME_BYTES) {
+      return { payload, event: (message as { event?: string }).event };
     }
 
-    this.ws.send(payload);
-    log.debug('Message sent', { type: message.type, bytes });
+    if (payload !== null) log.error('Refusing to send an oversized frame', { type: message.type, bytes });
+
+    // A TERMINAL frame is never dropped. `done` is how the server learns the
+    // turn ended; withholding it hangs the request until a timeout, which is
+    // a worse outcome than the oversized frame this guard exists to prevent
+    // — and reachable, because `permission_denials` carries each refused
+    // call's whole input, so one denied large write is enough.
+    //
+    // Every fallback below goes through `fit`, which measures. A guard
+    // that replaces one oversized frame with another it never measured is
+    // not a guard: `stripToEssentials` keeps `usage` and `cli_session_id`,
+    // both provider-supplied and neither bounded anywhere, so the stripped
+    // frame CAN still be over the cap — and then closes the connection
+    // exactly as if the guard were not here.
+    for (const fallback of this.fallbacksFor(message, bytes)) {
+      const fitted = this.fit(fallback);
+      if (fitted !== null) {
+        log.warn('Sent a reduced frame in place of an oversized one', { type: message.type, bytes });
+
+        return { payload: fitted, event: fallback['event'] as string | undefined };
+      }
+    }
+
+    // Nothing that carries the request id fits, which means the id itself is
+    // the size problem. There is no frame left to send — every one would be
+    // uncorrelatable or oversized — so the connection survives and the
+    // request times out, which is the least bad of three bad outcomes.
+    log.error('Could not reduce a frame to a sendable size', { type: message.type, bytes });
+
+    return null;
   }
 
-
   /**
-   * Send a frame only if it fits. Returns whether it went.
+   * A frame encoded, only if it fits; null otherwise.
    *
    * The single measuring point for everything the oversize path produces, so a
    * new fallback cannot be added without being measured.
    */
-  private trySend(frame: Record<string, unknown>): boolean {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
-
+  private fit(frame: Record<string, unknown>): string | null {
     let payload: string;
     try {
       payload = JSON.stringify(frame);
     } catch {
-      return false;
+      return null;
     }
 
-    if (Buffer.byteLength(payload, 'utf8') > MAX_FRAME_BYTES) return false;
-
-    this.ws.send(payload);
-
-    return true;
+    return Buffer.byteLength(payload, 'utf8') > MAX_FRAME_BYTES ? null : payload;
   }
 
   /**
@@ -2820,6 +3158,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * fits unless the id alone does not.
    */
   private *fallbacksFor(message: BridgeToServerMessage, bytes: number): Generator<Record<string, unknown>> {
+    // A numbered frame's stand-in keeps its number: it takes the frame's place.
+    const seq = (message as { seq?: number }).seq;
+    for (const frame of this.plainFallbacksFor(message, bytes)) {
+      yield seq !== undefined && frame['type'] === 'stream' ? { ...frame, seq } : frame;
+    }
+  }
+
+  private *plainFallbacksFor(message: BridgeToServerMessage, bytes: number): Generator<Record<string, unknown>> {
     const stripped = this.stripToEssentials(message);
     if (stripped !== null) {
       yield stripped;
@@ -2896,7 +3242,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
           // a literal `\ud83d` — valid UTF-8, valid-looking, and rejected
           // OUTRIGHT by PHP's `json_decode`. That would destroy the terminal
           // frame this whole path exists to guarantee, and the request would
-          // hang to timeout anyway. `trySend` measures size; nothing measured
+          // hang to timeout anyway. `fit` measures size; nothing measured
           // well-formedness.
           // Slice FIRST, then scrub. Scrubbing first and slicing after cuts a
           // pair the scrub had just approved, putting a lone surrogate back —

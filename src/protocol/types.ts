@@ -232,6 +232,19 @@ export interface HelloMessage {
    */
   attachment_limits?: AttachmentLimitsRef;
   /**
+   * This bridge numbers its stream frames (`seq`), keeps them until a
+   * `stream_ack` covers them, and keeps its turns running through a short drop
+   * (PROTOCOL.md, "Short drops"). Used only when the server's welcome carries
+   * `config.reconnect_grace_seconds`; an older server ignores the field.
+   */
+  reliable_delivery?: true;
+  /**
+   * After a reconnect: the turns this bridge still runs or still holds
+   * unconfirmed frames of, with the last seq the server confirmed. The server
+   * re-attaches these and fails every other turn it held detached.
+   */
+  running_turns?: { request_id: string; last_acked_seq: number }[];
+  /**
    * This bridge accepts `upload_offer`: a file a person picked in a chat,
    * streamed through the server into `<working folder>/file-uploads/` and not
    * kept by the server. Absent from a bridge that predates it, and a server
@@ -391,6 +404,8 @@ export interface StreamMessage {
   request_id: string;
   event: StreamEventType;
   data: StreamEventData;
+  /** 1, 2, 3... per request id; only against a server with reliable delivery. */
+  seq?: number;
 }
 
 /** Sent periodically to keep the connection alive. */
@@ -736,6 +751,13 @@ export interface ServerConfig {
    * bridge's default. `0` disables it.
    */
   silence_timeout?: number;
+  /**
+   * How long, in seconds, a turn keeps running through a dropped connection
+   * (PROTOCOL.md, "Short drops"). Its presence is what says the server
+   * supports reliable delivery; absent means an older server, and a drop
+   * stops every running turn as before.
+   */
+  reconnect_grace_seconds?: number;
   /**
    * What should happen to a file the assistant hands back.
    *
@@ -1254,7 +1276,15 @@ export interface UpstreamAuthForgetMessage {
   server: string;
 }
 
+/** The server stored a turn's frames up to and including `seq` (cumulative). */
+export interface StreamAckMessage {
+  type: 'stream_ack';
+  request_id: string;
+  seq: number;
+}
+
 export type ServerToBridgeMessage =
+  | StreamAckMessage
   | UpstreamAuthStartMessage
   | UpstreamAuthCodeMessage
   | UpstreamAuthForgetMessage

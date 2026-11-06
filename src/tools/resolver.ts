@@ -139,12 +139,13 @@ export class ToolResolver {
   }
 
   /**
-   * Cancel all pending tool calls (e.g., on disconnect).
+   * Cancel all pending tool calls (e.g., on disconnect), with `reason` as the
+   * error each one fails with when given.
    */
-  cancelAll(): void {
-    for (const [id, pending] of this.pending) {
+  cancelAll(reason?: string): void {
+    for (const [, pending] of this.pending) {
       clearTimeout(pending.timer);
-      pending.reject(new Error('Tool call cancelled — bridge disconnected'));
+      pending.reject(new Error(reason ?? 'Tool call cancelled — bridge disconnected'));
     }
     const count = this.pending.size;
     this.pending.clear();
