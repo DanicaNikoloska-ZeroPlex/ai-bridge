@@ -350,3 +350,34 @@ describe('a codex turn stopped by the bridge', () => {
     expect(events.filter((e) => e.event === 'done')).toHaveLength(1);
   });
 });
+
+/**
+ * A server tool that answered with an image (tool_resolve.content) reaches
+ * Codex as an MCP image block, and Codex reports the call's result as the whole
+ * CallToolResult. Forwarded as JSON, the picture went to the server inside the
+ * echo; it is described instead, and the text beside it is kept.
+ */
+describe('codex tool results with an image', () => {
+  it('describe the image and keep the text', async () => {
+    const image = Buffer.alloc(300 * 1024, 1).toString('base64');
+    const events = await replay([
+      { type: 'thread.started', thread_id: 't1' },
+      {
+        type: 'item.completed',
+        item: {
+          id: 'mcp_3', type: 'mcp_tool_call', server: 'bridge', tool: 'render',
+          arguments: {}, status: 'completed',
+          result: { content: [{ type: 'text', text: 'Floor 1' }, { type: 'image', mimeType: 'image/webp', data: image }] },
+        },
+      },
+      { type: 'turn.completed', usage: {} },
+    ]);
+
+    const results = events.filter((e) => e.event === 'tool_result');
+    const text = results.map((e) => (e.data as { result: string }).result).join('');
+    expect(text).not.toContain(image.slice(0, 100));
+    expect(JSON.parse(text)).toEqual({
+      content: [{ type: 'text', text: 'Floor 1' }, { type: 'text', text: '[image: image/webp, 300 KB]' }],
+    });
+  });
+});

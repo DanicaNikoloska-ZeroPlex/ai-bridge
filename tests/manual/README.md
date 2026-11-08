@@ -37,6 +37,9 @@ specified against:
   arrives on disk with a matching checksum, the model reads it, and the
   directory is gone afterwards.
 
+- with `--with-cli`: a server tool that answers with an image (`tool_resolve.content`)
+  has it seen by the model, and the image bytes are not echoed back to the server.
+
 - with `--with-cli`: an `isolated` turn cannot read a file outside its working
   directory, **while server-declared tools still work** — the two halves of the
   isolation guarantee, checked on the machine you are running this on.

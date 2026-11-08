@@ -269,6 +269,14 @@ This bridge answers [`file_read`](#handing-files-back): it hands back a file it 
 
 This bridge understands [`app_call`](#app-backends). Sent whatever `--local-tools` says, like the flags above: it says the frame is understood, and a bridge that did not opt in answers every `app_call` with a refusal. A server must not send `app_call` to a bridge that did not advertise it; it would be logged as an unknown frame and never answered.
 
+#### Additive field: `tool_result_content`
+
+```json
+{ "type": "hello", "...": "...", "tool_result_content": true }
+```
+
+This bridge takes [`tool_resolve.content`](#text-and-images-tool_resolvecontent): a server tool's answer as text and image parts, handed to the CLI as MCP content blocks. A server must not send `content` to a bridge without it; an older bridge reads `result`.
+
 #### Additive field: `self_update`
 
 ```json
@@ -2129,6 +2137,30 @@ After the server executes a tool, it sends the result back:
 }
 ```
 
+#### Text and images: `tool_resolve.content`
+
+A server tool can answer with content parts, so the model sees a picture beside the text (a rendered map, a chart). The bridge advertises this as `hello.tool_result_content: true` (0.38.0); a server must not send `content` to a bridge without it.
+
+```json
+{
+  "type": "tool_resolve",
+  "request_id": "req_abc123",
+  "tool_call_id": "tc_001",
+  "result": "Floor 1, 40x30 squares.\n[image: image/webp, 210 KB]",
+  "content": [
+    { "type": "text", "text": "Floor 1, 40x30 squares." },
+    { "type": "image", "mimeType": "image/webp", "data": "<base64>" }
+  ]
+}
+```
+
+- `content` is the MCP `CallToolResult` content list: `text` parts (`text`, a string) and `image` parts (`data`, standard base64; `mimeType`, one of `image/png`, `image/jpeg`, `image/gif`, `image/webp`), at most 32 parts. The bridge hands them to the CLI as MCP content blocks, in order.
+- `result` stays the text alone, with each image described in its place; it is what an older bridge reads, and what the CLI gets when `content` is refused.
+- A `content` the bridge cannot pass on whole (not a list, empty, more than 32 parts, an unknown part type, another image type, data that is not base64) is refused as a whole and logged; the CLI gets `result`.
+- Size: the bridge takes incoming frames up to 10 MB and closes the connection on a bigger one, taking every turn on it. A server keeps a `tool_resolve` with `content` well under that (laravel-ai-bridge: 8 MB, else it sends `result` saying the images were not sent).
+- The image bytes go no further than the CLI. The CLI's report of the call, echoed to the server as the stream's `tool_result`, carries a description instead (`[image: image/webp, 210 KB]`), for Claude and Codex alike.
+- Claude Code passes image blocks to the model (checked live with 2.1.311). Current Codex and Gemini CLI read MCP image blocks too, per their sources (not tested live); a CLI that does not reads the text parts.
+
 ### Server → Bridge: `tool_error`
 
 If a tool execution fails:
@@ -2731,7 +2763,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `ai_request` | New AI request for a conversation |
 | `cancel` | Stop a turn that is running |
 | `turn_input` | A message for a turn that is still running |
-| `tool_resolve` | Returning tool execution result |
+| `tool_resolve` | Returning tool execution result (with `content`, text and image parts, to a bridge advertising `tool_result_content`) |
 | `tool_error` | Tool execution failed |
 | `local_call` | Asking the bridge to run one tool on this machine |
 | `upload_offer` | A person's file is coming: fetch it into `file-uploads/` |
@@ -2800,6 +2832,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Upstream sign-in does not bump the version.** `hello.mcp_upstream_auth`, `welcome.upstream_oauth`, `upstream_status` and the `upstream_auth_*` frames are additive; their shape is versioned by `hello.mcp_upstream_auth.revision`, and a server must not send the server→bridge frames to a bridge without it.
 
 **Self-update does not bump the version.** `welcome.desired_bridge_version` and `hello.self_update` are additive in both directions.
+
+**Images in tool results do not bump the version.** `hello.tool_result_content` and `tool_resolve.content` are additive; a server must not send `content` to a bridge that did not advertise `tool_result_content`, and an older server sends `result` alone, which is what it always meant.
 
 **App backends do not bump the version.** `hello.app_backends`, `app_call` and `app_result` are additive; a server must not send `app_call` to a bridge that did not advertise `app_backends`. `hello.app_items` and `app_call.use` are additive the same way.
 
