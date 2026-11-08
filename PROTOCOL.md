@@ -2156,9 +2156,9 @@ A server tool can answer with content parts, so the model sees a picture beside 
 
 - `content` is the MCP `CallToolResult` content list: `text` parts (`text`, a string) and `image` parts (`data`, standard base64; `mimeType`, one of `image/png`, `image/jpeg`, `image/gif`, `image/webp`), at most 32 parts. The bridge hands them to the CLI as MCP content blocks, in order.
 - `result` stays the text alone, with each image described in its place; it is what an older bridge reads, and what the CLI gets when `content` is refused.
-- A `content` the bridge cannot pass on whole (not a list, empty, more than 32 parts, an unknown part type, another image type, data that is not base64) is refused as a whole and logged; the CLI gets `result`.
+- An empty or whitespace-only text part is left out (the model's API refuses one). A `content` the bridge cannot pass on whole (not a list, empty, more than 32 parts, an unknown part type, another image type, data that is not base64) is refused as a whole and logged; the CLI gets `result` followed by `[images not passed on by the bridge: <reason>]`, so the model does not take a described image for one it saw.
 - Size: the bridge takes incoming frames up to 10 MB and closes the connection on a bigger one, taking every turn on it. A server keeps a `tool_resolve` with `content` well under that (laravel-ai-bridge: 8 MB, else it sends `result` saying the images were not sent).
-- The image bytes go no further than the CLI. The CLI's report of the call, echoed to the server as the stream's `tool_result`, carries a description instead (`[image: image/webp, 210 KB]`), for Claude and Codex alike.
+- The image bytes go no further than the CLI. The CLI's report of the call, echoed to the server as the stream's `tool_result`, carries a description instead (`[image: image/webp, 210 KB]`), for Claude, Codex and Gemini alike.
 - Claude Code passes image blocks to the model (checked live with 2.1.311). Current Codex and Gemini CLI read MCP image blocks too, per their sources (not tested live); a CLI that does not reads the text parts.
 
 ### Server → Bridge: `tool_error`

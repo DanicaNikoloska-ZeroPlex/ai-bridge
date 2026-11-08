@@ -57,7 +57,7 @@ import {
 } from '../mcp/cli-config.js';
 import { RequestRefusal } from '../errors.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundArguments, safeStringify, toolResultEventData } from './result-text.js';
+import { boundArguments, safeStringify, toolResultEventData, withoutBinaryParts } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 import { stopTurn, stoppedByUs } from './stop.js';
 import { logIgnoredSubagentPrompt } from './subagent-prompt.js';
@@ -436,7 +436,9 @@ export class GeminiAdapter extends ProviderAdapter {
           // exists — taking the daemon down with every in-flight request on it.
           // Both sibling adapters already guard this.
           const raw = parsed['output'];
-          const output = typeof raw === 'string' ? raw : safeStringify(raw ?? '', '');
+          // An image a tool returned is described, never forwarded: this echo
+          // goes to the server (withoutBinaryParts).
+          const output = typeof raw === 'string' ? raw : safeStringify(withoutBinaryParts(raw ?? ''), '');
           const status = parsed['status'] as string;
 
           // `is_error` is structural, alongside the `Error: ` prefix rather

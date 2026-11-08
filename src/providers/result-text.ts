@@ -732,7 +732,10 @@ export function binaryPlaceholder(part: unknown): string | null {
     : undefined;
   const source = typeof record['source'] === 'object' && record['source'] !== null
     ? record['source'] as Record<string, unknown>
-    : undefined;
+    // Gemini's own part shape: { inlineData: { mimeType, data } }.
+    : typeof record['inlineData'] === 'object' && record['inlineData'] !== null
+      ? record['inlineData'] as Record<string, unknown>
+      : undefined;
   const holder = source ?? resource ?? record;
   const binary = holder['data'] ?? holder['blob'];
   // A base64 payload is binary whatever the part calls itself. Keying on the

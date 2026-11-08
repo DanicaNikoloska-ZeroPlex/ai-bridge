@@ -10,8 +10,9 @@
  *
  * What is accepted is checked here, once, on the way in. A part this bridge
  * cannot pass on is refused as a whole content list, not quietly dropped: the
- * CLI then gets `result`, exactly what an older bridge would have given it,
- * and the log says why.
+ * CLI then gets `result` with a line saying the images were not passed on and
+ * why, and the log says so too. An empty text part is left out (the model's
+ * API refuses one), which is not a refusal.
  */
 
 import { createLogger } from '../utils/logger.js';
@@ -52,18 +53,21 @@ export class ToolContentResult {
 
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
+/** What `tool_resolve.content` came to: parts to pass on, or why not. */
+export type ParsedToolContent =
+  | { parts: ToolContentPart[] }
+  | { refused: string };
+
 /**
- * Read `tool_resolve.content`, or null when there is none to use.
- *
- * Null for an absent field (an older server), and for one this bridge will not
- * pass on, which is logged. The caller then answers with `result`.
+ * Read `tool_resolve.content`: null when there is none (an older server), the
+ * parts, or the reason this bridge will not pass them on (logged here).
  */
-export function parseToolResultContent(raw: unknown, toolCallId: string): ToolContentPart[] | null {
+export function parseToolResultContent(raw: unknown, toolCallId: string): ParsedToolContent | null {
   if (raw === undefined || raw === null) return null;
 
-  const refuse = (reason: string): null => {
+  const refuse = (reason: string): ParsedToolContent => {
     log.warn('tool_resolve.content refused, the CLI gets the text result', { toolCallId, reason });
-    return null;
+    return { refused: reason };
   };
 
   if (!Array.isArray(raw)) return refuse('content is not a list');
@@ -77,7 +81,8 @@ export function parseToolResultContent(raw: unknown, toolCallId: string): ToolCo
 
     if (part['type'] === 'text') {
       if (typeof part['text'] !== 'string') return refuse(`part ${i}: text is not a string`);
-      parts.push({ type: 'text', text: part['text'] });
+      // The model's API refuses an empty text block.
+      if (part['text'].trim() !== '') parts.push({ type: 'text', text: part['text'] });
       continue;
     }
 
@@ -97,5 +102,21 @@ export function parseToolResultContent(raw: unknown, toolCallId: string): ToolCo
     return refuse(`part ${i}: unknown type ${JSON.stringify(String(part['type'])).slice(0, 40)}`);
   }
 
-  return parts;
+  if (parts.length === 0) return refuse('content has only empty text');
+  return { parts };
+}
+
+/**
+ * What the CLI gets for a `tool_resolve`: the parts as a ToolContentResult, or
+ * `result` as it always did. When the parts were refused, `result` (as text)
+ * with a line saying so, so the model does not take a described image for one
+ * it saw.
+ */
+export function toolResolveAnswer(result: unknown, rawContent: unknown, toolCallId: string): unknown {
+  const parsed = parseToolResultContent(rawContent, toolCallId);
+  if (parsed === null) return result;
+
+  const text = typeof result === 'string' ? result : (JSON.stringify(result) ?? '');
+  if ('refused' in parsed) return `${text}\n[images not passed on by the bridge: ${parsed.refused}]`;
+  return new ToolContentResult(parsed.parts, text);
 }

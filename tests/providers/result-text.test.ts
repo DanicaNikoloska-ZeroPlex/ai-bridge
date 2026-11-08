@@ -486,6 +486,11 @@ describe('withoutBinaryParts', () => {
     });
   });
 
+  it("describes Gemini's inlineData parts too", () => {
+    expect(withoutBinaryParts({ content: [{ inlineData: { mimeType: 'image/png', data: 'AAAA' } }] }))
+      .toEqual({ content: [{ type: 'text', text: '[unknown: image/png, 0 KB]' }] });
+  });
+
   it('returns anything without binary parts as it was', () => {
     const value = { content: [{ type: 'text', text: 'a' }] };
     expect(withoutBinaryParts(value)).toBe(value);

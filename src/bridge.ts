@@ -51,7 +51,7 @@ import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from 
 import { detectProviders } from './providers/detector.js';
 import { readClaudeUsage } from './providers/usage.js';
 import { ToolResolver } from './tools/resolver.js';
-import { parseToolResultContent, ToolContentResult } from './tools/content.js';
+import { toolResolveAnswer } from './tools/content.js';
 import { LOCAL_EXECUTION_OFF, refusalReason, runsLocally, type LocalExecutionConfig } from './local/gate.js';
 import { runLocalTool } from './local/executor.js';
 import { fillRoles, loadSecrets, sealedRefs, SecretStore, type EngramConfig, type SealedRef } from './local/engram.js';
@@ -1256,13 +1256,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         break;
       case 'tool_resolve': {
         // Content parts (text and images) from a server that read
-        // hello.tool_result_content; `result` alone from any other, or when
-        // the parts cannot be passed on (src/tools/content.ts).
-        const content = parseToolResultContent(message.content, message.tool_call_id);
-        const text = typeof message.result === 'string' ? message.result : JSON.stringify(message.result) ?? '';
+        // hello.tool_result_content; `result` alone from any other, or with a
+        // line saying why the parts were not passed on (src/tools/content.ts).
         this.toolResolver.resolve(
           message.tool_call_id,
-          content ? new ToolContentResult(content, text) : message.result,
+          toolResolveAnswer(message.result, message.content, message.tool_call_id),
         );
         break;
       }

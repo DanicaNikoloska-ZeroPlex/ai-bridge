@@ -150,10 +150,25 @@ describe('tool_resolve.content', () => {
     ['a text part without text', [{ type: 'text' }]],
     ['an empty list', []],
     ['not a list', { type: 'text', text: 'x' }],
-  ])('falls back to result for %s', async (_what, content) => {
+    ['more than 32 parts', Array.from({ length: 33 }, () => ({ type: 'text', text: 'x' }))],
+    ['only empty text', [{ type: 'text', text: ' ' }]],
+  ])('falls back to result, saying why, for %s', async (_what, content) => {
     answer = { result: 'the text', content };
     const got = await callRender();
-    expect(got.content).toEqual([{ type: 'text', text: 'the text' }]);
+    expect(got.content).toHaveLength(1);
+    expect(got.content[0]!['text']).toMatch(/^the text\n\[images not passed on by the bridge: .+\]$/);
+  });
+
+  it('falls back to a non-string result as its JSON', async () => {
+    answer = { result: { floor: 1 }, content: [{ type: 'image', mimeType: 'image/bmp', data: PNG }] };
+    const got = await callRender();
+    expect(got.content[0]!['text']).toMatch(/^\{"floor":1\}\n\[images not passed on by the bridge: part 0: mimeType/);
+  });
+
+  it('leaves out empty text parts (the model API refuses them)', async () => {
+    answer = { result: 'x', content: [{ type: 'text', text: '' }, { type: 'image', mimeType: 'image/png', data: PNG }] };
+    const got = await callRender();
+    expect(got.content).toEqual([{ type: 'image', mimeType: 'image/png', data: PNG }]);
   });
 
   it('carries images of several megabytes (the bridge takes frames up to 10 MB)', async () => {
