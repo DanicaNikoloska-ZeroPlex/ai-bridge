@@ -256,6 +256,12 @@ export interface HelloMessage {
   /** Takes `app_call.use`: a linked item other than the default, beside one request (0.22.0). */
   app_items?: true;
   /**
+   * Takes `tool_resolve.content`: a server tool's answer as text and image
+   * parts, passed to the CLI as MCP content blocks. A server must not send
+   * `content` to a bridge without it; `result` is what an older one reads.
+   */
+  tool_result_content?: true;
+  /**
    * This bridge follows `welcome.desired_bridge_version` by itself: it runs as
    * a service that can restart it onto a pinned version, and is not opted out.
    * `false` from a bridge that understands the field but will not follow it
@@ -1077,7 +1083,15 @@ export interface ToolResolveMessage {
   type: 'tool_resolve';
   request_id: string;
   tool_call_id: string;
+  /** The answer as one value; the text alone when `content` is sent too. */
   result: unknown;
+  /**
+   * The answer as MCP content parts, `{type: 'text', text}` and
+   * `{type: 'image', data (base64), mimeType}`; only from a server that read
+   * `hello.tool_result_content`. Handed to the CLI as content blocks instead of
+   * `result` (src/tools/content.ts).
+   */
+  content?: unknown;
 }
 
 /** Server responds with an error for a tool call. */

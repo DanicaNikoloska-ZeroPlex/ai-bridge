@@ -19,6 +19,8 @@ const require = createRequire(import.meta.url);
 const { WebSocketServer } = require('ws');
 
 const WITH_CLI = process.argv.includes('--with-cli');
+/** 240x160 PNG: a red triangle left, a blue square right, "K7" in black below. */
+const SHAPES_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAPAAAACgCAIAAAC9uXYyAAAELUlEQVR4nO3dy3EiURBEUYzAiPHfHvmiWWgiRhKfoqtfk51Z90YtCWiSs+fySRTURf0ARCsDNEUFaIoK0BQVoCkqQFNUgKaoAE1RAZqiAjRFBWiKCtAUFaApKkBTVJagP65X9SPQSXMFjWm6mx/oL82AprsZg8Y03WYG+rtmQNNt3qCHmL7++Zh27a2cQN9qBnTqtbeyBz3BtJwXoNf3SDOgI6+9VQLoeNNyXoBe3HPNgM679lYhoLNNy3kBemWvaAZ02LW3ygEdbFrOC9DLel0zoJOuvVUU6FTTcl6AXtNWzYCOufZWaaAjTct5AXpBPc2Azrj2VoGg80zLeQF6b3s0Azrg2ltlgg4zLecF6F3t1wxo92tvFQs6ybScF6D7rdIMaOtrb5UMOsa0nBegm63VDGjfa28VDjrDtJwXoDsdoRnQptfeKh90gGk5L0Bv7jjNgHa89lYjQLublvMC9LaO1gxou2tvNQW0tWk5L0Bv6D2aAe117a0GgfY1LecF6Fd7p2ZAG117q1mgTU3LeQH6pd6vGdAu195qHGhH03JegK5TaQa0xbW3mgjazrScF6CLtJoBff5rbzUUtJdpOS9AP0tOGdDnv/ZWc0EbmZbzAvTD5IgBbXHtrUaDdjEt5wXo+8n5Atrl2ltNB21hWs4L0HeSwwW00bW3ArSBaTkvQP9OThbQXtfeCtAGpuW8AP0jOVZA2117K0AbmJbzAvT/5EwB7XjtrQBtYFrOC9D/kgMFtOm1twK0gWk5L0B/mmoG9EmuvRWgDUzLeQHaWDOgz3DtrQBtYFrOazpoOUdAu197K0AbmJbzGg1aDhHQAdfeCtAGpuW85oKWEwR0xrW3ArSBaTmvoaDl+AAdc+2tAG1gWs5rImg5O0AnXXsrQBuYlvMaB1oODtBh194K0Aam5bxmgZZTA3TetbcCtIFpOa9BoOXIAB157a0AbWBazmsKaDkvQKdeeytAG5iW8xoBWg4L0MHX3grQBqblvPJBy0kBOvvaWwHawLScVzhoOaYzXHtxOjRAYzqqzaDljM5zx/witCtAYzqqbaDlgM52h/0u1Ozd//VNdGiApqgATVEBmqICNEUFaIoK0BQVoCkqQFNUgKaoAE1RAZqiAjRFBWiKCtBFl2+tev1lR0u/XGAMVARorxioCNBeMVARoL1ioKKtQFXPQF8xUBGgvWKgIkB7xUBFgPaKgYoeYQLxOWOsIkB7xVhFgPaKsYoA7RVjFV0edPRnHfH+E2K4IkB7xXBFgPaK4YoA7RXDFT1CtgofiNfGiEWA9ooRiwDtFSMWAdorRix6BdwelIBeGyMWAdorRiwCtFeMWARorxixaCu4o19Pz2PEIkB7xYhFgPaKEYsA7RUjUlSApqgATVEBmqICNEUFaIoK0BQVoCkqQFNUgKaoAE1RAZqi+gvIkNhYcWcjZQAAAABJRU5ErkJggg==';
 const BRIDGE = new URL('../../dist/cli.js', import.meta.url).pathname;
 
 if (!existsSync(BRIDGE)) {
@@ -45,7 +47,7 @@ function check(name, ok, detail = '') {
  * `isolation` of 'omit' leaves `cli_isolation` off the welcome entirely, which
  * is how a server predating this feature behaves.
  */
-async function turn({ isolation = 'workspace', request, args = [], assets = {}, tools = [], toolResult = null, silenceTimeout = null, timeoutMs = 120_000 }) {
+async function turn({ isolation = 'workspace', request, args = [], assets = {}, tools = [], toolResult = null, toolContent = null, silenceTimeout = null, timeoutMs = 120_000 }) {
   const frames = [];
   let requestSentAt = 0;
   let advertised = null;
@@ -105,6 +107,7 @@ async function turn({ isolation = 'workspace', request, args = [], assets = {}, 
             type: 'tool_resolve', request_id: msg.request_id,
             tool_call_id: msg.tool_call_id,
             result: toolResult ?? 'Jasper Bauer — Director, badge 4471',
+            ...(toolContent ? { content: toolContent } : {}),
           }));
         }
         if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
@@ -324,6 +327,26 @@ try {
     check('...while server-declared tools still work in isolated',
       r.toolCalled && /4471|Director/.test(r.text),
       `called=${r.toolCalled}, said: ${r.text.slice(0, 160)}`);
+
+    // A server tool that answers with an image (tool_resolve.content): the
+    // model has to SEE it, which only a real CLI can show. The picture is a red
+    // triangle (left), a blue square (right) and the characters "K7" below.
+    r = await turn({
+      isolation: 'isolated',
+      tools: [{ name: 'show_picture', description: 'Shows you a picture. Takes no arguments.', parameters: { type: 'object', properties: {} } }],
+      toolResult: 'Here is the picture.\n[image: image/png, 1 KB]',
+      toolContent: [{ type: 'text', text: 'Here is the picture.' }, { type: 'image', mimeType: 'image/png', data: SHAPES_PNG }],
+      request: aiRequest({
+        message: 'Call show_picture once, then say which shapes and colours it shows, and what characters are written in it. If you got no picture, say NO IMAGE.',
+      }),
+      timeoutMs: 300_000,
+    });
+    check('a server tool\'s image reaches the model',
+      r.toolCalled && /triangle/i.test(r.text) && /square/i.test(r.text) && r.text.includes('K7'),
+      `called=${r.toolCalled}, said: ${r.text.slice(0, 200)}`);
+    check('...and its bytes are not echoed back to the server',
+      r.toolResults.every((x) => !JSON.stringify(x).includes(SHAPES_PNG.slice(0, 64))) && r.toolResults.length > 0,
+      `echo: ${JSON.stringify(r.toolResults).slice(0, 200)}`);
 
     // Tool names and results. A tool that runs on this machine never reaches
     // the server any other way — the block and its result are the only account

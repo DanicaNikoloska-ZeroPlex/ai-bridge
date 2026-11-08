@@ -41,6 +41,7 @@ import {
   type ListToolsResult,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { ToolDefinition } from '../protocol/types.js';
+import { ToolContentResult } from '../tools/content.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('McpServer');
@@ -178,6 +179,18 @@ export class BridgeMcpServer {
         const result = providerId
           ? await this.handleCall(ctx.requestId, name, args, providerId)
           : await this.handleCall(ctx.requestId, name, args);
+        // A server tool that answered with content parts (text and images,
+        // tool_resolve.content) reaches the CLI as those blocks.
+        if (result instanceof ToolContentResult) {
+          log.info('MCP tool resolved', {
+            requestId: ctx.requestId,
+            name,
+            parts: result.content.length,
+            images: result.content.filter((p) => p.type === 'image').length,
+            imageBytes: result.imageBytes(),
+          });
+          return { content: result.content };
+        }
         const text = typeof result === 'string' ? result : JSON.stringify(result);
         log.info('MCP tool resolved', {
           requestId: ctx.requestId,

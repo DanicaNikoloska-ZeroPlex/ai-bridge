@@ -28,7 +28,7 @@ import { buildSpawnEnv, buildCombinedPrompt, appendStderr, formatStderrMessage, 
 import { startTurnTimeouts, clearRequestTimeout, type TurnTimeouts } from './timeout.js';
 import { buildCodexMcpArgs, CODEX_BEARER_ENV_VAR } from '../mcp/cli-config.js';
 import { resumeAwareErrorCode } from './session-error.js';
-import { boundArgumentText, boundArguments, safeStringify, toolResultEventData } from './result-text.js';
+import { boundArgumentText, boundArguments, safeStringify, toolResultEventData, withoutBinaryParts } from './result-text.js';
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 import { stopTurn, stoppedByUs } from './stop.js';
 import { logIgnoredSubagentPrompt } from './subagent-prompt.js';
@@ -527,7 +527,9 @@ export class CodexAdapter extends ProviderAdapter {
 
             const resultText = failed
               ? `Error: ${errorMsg ?? 'tool call failed'}`
-              : (typeof result === 'string' ? result : safeStringify(result ?? null, 'null'));
+              // An image the tool returned (tool_resolve.content) is described,
+              // not forwarded: the echo goes to the server (withoutBinaryParts).
+              : (typeof result === 'string' ? result : safeStringify(withoutBinaryParts(result ?? null), 'null'));
 
             // `is_error` is structural, alongside the `Error: ` prefix above
             // rather than instead of it: the prefix stays for consumers that
