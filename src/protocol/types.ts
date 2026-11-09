@@ -1556,6 +1556,12 @@ export interface TaskData {
    * Bounded to 8 KB, cut on a character boundary and marked as cut.
    */
   summary?: string;
+  /**
+   * True only on the `updated` `completed` the bridge ends a waiting helper
+   * with when no resume came in the window, so the chat can say a helper was
+   * still waiting. A real completion never carries it.
+   */
+  ended_waiting?: true;
   /** Running totals. Progress and finished only. */
   usage?: TaskUsage;
 }

@@ -219,6 +219,8 @@ describe('a helper waiting on its own work', () => {
       ['updated', 'running'],
       ['updated', 'completed'], ['finished', 'completed'],
     ]);
+    const a1Events = of(turn.events, 'task').filter((e) => (e.data as { task_id?: string }).task_id === 'a1');
+    for (const e of a1Events) expect(e.data).not.toHaveProperty('ended_waiting');
   });
 
   it('is forwarded as completed when the window passes without a resume', async () => {
@@ -235,7 +237,7 @@ describe('a helper waiting on its own work', () => {
     const a1 = turn.events.filter((e) => e.event === 'task' && (e.data as { task_id?: string }).task_id === 'a1');
     const last = a1[a1.length - 1]!;
 
-    expect(last.data).toMatchObject({ phase: 'updated', task_id: 'a1', tool_use_id: 'toolu_a1', task_type: 'local_agent', status: 'completed' });
+    expect(last.data).toMatchObject({ phase: 'updated', task_id: 'a1', tool_use_id: 'toolu_a1', task_type: 'local_agent', status: 'completed', ended_waiting: true });
     expect(turn.events.indexOf(last)).toBeLessThan(turn.events.findIndex((e) => e.event === 'input_closed'));
   });
 

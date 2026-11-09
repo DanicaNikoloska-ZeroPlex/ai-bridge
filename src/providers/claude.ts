@@ -820,7 +820,8 @@ export class ClaudeAdapter extends ProviderAdapter {
               log.info('No resume of a waiting helper within the window', { requestId, taskId: helperId });
               waitingHelpers.delete(helperId);
               // It was shown as waiting; this is its real end, with the last
-              // report it sent while waiting (PROTOCOL.md, `task`).
+              // report it sent while waiting, marked `ended_waiting` so the
+              // chat can say it was still waiting (PROTOCOL.md, `task`).
               const started = startedTasks.get(helperId);
               const summary = waitingSummaries.get(helperId);
               waitingSummaries.delete(helperId);
@@ -833,6 +834,7 @@ export class ClaudeAdapter extends ProviderAdapter {
                   ...(started?.taskType !== undefined ? { task_type: started.taskType } : {}),
                   status: 'completed',
                   ...(summary !== undefined ? { summary } : {}),
+                  ended_waiting: true,
                 },
               });
             } else if (deadline !== null) {
