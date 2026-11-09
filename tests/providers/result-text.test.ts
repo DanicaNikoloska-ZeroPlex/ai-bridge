@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { boundArgumentText, boundArguments, boundResult, safeStringify, replaceLoneSurrogates, replaceLoneSurrogateEscapes, MAX_ARGUMENT_BYTES, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
+import { withoutBinaryParts, boundArgumentText, boundArguments, boundResult, safeStringify, replaceLoneSurrogates, replaceLoneSurrogateEscapes, MAX_ARGUMENT_BYTES, MAX_RESULT_BYTES } from '../../src/providers/result-text.js';
 
 /** What the whole stream frame costs once encoded, as bridge.ts sends it. */
 function frameBytes(result: string): number {
@@ -461,5 +461,41 @@ describe('what a KEY costs once JSON has encoded it', () => {
 
     expect(Buffer.byteLength(encoded, 'utf8')).toBeLessThanOrEqual(MAX_ARGUMENT_BYTES);
     expect(JSON.parse(encoded)['plain']).toBe('ok');
+  });
+});
+
+describe('withoutBinaryParts', () => {
+  it('replaces image and blob parts of a CallToolResult and keeps the rest', () => {
+    const value = {
+      content: [
+        { type: 'text', text: 'a' },
+        { type: 'image', mimeType: 'image/png', data: 'AAAA' },
+        { type: 'resource', resource: { uri: 'x', mimeType: 'application/pdf', blob: 'AAAA' } },
+        { type: 'resource', resource: { uri: 'y', mimeType: 'text/plain', text: 'readable' } },
+      ],
+      structured_content: { n: 1 },
+    };
+    expect(withoutBinaryParts(value)).toEqual({
+      content: [
+        { type: 'text', text: 'a' },
+        { type: 'text', text: '[image: image/png, 0 KB]' },
+        { type: 'text', text: '[resource: application/pdf, 0 KB]' },
+        { type: 'resource', resource: { uri: 'y', mimeType: 'text/plain', text: 'readable' } },
+      ],
+      structured_content: { n: 1 },
+    });
+  });
+
+  it("describes Gemini's inlineData parts too", () => {
+    expect(withoutBinaryParts({ content: [{ inlineData: { mimeType: 'image/png', data: 'AAAA' } }] }))
+      .toEqual({ content: [{ type: 'text', text: '[unknown: image/png, 0 KB]' }] });
+  });
+
+  it('returns anything without binary parts as it was', () => {
+    const value = { content: [{ type: 'text', text: 'a' }] };
+    expect(withoutBinaryParts(value)).toBe(value);
+    expect(withoutBinaryParts('text')).toBe('text');
+    expect(withoutBinaryParts(null)).toBe(null);
+    expect(withoutBinaryParts([1])).toEqual([1]);
   });
 });

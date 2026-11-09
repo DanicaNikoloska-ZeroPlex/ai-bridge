@@ -52,6 +52,7 @@ import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from 
 import { detectProviders } from './providers/detector.js';
 import { readClaudeUsage } from './providers/usage.js';
 import { ToolResolver } from './tools/resolver.js';
+import { toolResolveAnswer } from './tools/content.js';
 import { LOCAL_EXECUTION_OFF, refusalReason, runsLocally, type LocalExecutionConfig } from './local/gate.js';
 import { runLocalTool } from './local/executor.js';
 import { fillRoles, loadSecrets, sealedRefs, SecretStore, type EngramConfig, type SealedRef } from './local/engram.js';
@@ -1368,9 +1369,16 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       case 'ai_request':
         this.handleAiRequest(message);
         break;
-      case 'tool_resolve':
-        this.toolResolver.resolve(message.tool_call_id, message.result);
+      case 'tool_resolve': {
+        // Content parts (text and images) from a server that read
+        // hello.tool_result_content; `result` alone from any other, or with a
+        // line saying why the parts were not passed on (src/tools/content.ts).
+        this.toolResolver.resolve(
+          message.tool_call_id,
+          toolResolveAnswer(message.result, message.content, message.tool_call_id),
+        );
         break;
+      }
       case 'tool_error':
         this.toolResolver.reject(message.tool_call_id, message.error);
         break;
@@ -1875,6 +1883,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       app_backends: true,
       // ...and hands a backend another linked item beside one request (app_call.use).
       app_items: true,
+      // tool_resolve.content: a server tool's answer as text and image parts,
+      // handed to the CLI as MCP content blocks (src/tools/content.ts).
+      tool_result_content: true,
       // MCP Apps: which spec revision and which revision of the bridge's own
       // frames (mcp_request/mcp_result, tool_result.ui, welcome tool _meta,
       // provider_tool_call_id). A server reads its absence as "too old".

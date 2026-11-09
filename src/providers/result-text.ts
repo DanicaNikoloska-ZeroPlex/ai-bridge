@@ -655,3 +655,137 @@ export function boundArguments(value: unknown): string {
     ? out
     : safeStringify({ __truncated__: { bytes: Buffer.byteLength(encoded, 'utf8') } }, '{}');
 }
+
+/**
+ * Reduce a tool result's content to the text a server can display.
+ *
+ * Claude sends this either as a plain string or as an array of content blocks,
+ * and the array form is what a tool returning structured output produces. A
+ * naive `String(content)` turns that into "[object Object]", which is worse
+ * than dropping it: the server would show something that looks like output.
+ */
+/**
+ * A tool result's content as one string.
+ *
+ * Deliberately NOT bounded here: the emit site splits it into frames, so
+ * bounding at this point would truncate a result that chunking can carry whole.
+ */
+export function flattenToolResult(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return content == null ? '' : describePart(content);
+
+  return (content
+    .map((part) => {
+      if (typeof part === 'string') return part;
+      if (typeof part === 'object' && part !== null) {
+        const text = (part as Record<string, unknown>)['text'];
+        if (typeof text === 'string') return text;
+      }
+      // A null element would otherwise render as the literal word "null".
+      if (part === null || part === undefined) return '';
+      return describePart(part);
+    })
+    .join(''));
+}
+
+/**
+ * Describe a result part that carries no text of its own.
+ *
+ * Only genuinely UNREADABLE parts are replaced: an image or audio block is
+ * megabytes of base64 — one screenshot measured at 617,411 characters against
+ * 2.1.261 — which is not output anyone can read and which a server cannot do
+ * anything with on this path. A file the assistant wants to hand back has its
+ * own route in the `attachment` event.
+ *
+ * Everything else is forwarded whole. An earlier version capped any non-text
+ * part at 4KB, which threw away exactly the readable structured output a
+ * server most wants — an MCP embedded resource carrying plain text became
+ * `[resource: 5 KB]` — and was a regression against forwarding it verbatim.
+ * Size is bounded once, on the assembled result, where the actual constraint
+ * lives.
+ */
+export function describePart(part: unknown): string {
+  const placeholder = binaryPlaceholder(part);
+  if (placeholder !== null) return placeholder;
+
+  const record = typeof part === 'object' && part !== null ? part as Record<string, unknown> : {};
+  const type = typeof record['type'] === 'string' ? record['type'] as string : 'unknown';
+  return safeStringify(part, `[${type}: could not be serialised]`);
+}
+
+/**
+ * `[image: image/png, 210 KB]` for a part that carries binary, else null.
+ */
+export function binaryPlaceholder(part: unknown): string | null {
+  const record = typeof part === 'object' && part !== null ? part as Record<string, unknown> : {};
+  const type = typeof record['type'] === 'string' ? record['type'] as string : 'unknown';
+
+  // Three shapes carry binary, and only knowing one of them means a perfectly
+  // good MCP image reads as a broken one — or worse, an embedded resource's
+  // base64 blob is forwarded verbatim, which is the case this exists to stop.
+  //
+  //   Anthropic : { type: 'image', source: { media_type, data } }
+  //   MCP image : { type: 'image', mimeType, data }
+  //   MCP blob  : { type: 'resource', resource: { mimeType, blob } }
+  const resource = typeof record['resource'] === 'object' && record['resource'] !== null
+    ? record['resource'] as Record<string, unknown>
+    : undefined;
+  const source = typeof record['source'] === 'object' && record['source'] !== null
+    ? record['source'] as Record<string, unknown>
+    // Gemini's own part shape: { inlineData: { mimeType, data } }.
+    : typeof record['inlineData'] === 'object' && record['inlineData'] !== null
+      ? record['inlineData'] as Record<string, unknown>
+      : undefined;
+  const holder = source ?? resource ?? record;
+  const binary = holder['data'] ?? holder['blob'];
+  // A base64 payload is binary whatever the part calls itself. Keying on the
+  // TYPE NAME let a `document` part carrying a PDF in `source.data` fall through
+  // to `safeStringify`, which inlines the whole thing: measured at 1.2 million
+  // characters across five frames. That used to be capped at 256 KB by
+  // `boundResult`; removing that bound in favour of chunking turned a bounded
+  // leak into one with a 16 MB ceiling.
+  const isBinary = type === 'image' || type === 'audio'
+    || ((source !== undefined || resource !== undefined) && typeof binary === 'string');
+
+  if (isBinary) {
+    const media = ['media_type', 'mimeType', 'mime_type']
+      .map((key) => holder[key])
+      .find((value): value is string => typeof value === 'string') ?? type;
+    // base64 is 4 characters per 3 bytes. A malformed part says so rather than
+    // reporting a confident "0 KB", which is indistinguishable from a tiny one.
+    const size = typeof binary === 'string'
+      ? `${Math.round((binary.length * 3) / 4 / 1024)} KB`
+      : 'size unknown';
+
+    return `[${type}: ${media}, ${size}]`;
+  }
+
+  return null;
+}
+
+/**
+ * A structured tool result with its binary parts replaced by a description.
+ *
+ * For a CLI that reports an MCP call's result as the `CallToolResult` object
+ * (Codex: `{content: [...], structured_content}`), which the adapter forwards
+ * as JSON. An image part there is the whole base64 picture, which would go to
+ * the server inside the echo; it becomes a text part saying what it was
+ * (`[image: image/png, 210 KB]`), as `flattenToolResult` does for Claude.
+ * Everything else is left as it was, so a result without images encodes
+ * exactly as before.
+ */
+export function withoutBinaryParts(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return value;
+  const content = (value as Record<string, unknown>)['content'];
+  if (!Array.isArray(content)) return value;
+
+  let changed = false;
+  const parts = content.map((part) => {
+    const placeholder = binaryPlaceholder(part);
+    if (placeholder === null) return part;
+    changed = true;
+    return { type: 'text', text: placeholder };
+  });
+
+  return changed ? { ...(value as Record<string, unknown>), content: parts } : value;
+}

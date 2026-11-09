@@ -70,7 +70,8 @@ All on the operator's machine, inside or started by one Node process:
 - **Posture** (`cli_isolation`): `isolated`, `workspace` or `native`; what the
   server asked for, capped by the operator's flags (decision 0006).
 - **Three kinds of tools**: server tools (run on the server via a socket
-  round-trip), local tools (`execute: "local"`, run here with vault values,
+  round-trip; an answer may carry text and image parts, `tool_resolve.content`,
+  handed to the CLI as MCP content blocks by `src/tools/content.ts`), local tools (`execute: "local"`, run here with vault values,
   decision 0004) and upstream tools (from `--mcp-upstreams`, decision 0008).
 - **Handshake capabilities**: `hello` fields that tell a server what this bridge
   understands; `welcome` fields that tell the bridge what the server wants
