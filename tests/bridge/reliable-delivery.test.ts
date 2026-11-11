@@ -743,6 +743,24 @@ describe('CodeRabbit remarks (D09710)', () => {
     expect(bridge!.isIdle()).toBe(true);
   }, 10_000);
 
+  it('sends nothing more of a turn given up on a live connection, so a cut-off answer never looks complete (4538165280)', async () => {
+    await start(120, undefined, 20);
+    adapter.finishOnAbort = false;
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    adapter.delta('a');
+    await waitFor((f) => f['type'] === 'error' && f['code'] === 'bridge_disconnected', 'the report', 2000);
+    expect(adapter.aborted).toBe(true);
+    const before = streamOf('req_1', 1).length;
+
+    // Still connected: what the stopped turn emits as it unwinds goes nowhere.
+    adapter.delta('late');
+    adapter.finish();
+    await sleep(50);
+    expect(streamOf('req_1', 1).slice(before)).toEqual([]);
+  }, 10_000);
+
   it('starts the live re-send wait over when the server confirms more (4537558595)', async () => {
     await start(120, undefined, 50);
     request('req_1');

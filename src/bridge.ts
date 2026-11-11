@@ -640,6 +640,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * whatever they still emit while unwinding goes out unnumbered, as before.
    */
   private readonly lostTurns = new Set<string>();
+  /**
+   * Turns the bridge stopped itself (given up on, or aborted for a drop): not
+   * one more of their stream frames is written, connected or not, so a cut-off
+   * answer never reaches the server looking complete. A turn only let go of for
+   * its unconfirmed final frames is not in here: it still sends its `done`.
+   */
+  private readonly stoppedTurns = new Set<string>();
   /** Re-attached turns waiting for their first confirmation on the new connection. */
   private readonly reattachTimers = new Map<string, ReturnType<typeof setTimeout> | null>();
   /** How often a turn's unconfirmed final frames were written again on this connection. */
@@ -1686,6 +1693,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // one, so the replay can say which accepted messages were never read.
       this.disconnectedTurns.push({ requestId: id, turnInput: this.turnInputs.get(id) ?? null, ended: false, due: false });
       this.lostTurns.add(id);
+      this.stoppedTurns.add(id);
       log.debug('Aborted active request on disconnect', { requestId: id });
     }
     this.activeRequests.clear();
@@ -1958,6 +1966,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (controller !== undefined) {
       // Released by the request's finally, which has not run yet.
       this.lostTurns.add(requestId);
+      this.stoppedTurns.add(requestId);
       controller.abort();
       this.activeRequests.delete(requestId);
       this.stoppingTurns.add(controller);
@@ -2576,6 +2585,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // old run's frames is a duplicate there; else from 1 again, as an older
     // server expects (PROTOCOL.md, "Short drops", re-issued turns).
     this.lostTurns.delete(request_id);
+    this.stoppedTurns.delete(request_id);
     this.closedTurns.delete(request_id);
     const firstSeq = message.first_seq;
     const continued = typeof firstSeq === 'number' && Number.isInteger(firstSeq) && firstSeq >= 1;
@@ -2819,6 +2829,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         this.stoppingTurns.delete(controller);
         if (this.activeRequests.get(request_id) === undefined) {
           this.lostTurns.delete(request_id);
+          this.stoppedTurns.delete(request_id);
           // Confirmed by the server already: nothing left to keep for it.
           if (this.outbox.serverEnded(request_id)) this.outbox.forget(request_id);
         }
@@ -3345,12 +3356,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return;
     }
 
-    // A turn given up on is reported as `bridge_disconnected` after the next
-    // welcome. What it still emits before that welcome (an unnumbered `done`
-    // as it unwinds, say) is dropped: written ahead of the report, it would
-    // make a cut-off answer look complete.
-    if (message.type === 'stream' && this.lostTurns.has(message.request_id) && !this.canWriteStream()) {
-      log.debug('Not connected and welcomed — dropping a frame of a turn given up on', { requestId: message.request_id });
+    // A turn the bridge stopped is reported as `bridge_disconnected`. What it
+    // still emits as it unwinds (an unnumbered `done`, say) is dropped, also on
+    // a live connection: written ahead of or beside the report, it would make a
+    // cut-off answer look complete. Any other lost turn's frames still wait for
+    // the welcome.
+    if (message.type === 'stream' && (this.stoppedTurns.has(message.request_id)
+      || (this.lostTurns.has(message.request_id) && !this.canWriteStream()))) {
+      log.debug('Dropping a frame of a turn the bridge stopped or lost', { requestId: message.request_id });
 
       return;
     }
