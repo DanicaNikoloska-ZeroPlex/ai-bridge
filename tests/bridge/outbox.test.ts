@@ -120,4 +120,22 @@ describe('StreamOutbox', () => {
     box.ack('a', 2);
     expect(box.holdsFinal('a')).toBe(false);
   });
+
+  it('numbers a re-issue on from first_seq: the old run counts as confirmed, a late ack of it changes nothing (review point 3)', () => {
+    const box = new StreamOutbox();
+    push(box, 'a', 'block_delta');
+    push(box, 'a', 'error');
+    box.continueAt('a', 3);
+    expect(box.pending('a')).toEqual([]);
+    expect(box.lastAcked('a')).toBe(2);
+    expect(box.allocate('a')).toBe(3);
+    box.ack('a', 2); // the old error frame's ack, after the re-issue
+    expect(box.serverEnded('a')).toBe(false);
+    expect(box.runningTurns()).toEqual([{ request_id: 'a', last_acked_seq: 2 }]);
+
+    // Also when the turn was let go of already.
+    box.forget('b');
+    box.continueAt('b', 5);
+    expect(box.peek('b')).toBe(5);
+  });
 });

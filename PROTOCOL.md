@@ -138,7 +138,8 @@ With a server that does:
 - **Not taken back.** If the server does not confirm a re-attached turn's first frame on the new connection within 30 seconds, it no longer holds that turn (its own grace period ran out first, for instance): the bridge stops it and reports `bridge_disconnected`. A server that holds the turn acks within one round trip; 30 s is the bridge's heartbeat interval. **A finished answer is never given up this way:** when the turn's `done` or `error` is among the unconfirmed frames, the bridge writes them again instead, after 30 seconds and then each time waiting twice as long, until the server acks them or answers `closed`, or the connection drops again. After 4 such re-sends (about 15 minutes) without an ack it lets go of them, logs it, and reports nothing (the server may have the answer), so the bridge can become idle again.
 - **Bounded.** The frames kept while waiting for a receipt are limited, per turn (32 MiB, 20,000 frames) and in total (128 MiB, 80,000 frames), so a long grace period with a chatty turn cannot exhaust the machine's memory. A turn's final frame (`done` / `error`) is always kept, so a finished answer is never refused. A turn that would go over is stopped and reported as `bridge_disconnected`, with a message saying its answer grew too large to keep: while the connection was down, or, on a connection that is up, because the server was too slow to confirm it. Both ask to send the message again.
 - **Grace expired.** A turn still kept when the grace period ends, or when the server that answers the reconnect does not do reliable delivery, is stopped and reported as `bridge_disconnected` after the reconnect, as before.
-- **A `session_lost` re-issue** under the same `request_id` numbers its frames **from 1 again** (the server accepts 1 or the error frame's `seq` + 1; this bridge always restarts). The server's ack for the old error frame arrives after the re-issued `ai_request` and is not applied to the new run.
+- **Re-sent on a live connection.** The server stores a frame only when it is the next one, so a frame it did not store (it failed there, or its stream store refused it) holds back every later frame of the turn, `done` included, until it is written again. While the connection stays up, the bridge therefore checks that the server keeps confirming: when nothing more of a turn has been confirmed 10 seconds after a frame was written (a server confirms within about a second), it writes every unconfirmed frame of that turn again, in order, and the wait doubles (10, 20, 40 s). After 3 such re-sends without progress it stops the turn and reports it as `bridge_disconnected`, with the message that the server was too slow to confirm (`outbox_unconfirmed`); when the turn's final frame is among the unconfirmed ones it lets go of them instead, as for a re-attached turn. A server with a stall bound ends such a turn itself first (laravel-ai-bridge: `stream_stalled` after 60 s, with `closed`). After a reconnect the same check takes over once the server has confirmed a re-attached turn's first frame.
+- **A `session_lost` re-issue** under the same `request_id`: when its `ai_request` carries **`first_seq`** (a server sends it to a bridge that announced `continued_seq`), the new run numbers its frames from `first_seq`, the error frame's `seq` + 1, and everything before it counts as confirmed: the old run's frames are dropped, and a late ack of them changes nothing. A re-send of the old error frame is then a plain duplicate on the server, never mistaken for the new run's first frame. Without `first_seq` (an older server) it numbers them **from 1 again** (that server accepts 1 or the error frame's `seq` + 1); the server's ack for the old error frame arrives after the re-issued `ai_request` and is not applied to the new run.
 
 ---
 
@@ -365,6 +366,14 @@ This bridge sends the [`input_closed`](#input_closed) stream event when a turn w
 ```
 
 This bridge numbers its stream frames, keeps them until `stream_ack`, and keeps its turns running through a short drop, when the server's welcome says it does too. `running_turns` is present only on a reconnect during the grace period. See [Short drops](#short-drops-reliable-delivery). An older server ignores both fields.
+
+#### Additive field: `continued_seq`
+
+```json
+{ "type": "hello", "...": "...", "reliable_delivery": true, "continued_seq": true }
+```
+
+A `session_lost` re-issue whose `ai_request` carries `first_seq` is numbered on from there instead of from 1. See [Short drops](#short-drops-reliable-delivery). An older server ignores the field and sends no `first_seq`, and the re-issue is numbered from 1 again, as before.
 
 #### Additive field: `effort_levels`
 
@@ -976,6 +985,8 @@ When the server needs an AI response (triggered by a user message in the browser
 **`subagent_prompt`** *(optional)*: Text appended to the system prompt of every subagent the assistant starts this turn. See [Additive field: `subagent_prompt`](#additive-field-subagent_prompt--text-for-every-subagent).
 
 **`cli_session_id`**: The CLI session to resume, or `null` to start a fresh session. **The server owns this mapping** (persisted per conversation) and is the single source of truth — the bridge keeps no session map of its own. See [Conversation Continuity](#conversation-continuity).
+
+**`first_seq`** (integer, optional): Only on a `session_lost` re-issue to a bridge that announced `continued_seq`: the `seq` the re-issued run's first stream frame gets. See [Short drops](#short-drops-reliable-delivery).
 
 **`history`**: Prior conversation turns (`{role, content}`). Included only when `cli_session_id` is `null`, so a fresh CLI session can be seeded with context. Omitted when resuming — the resumed session already holds its history.
 
@@ -2862,7 +2873,7 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 
 **The thinking level does not bump the version.** `hello.effort_levels` and `options.effort` are additive: an older bridge ignores the option, and an older server ignores the field.
 
-**Reliable delivery does not bump the version.** `hello.reliable_delivery`, `hello.running_turns`, `welcome.config.reconnect_grace_seconds`, `stream.seq` and `stream_ack` (with `closed`) are additive: a bridge numbers nothing unless the welcome carries the grace period, and a server must not send `stream_ack` to a bridge that did not advertise `reliable_delivery`. The `waiting` and `running` task statuses are additive too: they come on phase `updated`, and the helper's real end still comes as `completed`.
+**Reliable delivery does not bump the version.** `hello.reliable_delivery`, `hello.continued_seq`, `ai_request.first_seq`, `hello.running_turns`, `welcome.config.reconnect_grace_seconds`, `stream.seq` and `stream_ack` (with `closed`) are additive: a bridge numbers nothing unless the welcome carries the grace period, and a server must not send `stream_ack` to a bridge that did not advertise `reliable_delivery`. The `waiting` and `running` task statuses are additive too: they come on phase `updated`, and the helper's real end still comes as `completed`.
 
 **Announcing the input's close does not bump the version.** `hello.input_closed` and the `input_closed` stream event are additive: a consumer ignores an event it does not know, and a server that does not see the flag learns the close the way it always did, from `turn_ending`.
 

@@ -175,10 +175,11 @@ export class StreamOutbox {
   }
 
   /**
-   * The server re-issued this request id (`session_lost`): the new run numbers
-   * its frames from 1 again (PROTOCOL.md allows 1 or the error frame's seq + 1;
-   * this bridge restarts). The old run's frames are dropped: the server got
-   * its error frame, or it would not have re-issued.
+   * The server re-issued this request id (`session_lost`) without saying where
+   * to go on (an older server, no `first_seq`): the new run numbers its frames
+   * from 1 again (PROTOCOL.md allows 1 or the error frame's seq + 1). The old
+   * run's frames are dropped: the server got its error frame, or it would not
+   * have re-issued. See continueAt() for a server that sends `first_seq`.
    */
   restart(requestId: string): void {
     const old = this.turns.get(requestId);
@@ -191,6 +192,27 @@ export class StreamOutbox {
       bytes: 0,
       serverEnded: false,
       staleAck: lastFrame !== undefined && lastFrame.terminal ? lastFrame.seq : null,
+    });
+  }
+
+  /**
+   * The server re-issued this request id (`session_lost`) and said where the
+   * new run's numbering goes on (`ai_request.first_seq`): everything before
+   * it counts as confirmed (the server has the old run's error frame, or it
+   * would not have re-issued), so the old run's frames are dropped and a late
+   * ack of them changes nothing. Works whether or not the turn is still here
+   * (its error frame's ack may have let go of it already).
+   */
+  continueAt(requestId: string, firstSeq: number): void {
+    const old = this.turns.get(requestId);
+    if (old !== undefined) this.release(old, old.frames);
+    this.turns.set(requestId, {
+      nextSeq: firstSeq,
+      acked: firstSeq - 1,
+      frames: [],
+      bytes: 0,
+      serverEnded: false,
+      staleAck: null,
     });
   }
 

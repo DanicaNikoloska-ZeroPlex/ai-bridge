@@ -207,6 +207,13 @@ export interface BridgeOptions {
    * 30 s; exists so tests need not wait that long.
    */
   reattachAckTimeoutMs?: number;
+  /**
+   * How long the oldest unconfirmed frame of a turn may wait for a
+   * `stream_ack` on a live connection before the bridge writes the turn's
+   * unconfirmed frames again (PROTOCOL.md, "Short drops"). Default 10 s,
+   * doubling after each re-send; exists so tests need not wait that long.
+   */
+  liveAckTimeoutMs?: number;
 }
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
@@ -242,6 +249,22 @@ const DEFAULT_REATTACH_ACK_TIMEOUT_MS = 30_000;
  * server that never confirms is given about 15 minutes, not forever.
  */
 const MAX_FINAL_RESENDS = 4;
+/**
+ * See BridgeOptions.liveAckTimeoutMs. A server that stores a frame confirms
+ * it within about a second (its ack interval), so ten seconds without one on
+ * a connection that is up means it did not store it: it failed there, or it
+ * came after one that did, and the server stores nothing more of the turn
+ * until it is written again.
+ */
+const DEFAULT_LIVE_ACK_TIMEOUT_MS = 10_000;
+/**
+ * How often a turn's unconfirmed frames are written again on a live
+ * connection without the server confirming anything more, before the bridge
+ * gives the turn up (`outbox_unconfirmed`): 10, 20 and 40 s, then 80 s more,
+ * so about two and a half minutes. A server with the stall bound
+ * (`stream_stall_seconds`, 60 s) ends such a turn itself well before.
+ */
+const MAX_LIVE_RESENDS = 3;
 /*
  * What the assistant is told when work that needs the server cannot happen.
  * These strings are what it acts on, so each says whether the action
@@ -615,6 +638,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly finalResends = new Map<string, number>();
   private readonly reattachAckTimeoutMs: number;
   /**
+   * Turns with frames written on a live connection and not confirmed yet: the
+   * timer that checks for progress, and the confirmed seq when it was armed.
+   */
+  private readonly liveAckChecks = new Map<string, { timer: ReturnType<typeof setTimeout>; acked: number }>();
+  /** How often a turn's unconfirmed frames were written again on a live connection without progress. */
+  private readonly liveResends = new Map<string, number>();
+  private readonly liveAckTimeoutMs: number;
+  /**
    * Turns the server said are over on its side (`stream_ack` with `closed`):
    * nothing more of them is sent, until the server starts the id again.
    */
@@ -630,6 +661,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     super();
     this.selfUpdate = options.selfUpdate;
     this.reattachAckTimeoutMs = options.reattachAckTimeoutMs ?? DEFAULT_REATTACH_ACK_TIMEOUT_MS;
+    this.liveAckTimeoutMs = options.liveAckTimeoutMs ?? DEFAULT_LIVE_ACK_TIMEOUT_MS;
     // Refused rather than stripped (decision 0013): a token in --server would be
     // logged here and sent in the URL, which every access log on the way keeps.
     let carriesToken = false;
@@ -1678,6 +1710,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     for (const timer of this.reattachTimers.values()) if (timer !== null) clearTimeout(timer);
     this.reattachTimers.clear();
     this.finalResends.clear();
+    for (const check of this.liveAckChecks.values()) clearTimeout(check.timer);
+    this.liveAckChecks.clear();
+    this.liveResends.clear();
   }
 
   /**
@@ -1741,7 +1776,15 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       this.reattachTimers.delete(requestId);
     }
     this.finalResends.delete(requestId);
-    if (ended && !this.activeRequests.has(requestId)) this.outbox.forget(requestId);
+    if (ended && !this.activeRequests.has(requestId)) {
+      this.outbox.forget(requestId);
+      this.clearLiveAckCheck(requestId);
+
+      return;
+    }
+    // What is still unconfirmed (re-sent after a reconnect, say) is watched
+    // on this connection from now on, even if the turn writes nothing more.
+    if (this.outbox.pending(requestId).length > 0 && this.canWriteStream()) this.armLiveAckCheck(requestId);
   }
 
   /**
@@ -1770,6 +1813,73 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (timer !== undefined && timer !== null) clearTimeout(timer);
     this.reattachTimers.delete(requestId);
     this.finalResends.delete(requestId);
+    this.clearLiveAckCheck(requestId);
+  }
+
+  private clearLiveAckCheck(requestId: string): void {
+    const check = this.liveAckChecks.get(requestId);
+    if (check !== undefined) clearTimeout(check.timer);
+    this.liveAckChecks.delete(requestId);
+    this.liveResends.delete(requestId);
+  }
+
+  /**
+   * A numbered frame was just written on a live connection: unless a check is
+   * already armed (or the turn is a re-attached one, see armReattachCheck()),
+   * check after a while that the server confirmed something more of the turn.
+   *
+   * A server stores a frame only when it is the next one, so a frame it
+   * failed to store (an error there, or the stream store refusing it) holds
+   * back every later frame of the turn, `done` included, until it is written
+   * again: on a connection that stays up nothing else would write it. When the
+   * check finds no progress, every unconfirmed frame of the turn is written
+   * again, in order (the server drops the ones it has), and the wait doubles.
+   * After MAX_LIVE_RESENDS without progress the turn is given up and reported
+   * (`outbox_unconfirmed`), or, when its final frame is among the unconfirmed
+   * ones, let go of as in armReattachCheck(): the server may well have it.
+   */
+  private armLiveAckCheck(requestId: string): void {
+    if (this.liveAckChecks.has(requestId) || this.reattachTimers.has(requestId)) return;
+    const resends = this.liveResends.get(requestId) ?? 0;
+    const acked = this.outbox.lastAcked(requestId);
+    const timer = setTimeout(() => {
+      this.liveAckChecks.delete(requestId);
+      if (this.outbox.pending(requestId).length === 0 || !this.canWriteStream() || this.reattachTimers.has(requestId)) {
+        this.liveResends.delete(requestId);
+
+        return;
+      }
+      if (this.outbox.lastAcked(requestId) > acked) {
+        // Confirmed further meanwhile: keep watching what is still unconfirmed.
+        this.liveResends.delete(requestId);
+        this.armLiveAckCheck(requestId);
+
+        return;
+      }
+      if (resends >= MAX_LIVE_RESENDS) {
+        if (this.outbox.holdsFinal(requestId)) {
+          log.warn('The server never confirmed this turn\'s final frames; letting go of them', { requestId, resends });
+          this.clearLiveAckCheck(requestId);
+          this.outbox.forget(requestId);
+          this.lostTurns.add(requestId);
+
+          return;
+        }
+        log.error('The server stopped confirming this turn\'s output on a live connection; stopping it', { requestId, resends });
+        this.giveUpTurn(requestId, 'outbox_unconfirmed');
+
+        return;
+      }
+      const frames = this.outbox.pending(requestId);
+      log.warn('The server has not confirmed this turn\'s output in time; sending it again', {
+        requestId, from: frames[0]!.seq, frames: frames.length, resend: resends + 1,
+      });
+      this.liveResends.set(requestId, resends + 1);
+      for (const frame of frames) this.ws!.send(frame.payload);
+      this.armLiveAckCheck(requestId);
+    }, this.liveAckTimeoutMs * 2 ** resends);
+    timer.unref?.();
+    this.liveAckChecks.set(requestId, { timer, acked });
   }
 
   /**
@@ -1925,6 +2035,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // (PROTOCOL.md, "Short drops"). Used only if the welcome says the server
       // does it too (`config.reconnect_grace_seconds`).
       reliable_delivery: true,
+      // A session_lost re-issue carrying first_seq is numbered on from there
+      // (PROTOCOL.md, "Short drops", re-issued turns).
+      continued_seq: true,
       // After a drop: what this machine still runs or still holds frames of.
       ...(runningTurns.length > 0 ? { running_turns: runningTurns } : {}),
     };
@@ -2433,11 +2546,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     const cliSessionId = message.cli_session_id ?? null;
 
     // The same request id again is the server's `session_lost` re-issue. Its
-    // frames are numbered from 1 again (PROTOCOL.md, "Short drops", allows 1
-    // or the error frame's seq + 1; this bridge restarts).
+    // frames are numbered on from `first_seq` when the server says so (it
+    // does for a bridge that announced `continued_seq`), so a re-send of the
+    // old run's frames is a duplicate there; else from 1 again, as an older
+    // server expects (PROTOCOL.md, "Short drops", re-issued turns).
     this.lostTurns.delete(request_id);
     this.closedTurns.delete(request_id);
-    if (this.outbox.has(request_id)) this.outbox.restart(request_id);
+    const firstSeq = message.first_seq;
+    const continued = typeof firstSeq === 'number' && Number.isInteger(firstSeq) && firstSeq >= 1;
+    if (continued || this.outbox.has(request_id)) this.clearLiveAckCheck(request_id);
+    if (continued && this.numbersFramesOf(request_id)) this.outbox.continueAt(request_id, firstSeq);
+    else if (this.outbox.has(request_id)) this.outbox.restart(request_id);
     else if (this.numbersFramesOf(request_id)) this.outbox.open(request_id);
 
     // A contradictory bridge_prompt is refused before anything acts on it: a
@@ -3282,7 +3401,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
 
     this.ws!.send(encoded.payload);
-    if (kept) this.armReattachCheck(requestId);
+    if (kept) {
+      this.armReattachCheck(requestId);
+      this.armLiveAckCheck(requestId);
+    }
     log.debug('Message sent', { type: message.type, seq });
   }
 

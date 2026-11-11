@@ -239,6 +239,13 @@ export interface HelloMessage {
    */
   reliable_delivery?: true;
   /**
+   * With `reliable_delivery`: a `session_lost` re-issue that carries
+   * `ai_request.first_seq` is numbered on from there instead of from 1, so a
+   * re-send of the old run's frames is a plain duplicate on the server
+   * (PROTOCOL.md, "Short drops", re-issued turns). An older server ignores it.
+   */
+  continued_seq?: true;
+  /**
    * After a reconnect: the turns this bridge still runs or still holds
    * unconfirmed frames of, with the last seq the server confirmed. The server
    * re-attaches these and fails every other turn it held detached.
@@ -1002,6 +1009,14 @@ export interface AiRequestMessage {
    * resuming — the resumed CLI session already holds the history.
    */
   history?: ConversationEntry[];
+  /**
+   * Only on a `session_lost` re-issue from a server that does reliable
+   * delivery, to a bridge that announced `continued_seq`: the `seq` the
+   * re-issued run's first stream frame gets (the error frame's + 1).
+   * Everything before it counts as confirmed. Absent: the re-issue is
+   * numbered from 1 again, as before.
+   */
+  first_seq?: number;
   /**
    * Absolute path the CLI should be spawned in.
    *
