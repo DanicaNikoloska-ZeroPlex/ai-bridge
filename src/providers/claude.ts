@@ -624,6 +624,13 @@ export class ClaudeAdapter extends ProviderAdapter {
             mainBackgroundTasks.add(task.task_id);
             if (task.task_type === 'local_agent') mainBackgroundHelpers.add(task.task_id);
           }
+          // Work a waiting helper owns runs again (a helper of its own was
+          // resumed, say): its resume window is not counting while that runs,
+          // and starts afresh once it has ended (openResumeWindows()), so a
+          // long resumed child cannot use up its parent's window.
+          for (const [helperId, deadline] of waitingHelpers) {
+            if (deadline !== null && ownsRunningWork(helperId)) waitingHelpers.set(helperId, null);
+          }
           taskOutput.started(frame);
         } else if (task.phase === 'finished'
           || (task.phase === 'updated' && task.status !== 'running' && task.status !== 'pending')) {
@@ -1994,6 +2001,9 @@ function taskEventFrom(frame: Record<string, unknown>, started: Map<string, Star
 
   let known = started.get(taskId);
   if (phase === 'started') {
+    // A resume (the same task_id started again) that does not name the
+    // spawning call keeps the one it started with: it is the grouping key.
+    toolUseId = toolUseId ?? known?.toolUseId;
     // Recorded whether or not the CLI named the spawning call. Recording only
     // the ones that did made a task started without a `tool_use_id` look, to
     // every later phase, like one this process never saw start: `started` got

@@ -320,9 +320,10 @@ interface DisconnectedTurn {
   /**
    * Why it is reported: the connection dropped (default), or it outgrew the
    * outbox while the connection was down (`outbox_full`) or while it was up
-   * and the server was slow to confirm (`outbox_unconfirmed`).
+   * and the server was slow to confirm (`outbox_unconfirmed`), or the other
+   * turns together had already filled the outbox (`outbox_shared_full`).
    */
-  reason?: 'outbox_full' | 'outbox_unconfirmed';
+  reason?: 'outbox_full' | 'outbox_unconfirmed' | 'outbox_shared_full';
 }
 
 const MAX_RECONNECT_ATTEMPTS = 100;
@@ -557,6 +558,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * cancelRequest() for why the answer waits.
    */
   private readonly cancelledRequests = new Set<string>();
+  /**
+   * Turns stopped and no longer in activeRequests (given up, or aborted by a
+   * drop) whose CLI has not finished stopping yet, by their controller. Until
+   * it has, the bridge is not idle: a restart would lose what the turn still
+   * reports (a `pending_inputs` replay, say).
+   */
+  private readonly stoppingTurns = new Set<AbortController>();
   /**
    * The input port of each running turn that keeps its input open, keyed by
    * request id. See TurnInputPort and handleTurnInput().
@@ -1348,6 +1356,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   isIdle(): boolean {
     return this.activeRequests.size === 0
       && this.cancelledRequests.size === 0
+      && this.stoppingTurns.size === 0
       && this.incomingUploads.size === 0
       && this.fileReads.size === 0
       && this.transfers.size === 0
@@ -1596,6 +1605,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.sessionId = null;
 
     this.clearReattachTimers();
+    // An ack of an old run still on its way is gone with the connection.
+    this.outbox.dropStaleAcks();
 
     // A server with reliable delivery keeps this machine's turns for the grace
     // period, so they keep running here too: their frames wait in the outbox
@@ -1669,6 +1680,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private abortTurnsForDisconnect(): void {
     for (const [id, controller] of this.activeRequests) {
       controller.abort();
+      this.stoppingTurns.add(controller);
       // Record the aborted request so it can be replayed as a
       // terminal error after reconnect — with its input port, if it had
       // one, so the replay can say which accepted messages were never read.
@@ -1767,6 +1779,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return;
     }
 
+    const ackedBefore = this.outbox.lastAcked(requestId);
     const { ended, known } = this.outbox.ack(requestId, seq);
     if (!known) return;
     // The server holds this turn on the new connection.
@@ -1782,6 +1795,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
       return;
     }
+    // Progress: the live re-send check starts over from its first, short wait
+    // (the doubling is for a server that confirms nothing). A duplicate ack
+    // leaves it as it is.
+    if (this.outbox.lastAcked(requestId) > ackedBefore) this.clearLiveAckCheck(requestId);
     // What is still unconfirmed (re-sent after a reconnect, say) is watched
     // on this connection from now on, even if the turn writes nothing more.
     if (this.outbox.pending(requestId).length > 0 && this.canWriteStream()) this.armLiveAckCheck(requestId);
@@ -1861,7 +1878,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
           log.warn('The server never confirmed this turn\'s final frames; letting go of them', { requestId, resends });
           this.clearLiveAckCheck(requestId);
           this.outbox.forget(requestId);
-          this.lostTurns.add(requestId);
+          // Only while it still runs: a finished turn sends nothing more, and
+          // its marker would never be released (its finally has run).
+          if (this.activeRequests.has(requestId)) this.lostTurns.add(requestId);
 
           return;
         }
@@ -1907,8 +1926,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
           log.warn('The server never confirmed this turn\'s final frames; letting go of them', { requestId, resends });
           this.finalResends.delete(requestId);
           this.outbox.forget(requestId);
-          // Anything the turn still sends goes out unnumbered, as for a lost turn.
-          this.lostTurns.add(requestId);
+          // Anything the turn still sends goes out unnumbered, as for a lost
+          // turn; only while it still runs (see armLiveAckCheck()).
+          if (this.activeRequests.has(requestId)) this.lostTurns.add(requestId);
 
           return;
         }
@@ -1934,11 +1954,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private giveUpTurn(requestId: string, reason?: DisconnectedTurn['reason']): void {
     this.outbox.forget(requestId);
     this.clearReattachTimer(requestId);
-    this.lostTurns.add(requestId);
     const controller = this.activeRequests.get(requestId);
     if (controller !== undefined) {
+      // Released by the request's finally, which has not run yet.
+      this.lostTurns.add(requestId);
       controller.abort();
       this.activeRequests.delete(requestId);
+      this.stoppingTurns.add(controller);
     }
     const turn: DisconnectedTurn = {
       requestId,
@@ -2458,7 +2480,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         : turn.reason === 'outbox_unconfirmed'
           ? 'Request stopped: the server was too slow to confirm the answer, and it grew larger than this machine '
             + 'keeps unconfirmed, so the rest of it was lost. Send the message again, or ask for a shorter answer.'
-          : 'Request aborted: the bridge connection dropped while the response was streaming.',
+          : turn.reason === 'outbox_shared_full'
+            ? 'Request stopped: this machine was already keeping as much unconfirmed output for other answers as it '
+              + 'can, so the rest of this one was lost. Send the message again to retry.'
+            : 'Request aborted: the bridge connection dropped while the response was streaming.',
       fatal: false,
       ...(turn.turnInput !== null ? { pending_inputs: turn.turnInput.pending() } : {}),
     });
@@ -2554,7 +2579,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.closedTurns.delete(request_id);
     const firstSeq = message.first_seq;
     const continued = typeof firstSeq === 'number' && Number.isInteger(firstSeq) && firstSeq >= 1;
-    if (continued || this.outbox.has(request_id)) this.clearLiveAckCheck(request_id);
+    // The re-issue itself shows the server holds the turn: a re-attach check
+    // left from the old run (its ack may be late) must not give up the new one.
+    if (continued || this.outbox.has(request_id)) this.clearReattachTimer(request_id);
     if (continued && this.numbersFramesOf(request_id)) this.outbox.continueAt(request_id, firstSeq);
     else if (this.outbox.has(request_id)) this.outbox.restart(request_id);
     else if (this.numbersFramesOf(request_id)) this.outbox.open(request_id);
@@ -2677,6 +2704,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         gemini: ' Install the Gemini CLI (https://github.com/google-gemini/gemini-cli) on the machine running the bridge and restart it.',
       };
       const hint = installHints[provider] ?? '';
+      // Nothing will run, so nothing is kept for it: a later drop must not
+      // list it as running or report it as disconnected.
+      this.outbox.forget(request_id);
       this.send({
         type: 'error',
         request_id,
@@ -2786,6 +2816,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       .finally(() => {
         // Only our own entry: a re-issue under the same id may own it by now.
         if (this.activeRequests.get(request_id) === controller) this.activeRequests.delete(request_id);
+        this.stoppingTurns.delete(controller);
         if (this.activeRequests.get(request_id) === undefined) {
           this.lostTurns.delete(request_id);
           // Confirmed by the server already: nothing left to keep for it.
@@ -3018,6 +3049,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       let doneData: DoneData = {};
       let sessionLost = false;
       const newCliSessionId = await adapter.execute(context, (event: AdapterStreamEvent) => {
+        // After session_lost the server re-issues the turn under this id:
+        // anything more of this run would be numbered as the new run's.
+        if (sessionLost) return;
         if (event.event === 'done') {
           doneData = event.data as DoneData;
           return;
@@ -3311,6 +3345,16 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return;
     }
 
+    // A turn given up on is reported as `bridge_disconnected` after the next
+    // welcome. What it still emits before that welcome (an unnumbered `done`
+    // as it unwinds, say) is dropped: written ahead of the report, it would
+    // make a cut-off answer look complete.
+    if (message.type === 'stream' && this.lostTurns.has(message.request_id) && !this.canWriteStream()) {
+      log.debug('Not connected and welcomed — dropping a frame of a turn given up on', { requestId: message.request_id });
+
+      return;
+    }
+
     // A turn's frames against a server with reliable delivery: numbered, kept
     // until confirmed, and never dropped for want of a connection.
     if (message.type === 'stream' && this.numbersFramesOf(message.request_id)) {
@@ -3378,13 +3422,17 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       payload: encoded.payload,
       terminal: encoded.event === 'done' || encoded.event === 'error',
     });
-    if (result === 'full') {
+    if (result === 'full' || result === 'shared_full') {
       // Bounded, so a long grace period with a chatty turn cannot exhaust
       // memory: the turn is stopped and reported as lost, saying whether the
-      // connection was down or the server just did not confirm in time.
+      // connection was down or the server just did not confirm in time, or
+      // that other turns had filled the outbox (this answer is not the cause).
       const connected = this.canWriteStream();
-      log.error('Too much unconfirmed output kept for this turn; stopping it', { requestId, seq, connected });
-      this.giveUpTurn(requestId, connected ? 'outbox_unconfirmed' : 'outbox_full');
+      const shared = result === 'shared_full';
+      log.error(shared
+        ? 'Too much unconfirmed output kept for all turns together; stopping this one'
+        : 'Too much unconfirmed output kept for this turn; stopping it', { requestId, seq, connected });
+      this.giveUpTurn(requestId, shared ? 'outbox_shared_full' : connected ? 'outbox_unconfirmed' : 'outbox_full');
 
       return;
     }

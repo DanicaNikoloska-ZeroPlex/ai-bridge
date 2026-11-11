@@ -282,4 +282,59 @@ describe('a helper waiting on its own work', () => {
     expect(last.data).toMatchObject({ phase: 'updated', status: 'completed' });
     expect(last.data).not.toHaveProperty('summary');
   });
+
+  it('starts its resume window afresh when a helper of its own is resumed and runs past it (4512398552)', async () => {
+    const steps: Step[] = [
+      echo('go'), init,
+      helperStarted('a1'), text('Launched.'), result(),
+      helperCalls('a1', 'n1', 'Agent'), nestedHelper('n1'),
+      ...ended('a1'),
+      ...notificationTurn('The helper is waiting on its own helper.'),
+      ...ended('n1'),
+      // a1's window (300 ms) opens here; then n1 is resumed and runs for longer than that.
+      { sleep: 50 },
+      nestedHelper('n1'),
+      { sleep: 500 },
+      ...ended('n1'),
+      { sleep: 100 },
+      helperStarted('a1'), helperSays('a1', 'Got the result.'),
+      ...ended('a1'),
+      ...notificationTurn('Done.'),
+      { waitEof: true },
+    ];
+    const turn = await run(steps, 300);
+
+    expect(turn.record.eofAt).toBe(linesBefore(steps, steps.length - 1));
+    const a1 = of(turn.events, 'task').filter((e) => (e.data as { task_id?: string }).task_id === 'a1');
+    for (const e of a1) expect(e.data).not.toHaveProperty('ended_waiting');
+    expect(of(turn.events, 'error')).toEqual([]);
+  });
+
+  it('keeps the helper\'s call id on a resume whose frame does not name it (4512398544)', async () => {
+    const steps: Step[] = [
+      echo('go'), init,
+      helperStarted('a1'), text('Launched.'), result(),
+      helperCalls('a1', 'b1', 'Bash'), helperCommand('b1'),
+      ...ended('a1'),
+      ...notificationTurn('Waiting.'),
+      ...ended('b1'),
+      { sleep: 50 },
+      // The resume without `tool_use_id`.
+      line({
+        type: 'system', subtype: 'task_started', task_id: 'a1', description: 'a1',
+        subagent_type: 'general-purpose', is_backgrounded: true, spawn_depth: 1, task_type: 'local_agent',
+      }),
+      helperSays('a1', 'Check passed.'),
+      ...ended('a1'),
+      ...notificationTurn('Done.'),
+      { waitEof: true },
+    ];
+    const turn = await run(steps, 3000);
+    const running = of(turn.events, 'task')
+      .map((e) => e.data as { task_id: string; status?: string; tool_use_id?: string })
+      .find((d) => d.task_id === 'a1' && d.status === 'running');
+
+    expect(running).toMatchObject({ tool_use_id: 'toolu_a1' });
+  });
 });
+

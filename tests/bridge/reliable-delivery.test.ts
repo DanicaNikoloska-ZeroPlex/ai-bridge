@@ -360,14 +360,17 @@ describe('against a server with reliable delivery', () => {
     await sleep(20);
     const before = streamOf('req_1').length;
 
-    // The server re-issues, then confirms the old error frame.
+    // The server re-issues, then confirms the old error frame (seq 1).
     request('req_1');
-    ack('req_1', 2);
+    ack('req_1', 1);
     await sleep(30);
     adapter.delta('again');
     await waitFor(() => streamOf('req_1').length > before, 'the re-issued turn\'s first frame');
 
     expect(streamOf('req_1').slice(before)[0]).toMatchObject({ event: 'block_delta', seq: 1 });
+    // ...and is kept: the old run's ack did not count for it.
+    const outbox = (bridge as unknown as { outbox: StreamOutbox }).outbox;
+    expect(outbox.pending('req_1').map((f) => f.seq)).toEqual([1]);
   });
 });
 
@@ -638,6 +641,138 @@ describe('review follow-up: a gap on a live connection, and a re-issue numbered 
     expect(outbox.pending('req_1').map((f) => f.seq)).toEqual([errorSeq + 1]);
     expect(outbox.runningTurns()).toEqual([{ request_id: 'req_1', last_acked_seq: errorSeq }]);
   });
+});
+
+describe('CodeRabbit remarks (D09710)', () => {
+  const internals = () => bridge as unknown as { outbox: StreamOutbox; lostTurns: Set<string> };
+  const reissue = (id: string, firstSeq?: number): void => socket.send(JSON.stringify({
+    type: 'ai_request', request_id: id, conversation_id: 'conv-1', provider: 'fake',
+    message: 'hi', system_prompt: null, options: {}, cli_session_id: null,
+    ...(firstSeq !== undefined ? { first_seq: firstSeq } : {}),
+  }));
+
+  it('a first_seq re-issue after a reconnect is not given up when the old run\'s ack is late (4537558605)', async () => {
+    await start(120, 200);
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    await drop();
+    adapter.delta('a');
+    adapter.emit({ event: 'error', data: { code: 'session_lost', message: 'gone' } });
+    adapter.finish();
+    await nextConnection();
+    welcome(120);
+    await waitFor((f, c) => c === 2 && f['seq'] === 2, 'the re-sent error frame');
+
+    // The server re-issues at once; its ack of the old run comes only after the re-attach timeout.
+    reissue('req_1', 3);
+    await waitFor((f, c) => c === 2 && f['type'] === 'ai_request_ack', 'the re-issue\'s ack');
+    adapter.delta('b');
+    await sleep(500);
+
+    expect(frames.some((f) => f.frame['code'] === 'bridge_disconnected')).toBe(false);
+    expect(adapter.aborted).toBe(false);
+    ack('req_1', 2);
+  }, 10_000);
+
+  it('drops a given-up turn\'s frames written before the welcome, so its report comes first (4512398520)', async () => {
+    await start(2);
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    await drop();
+    // Connected again, not yet welcomed, when the grace period runs out and the turn's done comes.
+    await nextConnection();
+    for (let i = 0; i < 300 && !adapter.aborted; i++) await sleep(10);
+    expect(adapter.aborted).toBe(true);
+    await sleep(50);
+
+    expect(streamOf('req_1', 2)).toEqual([]);
+    welcome(2);
+    await waitFor((f) => f['type'] === 'error' && f['code'] === 'bridge_disconnected', 'the replay');
+    expect(streamOf('req_1', 2)).toEqual([]);
+  }, 10_000);
+
+  it('forwards nothing more of a run after its session_lost, even once the turn is re-issued (4512398508)', async () => {
+    await start(120);
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    adapter.emit({ event: 'error', data: { code: 'session_lost', message: 'gone' } });
+    await waitFor((f) => f['event'] === 'error', 'the error');
+    const oldEmit = adapter.emit;
+    const oldFinish = adapter.finish;
+
+    reissue('req_1', 2);
+    await sleep(30);
+    // The old CLI still writes something on its way out.
+    oldEmit({ event: 'block_delta', data: { block_index: 0, delta: 'late' } as never });
+    oldFinish();
+    adapter.delta('new');
+    await waitFor((f) => (f['data'] as { delta?: string } | undefined)?.delta === 'new', 'the new run\'s frame');
+
+    expect(streamOf('req_1').some((f) => (f['data'] as { delta?: string } | undefined)?.delta === 'late')).toBe(false);
+    expect(streamOf('req_1').find((f) => (f['data'] as { delta?: string } | undefined)?.delta === 'new')).toMatchObject({ seq: 2 });
+  });
+
+  it('keeps nothing for a request whose provider is not available (4512398495)', async () => {
+    await start(120);
+    socket.send(JSON.stringify({
+      type: 'ai_request', request_id: 'req_x', conversation_id: 'conv-1', provider: 'nope',
+      message: 'hi', system_prompt: null, options: {}, cli_session_id: null,
+    }));
+    await waitFor((f) => f['type'] === 'error' && f['code'] === 'provider_unavailable', 'the refusal');
+
+    expect(internals().outbox.has('req_x')).toBe(false);
+    expect(internals().outbox.runningTurns()).toEqual([]);
+  });
+
+  it('is not idle while a given-up turn is still stopping (4512398489)', async () => {
+    await start(120, undefined, 20);
+    adapter.finishOnAbort = false;
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    adapter.delta('a');
+    await waitFor((f) => f['type'] === 'error' && f['code'] === 'bridge_disconnected', 'the report', 2000);
+    expect(adapter.aborted).toBe(true);
+
+    expect(bridge!.isIdle()).toBe(false);
+    adapter.finish();
+    await sleep(30);
+    expect(bridge!.isIdle()).toBe(true);
+  }, 10_000);
+
+  it('starts the live re-send wait over when the server confirms more (4537558595)', async () => {
+    await start(120, undefined, 50);
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    adapter.delta('a');
+    adapter.delta('b');
+    const sendsOf2 = (): number => streamOf('req_1', 1).filter((f) => f['seq'] === 2).length;
+    // 50, 100, 200 ms: three re-sends without progress; the next wait is 400 ms.
+    await waitFor(() => sendsOf2() === 4, 'the third re-send', 2000);
+
+    ack('req_1', 1);
+    // Progress: the next re-send comes after the first, short wait again.
+    await waitFor(() => sendsOf2() === 5, 'a re-send soon after the progress', 250);
+    expect(adapter.aborted).toBe(false);
+  }, 10_000);
+
+  it('does not keep a lost-turn marker for a finished turn whose final frames it let go of (4512398484)', async () => {
+    await start(120, undefined, 20);
+    request('req_1');
+    await waitFor((f) => f['type'] === 'ai_request_ack', 'the ack');
+    await sleep(20);
+    adapter.finish();
+    await waitFor((f) => f['event'] === 'done', 'the done');
+    // 20, 40, 80 ms re-sends, then let go of after 160 ms more.
+    await sleep(700);
+
+    expect(internals().outbox.has('req_1')).toBe(false);
+    expect(internals().lostTurns.has('req_1')).toBe(false);
+  }, 10_000);
 });
 
 describe('against a server without reliable delivery', () => {

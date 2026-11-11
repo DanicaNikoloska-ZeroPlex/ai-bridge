@@ -98,7 +98,7 @@ describe('StreamOutbox', () => {
     const frame = (seq: number, bytes: number) => ({ seq, payload: 'x'.repeat(bytes), terminal: false });
     expect(box.keep('a', frame(box.allocate('a'), 101))).toBe('full'); // over the turn's bytes
     expect(box.keep('a', frame(box.allocate('a'), 80))).toBe('kept');
-    expect(box.keep('b', frame(box.allocate('b'), 80))).toBe('full'); // over the total
+    expect(box.keep('b', frame(box.allocate('b'), 80))).toBe('shared_full'); // over the total
     box.forget('a');
     expect(box.keep('b', frame(box.allocate('b'), 80))).toBe('kept');
   });
@@ -137,5 +137,47 @@ describe('StreamOutbox', () => {
     box.forget('b');
     box.continueAt('b', 5);
     expect(box.peek('b')).toBe(5);
+  });
+
+  it('tells a full shared outbox apart from one turn outgrowing its own bound (4512398529)', () => {
+    const box = new StreamOutbox({ turnBytes: 1_000_000, turnFrames: 2, totalBytes: 1_000_000, totalFrames: 3 });
+    const frame = (seq: number) => ({ seq, payload: 'x', terminal: false });
+    expect(box.keep('a', frame(box.allocate('a')))).toBe('kept');
+    expect(box.keep('a', frame(box.allocate('a')))).toBe('kept');
+    expect(box.keep('b', frame(box.allocate('b')))).toBe('kept');
+    // b holds one frame, far within its own bound: the others filled the outbox.
+    expect(box.keep('b', frame(box.allocate('b')))).toBe('shared_full');
+    // a is over its own bound, whatever the total.
+    expect(box.keep('a', frame(box.allocate('a')))).toBe('full');
+  });
+
+  it('after a restart, applies no ack of the old run to the new one, a late one for an earlier frame neither (4512398534)', () => {
+    const box = new StreamOutbox();
+    push(box, 'a', 'block_delta');
+    push(box, 'a', 'error'); // session_lost, seq 2; neither confirmed yet
+
+    box.restart('a');
+    expect(push(box, 'a', 'block_delta')).toBe(1);
+    // The old run's acks arrive after the re-issue: the one for frame 1, then the error frame's.
+    box.ack('a', 1);
+    box.ack('a', 2);
+    expect(box.pending('a').map((f) => f.seq)).toEqual([1]);
+    expect(box.lastAcked('a')).toBe(0);
+    // A frame written now is kept as well, and the new run's own acks work as usual.
+    expect(push(box, 'a', 'block_delta')).toBe(2);
+    expect(box.pending('a').map((f) => f.seq)).toEqual([1, 2]);
+    box.ack('a', 1);
+    expect(box.pending('a').map((f) => f.seq)).toEqual([2]);
+  });
+
+  it('after a restart, applies acks to the new run once the connection dropped (4512398534)', () => {
+    const box = new StreamOutbox();
+    push(box, 'a', 'error');
+    box.restart('a');
+    push(box, 'a', 'block_delta');
+    // The old run's ack was lost with the connection; after the reconnect every ack is the new run's.
+    box.dropStaleAcks();
+    box.ack('a', 1);
+    expect(box.pending('a')).toEqual([]);
   });
 });

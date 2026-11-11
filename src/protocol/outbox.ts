@@ -49,8 +49,14 @@ export type KeepResult =
   | 'kept'
   /** Not kept: the server has ended the turn (or already has this seq). */
   | 'ended'
-  /** Not kept: it would go over a bound (never for a final frame). The turn must be stopped. */
-  | 'full';
+  /** Not kept: it would take this turn over its own bound (never for a final frame). The turn must be stopped. */
+  | 'full'
+  /**
+   * Not kept: the turn is within its own bound, but the other turns together
+   * already hold what the whole outbox may (never for a final frame). The
+   * turn must be stopped, and the reason is not that its answer grew too large.
+   */
+  | 'shared_full';
 
 /** One numbered frame, already encoded exactly as it goes on the wire. */
 export interface OutboxFrame {
@@ -78,8 +84,10 @@ interface TurnOutbox {
   serverEnded: boolean;
   /**
    * A `session_lost` re-issue started numbering from 1 again before the
-   * server's ack for the old run's error frame arrived. That ack (this seq)
-   * belongs to the old run and must not trim the new one's frames.
+   * server confirmed the old run's last frame (its error frame, this seq).
+   * Until that ack arrives, an ack up to this seq belongs to the old run and
+   * must not trim the new one's frames: the server confirms the old run's
+   * frames before it stores any of the new run's.
    */
   staleAck: number | null;
 }
@@ -121,17 +129,20 @@ export class StreamOutbox {
    * Keep a numbered frame until it is confirmed. Not kept when the server
    * has already ended the turn, because nothing would ever confirm it
    * (`ended`), or when it would take the turn or the whole outbox over a
-   * bound (`full`). A final frame is never refused for a bound.
+   * bound (`full` for its own, `shared_full` for the whole outbox's). A final
+   * frame is never refused for a bound.
    */
   keep(requestId: string, frame: OutboxFrame): KeepResult {
     const turn = this.turnFor(requestId);
     if (turn.serverEnded || frame.seq <= turn.acked) return 'ended';
     const bytes = bytesOf(frame);
     if (!frame.terminal && (turn.frames.length + 1 > this.limits.turnFrames
-      || turn.bytes + bytes > this.limits.turnBytes
-      || this.totalFrames + 1 > this.limits.totalFrames
-      || this.totalBytes + bytes > this.limits.totalBytes)) {
+      || turn.bytes + bytes > this.limits.turnBytes)) {
       return 'full';
+    }
+    if (!frame.terminal && (this.totalFrames + 1 > this.limits.totalFrames
+      || this.totalBytes + bytes > this.limits.totalBytes)) {
+      return 'shared_full';
     }
     turn.frames.push(frame);
     turn.bytes += bytes;
@@ -151,11 +162,16 @@ export class StreamOutbox {
     if (turn === undefined) return { ended: false, known: false };
 
     if (turn.staleAck !== null) {
-      const stale = turn.staleAck;
+      // The re-issued run's own acks only come after the server has confirmed
+      // the old run's last frame, so until that ack arrives every ack up to
+      // its seq is the old run's (a late one for an earlier frame too). One
+      // above it can only be the new run's.
+      if (seq <= turn.staleAck) {
+        if (seq === turn.staleAck) turn.staleAck = null;
+
+        return { ended: turn.serverEnded, known: true };
+      }
       turn.staleAck = null;
-      // The re-issued run's own acks only come after the server has seen its
-      // frames, which is after it confirmed the old run's final frame.
-      if (seq === stale) return { ended: turn.serverEnded, known: true };
     }
 
     if (seq > turn.acked) turn.acked = seq;
@@ -193,6 +209,15 @@ export class StreamOutbox {
       serverEnded: false,
       staleAck: lastFrame !== undefined && lastFrame.terminal ? lastFrame.seq : null,
     });
+  }
+
+  /**
+   * The connection dropped: an ack of an old run still on its way (see
+   * restart()) is gone with it, so every ack from now on is the re-issued
+   * run's own.
+   */
+  dropStaleAcks(): void {
+    for (const turn of this.turns.values()) turn.staleAck = null;
   }
 
   /**
