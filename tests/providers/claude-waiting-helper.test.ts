@@ -310,6 +310,29 @@ describe('a helper waiting on its own work', () => {
     expect(of(turn.events, 'error')).toEqual([]);
   });
 
+  it('is not marked waiting on a turn without its input open: plain completed and finished, as before', async () => {
+    const steps: Step[] = [
+      init,
+      helperStarted('a1'), text('Launched.'),
+      helperCalls('a1', 'b1', 'Bash'), helperCommand('b1'),
+      ...ended('a1'),
+      ...ended('b1'),
+      result(),
+    ];
+    const turn = await runInputTurn({ message: 'go', steps, withPort: false, helperResumeWindowMs: 300 });
+    const a1 = of(turn.events, 'task')
+      .map((e) => e.data as { task_id: string; phase: string; status?: string; summary?: string })
+      .filter((d) => d.task_id === 'a1')
+      .map((d) => [d.phase, d.status, d.summary]);
+
+    expect(a1).toEqual([
+      ['started', undefined, undefined],
+      ['updated', 'completed', undefined], ['finished', 'completed', 'a1'],
+    ]);
+    for (const e of of(turn.events, 'task')) expect(e.data).not.toHaveProperty('ended_waiting');
+    expect(of(turn.events, 'done')).toHaveLength(1);
+  });
+
   it('keeps the helper\'s call id on a resume whose frame does not name it (4512398544)', async () => {
     const steps: Step[] = [
       echo('go'), init,

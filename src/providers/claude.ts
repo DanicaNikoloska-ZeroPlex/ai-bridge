@@ -639,7 +639,9 @@ export class ClaudeAdapter extends ProviderAdapter {
           if (startedTasks.get(task.task_id)?.taskType === 'local_agent') {
             if (task.status === 'completed') {
               // Stopped with its own work still running: waiting, not done.
-              if (wasRunning && ownsRunningWork(task.task_id)) {
+              // Input-open turns only (PROTOCOL.md): any other turn forwards
+              // the plain `completed` / `finished`, as before.
+              if (acceptsInput && wasRunning && ownsRunningWork(task.task_id)) {
                 waitingHelpers.set(task.task_id, null);
                 log.info('A helper stopped while its own work runs — waiting for it', { requestId, taskId: task.task_id });
               }
