@@ -156,6 +156,36 @@ Claude uses its own sign-in, so you can set up the file before you have tokens.
 Usage figures follow the token in use; if Anthropic will not report usage for a
 long-lived token, the bridge reports none rather than another account's.
 
+**Two Claude accounts on the CLI's own sign-in.** Where Claude is signed in
+interactively (`~/.claude/.credentials.json`) rather than by token, keep one
+profile per account and swap the sign-in:
+
+```
+claude /login                          # sign in as the first account
+npx @tetrixdev/ai-bridge claude-login save work
+claude /login                          # sign in as the second account
+npx @tetrixdev/ai-bridge claude-login save home
+npx @tetrixdev/ai-bridge claude-login use work    # switch; again with home to switch back
+npx @tetrixdev/ai-bridge claude-login list        # names, and which is signed in (never a value)
+```
+
+Profiles live in `~/.claude/credentials-profiles/` (0700, files 0600). Claude
+rewrites its sign-in whenever it refreshes it, so `use` first copies the current
+sign-in back into its own profile, then puts the chosen one in place atomically;
+it refuses to replace a sign-in that is saved as no profile (`--discard-current`
+to do it anyway), so run `save` after every `claude /login`. When the current
+sign-in matches its profile only by the name last used (its tokens changed
+since), the copy it replaces is kept as `<name>.json.<time>.prev` (each its own file, removed after 30 days), in case that change
+was an unsaved `/login`. On macOS Claude keeps its sign-in in the Keychain, not
+in this file, so these commands do not apply there. `claude /status` may go on
+showing the previous account's email for a while: only the sign-in file is
+swapped, not Claude's cached account details in `~/.claude.json`. Claude reads the
+file at each start, and the usage report reads it on every ask, so no bridge
+needs a restart. `use` warns while Claude processes run: one refreshing at that
+moment may write the previous account back (`list` shows it; run `use` again).
+A long-lived token (above, or `CLAUDE_CODE_OAUTH_TOKEN` in the environment)
+overrides this sign-in; `list` and `use` say so when one is set.
+
 `--env-file` is available on its own, too, for anyone running the bridge some
 other way. A flag or an environment variable still wins over the file, so a
 service can be pointed at one and overridden by hand for a single run.

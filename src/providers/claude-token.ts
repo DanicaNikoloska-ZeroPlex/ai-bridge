@@ -22,7 +22,7 @@
  * a person can still override the file for one run.
  */
 import { randomBytes } from 'node:crypto';
-import { chmodSync, chownSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 export const CLAUDE_TOKEN_KEY = 'CLAUDE_CODE_OAUTH_TOKEN';
@@ -242,22 +242,40 @@ export function useClaudeToken(path: string, rawName: string): { name: string; f
     if (out.length && out.at(-1) === '') out.splice(out.length - 1, 0, `${CLAUDE_TOKEN_ACTIVE_KEY}=${name}`);
     else out.push(`${CLAUDE_TOKEN_ACTIVE_KEY}=${name}`);
   }
-  // Written beside the file and renamed over it: a run reading it meanwhile
-  // sees the old file or the new one, never half of one. Through a symlink to
-  // the real file, so the link stays a link; created exclusively and 0600 so
-  // the tokens are never readable by others, not even for a moment; given the
-  // original's owner, so `sudo` cannot leave a service a file it cannot read.
-  const real = realpathSync(path);
-  const owner = statSync(real);
+  writePrivateFile(path, out.join('\n'));
+  return { name, filled: (file.tokens.get(name) ?? '') !== '' };
+}
+
+/**
+ * Replace `path` with `text` atomically, keeping it private. Written beside the
+ * file and renamed over it: a reader meanwhile sees the old file or the new one,
+ * never half of one. Through a symlink to the real file, so the link stays a
+ * link; created exclusively and 0600 so the contents are never readable by
+ * others, not even for a moment; given the original's owner (when there is an
+ * original), so `sudo` cannot leave a service a file it cannot read.
+ */
+export function writePrivateFile(path: string, text: string): void {
+  let real = path;
+  let owner: { uid: number; gid: number } | null = null;
+  try {
+    real = realpathSync(path);
+    owner = statSync(real);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    // Not there yet is fine; a symlink pointing nowhere is refused, not
+    // replaced by a file of its own.
+    let isLink = false;
+    try { isLink = lstatSync(path).isSymbolicLink(); } catch { /* nothing at all */ }
+    if (isLink) throw new Error(`${path} is a symlink to a file that does not exist`);
+  }
   const tmp = join(dirname(real), `.${basename(real)}.${randomBytes(6).toString('hex')}.tmp`);
   try {
-    writeFileSync(tmp, out.join('\n'), { mode: 0o600, flag: 'wx' });
+    writeFileSync(tmp, text, { mode: 0o600, flag: 'wx' });
     chmodSync(tmp, 0o600);
-    if (process.platform !== 'win32' && process.getuid?.() !== owner.uid) chownSync(tmp, owner.uid, owner.gid);
+    if (owner && process.platform !== 'win32' && process.getuid?.() !== owner.uid) chownSync(tmp, owner.uid, owner.gid);
     renameSync(tmp, real);
   } catch (err) {
     rmSync(tmp, { force: true });
     throw err;
   }
-  return { name, filled: (file.tokens.get(name) ?? '') !== '' };
 }
