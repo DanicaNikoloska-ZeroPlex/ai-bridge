@@ -29,6 +29,7 @@ import { loadOrCreateIdentity, saveIdentity, fingerprint, type Identity } from '
 import { buildAllowedRoots, type AllowedRoot } from './workspace/allowlist.js';
 import { resolveApiOrigin } from './attachments/origin.js';
 import { enrol, type EngramConfig } from './local/engram.js';
+import { listClaudeLogins, runningClaudeProcesses, saveClaudeLogin, useClaudeLogin } from './providers/claude-login.js';
 import { CLAUDE_TOKEN_KEY, listClaudeTokens, loadClaudeToken, useClaudeToken, useClaudeTokenFile } from './providers/claude-token.js';
 import { installBridge, listBridges, pathsFor, readEnvFile, uninstallBridge } from './service/index.js';
 import { SelfUpdater } from './selfupdate/updater.js';
@@ -817,6 +818,92 @@ claudeTokenCommand
       console.log(result.filled
         ? `Claude runs now use "${result.name}" (${path}), from the next run on.`
         : `"${result.name}" is active but its line is empty: Claude runs use Claude's own sign-in until you fill it in ${path}.`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+/**
+ * Where a long-lived token would override the CLI's own sign-in: this shell's
+ * environment, or a token file a bridge reads with a filled active token. One
+ * line each, for `claude-login` to say plainly. Never a value.
+ */
+function claudeTokenOverrides(): string[] {
+  const lines: string[] = [];
+  if (process.env[CLAUDE_TOKEN_KEY]) lines.push(`${CLAUDE_TOKEN_KEY} is set in this shell's environment: Claude started from here uses that token, not the sign-in.`);
+  const files = new Map<string, string[]>();
+  const fromEnv = process.env['AI_BRIDGE_CLAUDE_ENV'];
+  if (fromEnv) files.set(resolve(fromEnv), ['AI_BRIDGE_CLAUDE_ENV']);
+  let bridges: ReturnType<typeof listBridges> = [];
+  try { bridges = listBridges(); } catch { /* no installed bridges to ask */ }
+  for (const b of bridges) {
+    const file = readEnvFile(pathsFor(b.name).env).claudeEnv;
+    if (file) files.set(file, [...(files.get(file) ?? []), `bridge "${b.name}"`]);
+  }
+  for (const [file, who] of files) {
+    const outcome = loadClaudeToken(file, {});
+    if (outcome.status === 'loaded') {
+      lines.push(`${who.join(', ')}: Claude runs and usage use the long-lived token "${outcome.name}" from ${file}, which overrides this sign-in. To use the sign-in instead, make an empty slot active there (\`ai-bridge claude-token use <name> --file ${file}\`) or drop the file (\`install --claude-env ""\`).`);
+    }
+  }
+  return lines;
+}
+
+function warnClaudeTokenOverrides(): void {
+  for (const line of claudeTokenOverrides()) console.warn(`Note: ${line}`);
+}
+
+const claudeLoginCommand = program
+  .command('claude-login')
+  .description("Named profiles of the Claude CLI's own sign-in (~/.claude/.credentials.json): save one per account, switch between them");
+claudeLoginCommand
+  .command('list')
+  .description('The saved profiles and which one is signed in now (never a value)')
+  .action(() => {
+    try {
+      const listing = listClaudeLogins();
+      if (!listing.profiles.length) console.log('No profiles yet. Sign in with `claude /login`, then `ai-bridge claude-login save <name>`; repeat per account.');
+      for (const name of listing.profiles) console.log(`  ${listing.active?.name === name ? '*' : ' '} ${name}`);
+      if (!listing.signedIn) console.log(`No Claude sign-in at ${listing.credentials}.`);
+      else if (!listing.active) console.log(`The current sign-in (${listing.credentials}) is not saved as any profile.`);
+      else console.log(`Signed in as "${listing.active.name}"${listing.active.how === 'recorded' ? ' (the profile last saved or used; its tokens have been refreshed since)' : ''}.`);
+      warnClaudeTokenOverrides();
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+claudeLoginCommand
+  .command('save')
+  .description('Store the current Claude sign-in as profile <name>')
+  .argument('<name>', 'A name for this account, e.g. work or home')
+  .action((name: string) => {
+    try {
+      const result = saveClaudeLogin(name);
+      console.log(`${result.replaced ? 'Replaced' : 'Saved'} profile "${result.name}" from the current sign-in.`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+claudeLoginCommand
+  .command('use')
+  .description('Make profile <name> the Claude sign-in, from the next Claude start on; no bridge restart needed')
+  .argument('<name>', 'A profile name, as `ai-bridge claude-login list` shows it')
+  .option('--discard-current', 'Replace a current sign-in that is saved as no profile (it is lost)')
+  .action((name: string, opts: { discardCurrent?: boolean }) => {
+    try {
+      const running = runningClaudeProcesses();
+      const result = useClaudeLogin(name, { discardCurrent: !!opts.discardCurrent });
+      if (result.savedBack && !result.already) console.log(`Saved the current sign-in back into "${result.savedBack}".`);
+      console.log(result.already
+        ? `"${result.name}" is already the sign-in in place (its latest tokens are saved).`
+        : `Claude now signs in as "${result.name}", from the next start on.`);
+      if (running) {
+        console.warn(`Warning: ${running} Claude process${running === 1 ? ' is' : 'es are'} running. One may switch to the new sign-in at its next token check, or, refreshing at that moment, write the previous account back; if \`ai-bridge claude-login list\` later shows the wrong profile, run this again once they have finished.`);
+      }
+      warnClaudeTokenOverrides();
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
