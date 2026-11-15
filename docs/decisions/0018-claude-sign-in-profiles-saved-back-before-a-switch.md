@@ -3,7 +3,7 @@ status: accepted
 date: 2026-11-15
 supersedes:
 superseded_by:
-revisit_when: Claude Code stops keeping its sign-in in ~/.claude/.credentials.json (a keychain, another file), its credentials file starts carrying an account id worth matching on, or switching the sign-in needs to happen per bridge rather than per machine user
+revisit_when: Claude Code stops keeping its sign-in in ~/.claude/.credentials.json on Linux and Windows (it already uses the Keychain on macOS, where this does not apply), its credentials file starts carrying an account id worth matching on, or switching the sign-in needs to happen per bridge rather than per machine user
 ---
 # Claude sign-in profiles, saved back before every switch
 
@@ -38,7 +38,8 @@ Nothing in the running bridge changes: Claude runs and usage read the file
 themselves. `list` and `use` say plainly when a long-lived token (this shell's
 `CLAUDE_CODE_OAUTH_TOKEN`, `AI_BRIDGE_CLAUDE_ENV`, or an installed bridge's token
 file with a filled active slot) overrides the sign-in, and `use` warns, without
-blocking, while Claude processes run.
+blocking, while this user's Claude processes run. Files it makes are owned
+like `~/.claude`, so a run under `sudo` leaves nothing to root.
 
 ## Consequences
 - Switching is one command per machine user, from any bridge version via npx.
@@ -47,7 +48,12 @@ blocking, while Claude processes run.
   `list` then shows it and `use` again fixes it.
 - Copies of the sign-in exist beside it, as private as it is.
 - Signing in to another account with `claude /login` and then calling `use`
-  without `save` would save that account under the old profile's name when the
-  match falls back to the recorded name; the README says to `save` after every
-  `/login`.
+  without `save` looks exactly like a token refresh (the file has no account id),
+  so that sign-in is saved under the recorded profile's name. The copy it
+  replaces is then kept as `<name>.json.prev`, and `use` says so; the README says
+  to `save` after every `/login`.
+- `use` re-reads the file just before replacing it and saves whatever a Claude
+  process refreshed meanwhile, so a rotated refresh token is not lost.
+- Claude's cached account details in `~/.claude.json` are not swapped, so
+  `claude /status` may show the previous account's email for a while.
 - No protocol change.

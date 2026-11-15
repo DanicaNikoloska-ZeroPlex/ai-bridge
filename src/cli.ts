@@ -831,6 +831,7 @@ claudeTokenCommand
  */
 function claudeTokenOverrides(): string[] {
   const lines: string[] = [];
+  if (process.env['ANTHROPIC_API_KEY']) lines.push("ANTHROPIC_API_KEY is set in this shell's environment: Claude started from here may use that key, not the sign-in.");
   if (process.env[CLAUDE_TOKEN_KEY]) lines.push(`${CLAUDE_TOKEN_KEY} is set in this shell's environment: Claude started from here uses that token, not the sign-in.`);
   const files = new Map<string, string[]>();
   const fromEnv = process.env['AI_BRIDGE_CLAUDE_ENV'];
@@ -865,9 +866,9 @@ claudeLoginCommand
       const listing = listClaudeLogins();
       if (!listing.profiles.length) console.log('No profiles yet. Sign in with `claude /login`, then `ai-bridge claude-login save <name>`; repeat per account.');
       for (const name of listing.profiles) console.log(`  ${listing.active?.name === name ? '*' : ' '} ${name}`);
-      if (!listing.signedIn) console.log(`No Claude sign-in at ${listing.credentials}.`);
+      if (!listing.signedIn) console.log(`No Claude sign-in at ${listing.credentials}.${process.platform === 'darwin' ? ' On macOS Claude keeps its sign-in in the Keychain, which claude-login does not switch.' : ''}`);
       else if (!listing.active) console.log(`The current sign-in (${listing.credentials}) is not saved as any profile.`);
-      else console.log(`Signed in as "${listing.active.name}"${listing.active.how === 'recorded' ? ' (the profile last saved or used; its tokens have been refreshed since)' : ''}.`);
+      else console.log(`Signed in as "${listing.active.name}"${listing.active.how === 'recorded' ? ' (by the profile last saved or used: its tokens changed since, by a refresh or by a `claude /login`; after a /login, run `save` first)' : ''}.`);
       warnClaudeTokenOverrides();
     } catch (err) {
       console.error(err instanceof Error ? err.message : String(err));
@@ -897,6 +898,7 @@ claudeLoginCommand
       const running = runningClaudeProcesses();
       const result = useClaudeLogin(name, { discardCurrent: !!opts.discardCurrent });
       if (result.savedBack && !result.already) console.log(`Saved the current sign-in back into "${result.savedBack}".`);
+      if (result.kept) console.log(`The copy it replaced is kept as ${result.kept}; if you had signed in to another account with \`claude /login\` without saving it, move that file back over the profile.`);
       console.log(result.already
         ? `"${result.name}" is already the sign-in in place (its latest tokens are saved).`
         : `Claude now signs in as "${result.name}", from the next start on.`);

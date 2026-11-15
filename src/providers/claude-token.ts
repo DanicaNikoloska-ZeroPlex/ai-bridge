@@ -22,7 +22,7 @@
  * a person can still override the file for one run.
  */
 import { randomBytes } from 'node:crypto';
-import { chmodSync, chownSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 export const CLAUDE_TOKEN_KEY = 'CLAUDE_CODE_OAUTH_TOKEN';
@@ -262,6 +262,11 @@ export function writePrivateFile(path: string, text: string): void {
     owner = statSync(real);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    // Not there yet is fine; a symlink pointing nowhere is refused, not
+    // replaced by a file of its own.
+    let isLink = false;
+    try { isLink = lstatSync(path).isSymbolicLink(); } catch { /* nothing at all */ }
+    if (isLink) throw new Error(`${path} is a symlink to a file that does not exist`);
   }
   const tmp = join(dirname(real), `.${basename(real)}.${randomBytes(6).toString('hex')}.tmp`);
   try {

@@ -21,9 +21,9 @@
  * overwritten silently: switching refuses until it is saved or discarded.
  */
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { writePrivateFile } from './claude-token.js';
 
@@ -84,13 +84,30 @@ function profilePath(paths: ClaudeLoginPaths, name: string): string {
   return join(paths.profiles, `${name}.json`);
 }
 
+/** Give what this command made the owner of ~/.claude, so a run under `sudo`
+ *  does not leave the profiles to root. */
+function ownLikeClaudeDir(paths: ClaudeLoginPaths, path: string): void {
+  if (process.platform === 'win32') return;
+  const ref = statSync(dirname(paths.profiles));
+  if (process.getuid?.() !== ref.uid) chownSync(path, ref.uid, ref.gid);
+}
+
 function ensureProfilesDir(paths: ClaudeLoginPaths): void {
   mkdirSync(paths.profiles, { recursive: true, mode: 0o700 });
   if (process.platform !== 'win32') chmodSync(paths.profiles, 0o700);
+  ownLikeClaudeDir(paths, paths.profiles);
 }
 
 function recordActive(paths: ClaudeLoginPaths, name: string): void {
-  writeFileSync(join(paths.profiles, ACTIVE_FILE), `${name}\n`, { mode: 0o600 });
+  const path = join(paths.profiles, ACTIVE_FILE);
+  writeFileSync(path, `${name}\n`, { mode: 0o600 });
+  ownLikeClaudeDir(paths, path);
+}
+
+/** Write a profile file, private and owned like ~/.claude. */
+function writeProfile(paths: ClaudeLoginPaths, file: string, text: string): void {
+  writePrivateFile(file, text);
+  ownLikeClaudeDir(paths, file);
 }
 
 function recordedActive(paths: ClaudeLoginPaths): string | null {
@@ -152,7 +169,7 @@ export function saveClaudeLogin(rawName: string, home?: string): { name: string;
   ensureProfilesDir(paths);
   const target = profilePath(paths, name);
   const replaced = existsSync(target);
-  writePrivateFile(target, current.text);
+  writeProfile(paths, target, current.text);
   recordActive(paths, name);
   return { name, replaced };
 }
@@ -163,6 +180,9 @@ export interface ClaudeLoginSwitch {
   savedBack: string | null;
   /** True when the chosen profile was already the sign-in in place. */
   already: boolean;
+  /** Where the copy the save-back replaced was kept, when the owner was only
+   *  the recorded name (a refresh, or a `claude /login` nobody saved). */
+  kept: string | null;
 }
 
 /**
@@ -184,25 +204,53 @@ export function useClaudeLogin(rawName: string, opts: { home?: string; discardCu
 
   const current = readCurrent(paths);
   let savedBack: string | null = null;
+  let kept: string | null = null;
   if (current) {
     const owner = ownerOf(paths, current.id);
     if (owner) {
-      if (readFileSync(profilePath(paths, owner.name), 'utf8') !== current.text) writePrivateFile(profilePath(paths, owner.name), current.text);
+      const file = profilePath(paths, owner.name);
+      const stored = readFileSync(file, 'utf8');
+      if (stored !== current.text) {
+        // Matched only by the recorded name: the tokens may have been refreshed,
+        // or this may be another account signed in with `claude /login` and
+        // never saved. The two look the same, so the copy being replaced is
+        // kept one generation back rather than lost.
+        if (owner.how === 'recorded') {
+          kept = `${file}.prev`;
+          writeProfile(paths, kept, stored);
+        }
+        writeProfile(paths, file, current.text);
+      }
       savedBack = owner.name;
+      // A Claude process may refresh while this runs: whatever it wrote is
+      // saved too before the file is replaced, so its new refresh token is kept.
+      let saved = current.text;
+      for (let i = 0; i < 3 && savedBack !== name; i++) {
+        const now = readIfThere(paths.credentials);
+        if (now === null || now === saved || !identityOf(now)) break;
+        writeProfile(paths, file, now);
+        saved = now;
+      }
     } else if (!opts.discardCurrent) {
       throw new Error('the current Claude sign-in is not saved as any profile. Save it first (`ai-bridge claude-login save <name>`), or pass --discard-current to replace it anyway');
     }
   }
   if (savedBack === name) {
     recordActive(paths, name);
-    return { name, savedBack, already: true };
+    return { name, savedBack, already: true, kept };
   }
-  writePrivateFile(paths.credentials, chosen);
+  try {
+    writePrivateFile(paths.credentials, chosen);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EPERM' || code === 'EBUSY') throw new Error(`could not replace ${paths.credentials} (${code}): close Claude and try again`);
+    throw err;
+  }
   recordActive(paths, name);
-  return { name, savedBack, already: false };
+  return { name, savedBack, already: false, kept };
 }
 
-/** How many Claude CLI processes run on this machine besides this one; null
+/** How many Claude CLI processes this user runs besides this one; null
  *  when that cannot be told here. Only a count: nothing about them is read
  *  beyond their name. */
 export function runningClaudeProcesses(): number | null {
@@ -212,12 +260,14 @@ export function runningClaudeProcesses(): number | null {
     for (const entry of readdirSync('/proc')) {
       if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
       try {
-        if (readFileSync(`/proc/${entry}/comm`, 'utf8').trim() === 'claude') count++;
+        if (readFileSync(`/proc/${entry}/comm`, 'utf8').trim() !== 'claude') continue;
+        // Only this user's: another user's Claude has a sign-in of its own.
+        if (statSync(`/proc/${entry}`).uid === process.getuid?.()) count++;
       } catch { /* gone, or not ours to read */ }
     }
     return count;
   }
-  const res = spawnSync('pgrep', ['-x', 'claude'], { encoding: 'utf8', timeout: 3000 });
+  const res = spawnSync('pgrep', ['-x', '-u', String(process.getuid?.() ?? ''), 'claude'], { encoding: 'utf8', timeout: 3000 });
   if (res.error || (res.status !== 0 && res.status !== 1)) return null;
   return res.stdout.split('\n').filter((l) => l.trim() !== '' && Number(l) !== process.pid).length;
 }

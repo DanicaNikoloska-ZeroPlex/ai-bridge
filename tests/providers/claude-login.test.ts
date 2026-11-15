@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
@@ -53,7 +53,7 @@ describe('Claude sign-in profiles', () => {
   test('use swaps the sign-in in place and list follows it', () => {
     twoAccounts();
     const result = useClaudeLogin('work', { home });
-    expect(result).toEqual({ name: 'work', savedBack: 'home', already: false });
+    expect(result).toEqual({ name: 'work', savedBack: 'home', already: false, kept: null });
     expect(current()).toBe(creds('acc-work-1', 'ref-work-1'));
     expect(listClaudeLogins(home).active).toEqual({ name: 'work', how: 'match' });
   });
@@ -82,6 +82,31 @@ describe('Claude sign-in profiles', () => {
     expect(statSync(paths.credentials).ino).not.toBe(before); // renamed over, not rewritten in place
     expect(readdirSync(join(home, '.claude')).filter((f) => f.endsWith('.tmp'))).toEqual([]);
     expect(readdirSync(paths.profiles).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  test('an unsaved `claude /login` matched only by name keeps the profile it replaces', () => {
+    twoAccounts();
+    useClaudeLogin('work', { home });
+    signIn('acc-home-2', 'ref-home-2'); // signed in to home again, never saved
+    const result = useClaudeLogin('home', { home });
+    expect(result.savedBack).toBe('work');
+    expect(result.kept).toBe(join(paths.profiles, 'work.json.prev'));
+    expect(readFileSync(result.kept!, 'utf8')).toBe(creds('acc-work-1', 'ref-work-1'));
+    if (process.platform !== 'win32') expect(mode(result.kept!)).toBe(0o600);
+    expect(listClaudeLogins(home).profiles).toEqual(['home', 'work']);
+  });
+
+  test('a save-back matched by tokens keeps no extra copy', () => {
+    twoAccounts();
+    expect(useClaudeLogin('work', { home }).kept).toBeNull();
+  });
+
+  test.skipIf(process.platform === 'win32')('a credentials symlink pointing nowhere is refused, not replaced', () => {
+    twoAccounts();
+    rmSync(paths.credentials);
+    symlinkSync(join(home, 'missing.json'), paths.credentials);
+    expect(() => useClaudeLogin('work', { home })).toThrow(/symlink/);
+    expect(lstatSync(paths.credentials).isSymbolicLink()).toBe(true);
   });
 
   test('a sign-in saved as no profile is never overwritten silently', () => {
