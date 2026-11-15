@@ -45,9 +45,10 @@ export interface BridgeConfig {
   engram?: string | undefined;
   /**
    * A file holding CLAUDE_CODE_OAUTH_TOKEN (a long-lived token from
-   * `claude setup-token`), as AI_BRIDGE_CLAUDE_ENV. A path, never the token:
-   * the token stays in one 0600 file of its own, so renewing it is one edit
-   * and a restart, and this file never holds a second copy.
+   * `claude setup-token`), or several named ones and CLAUDE_TOKEN_ACTIVE, as
+   * AI_BRIDGE_CLAUDE_ENV. A path, never a token: the tokens stay in one 0600
+   * file of their own, read for every run, so renewing or switching is one
+   * edit, and this file never holds a second copy.
    */
   claudeEnv?: string | undefined;
 }
