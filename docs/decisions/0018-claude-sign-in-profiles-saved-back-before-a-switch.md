@@ -50,7 +50,7 @@ like `~/.claude`, so a run under `sudo` leaves nothing to root.
 - Signing in to another account with `claude /login` and then calling `use`
   without `save` looks exactly like a token refresh (the file has no account id),
   so that sign-in is saved under the recorded profile's name. The copy it
-  replaces is then kept as `<name>.json.prev`, and `use` says so; the README says
+  replaces is then kept as `<name>.json.<time>.prev` (each its own file, removed after 30 days), and `use` says so; the README says
   to `save` after every `/login`.
 - `use` re-reads the file just before replacing it and saves whatever a Claude
   process refreshed meanwhile, so a rotated refresh token is not lost.

@@ -21,7 +21,7 @@
  * overwritten silently: switching refuses until it is saved or discarded.
  */
 import { spawnSync } from 'node:child_process';
-import { chmodSync, chownSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -89,7 +89,7 @@ function profilePath(paths: ClaudeLoginPaths, name: string): string {
 function ownLikeClaudeDir(paths: ClaudeLoginPaths, path: string): void {
   if (process.platform === 'win32') return;
   const ref = statSync(dirname(paths.profiles));
-  if (process.getuid?.() !== ref.uid) chownSync(path, ref.uid, ref.gid);
+  if (process.getuid?.() === 0 && ref.uid !== 0) chownSync(path, ref.uid, ref.gid);
 }
 
 function ensureProfilesDir(paths: ClaudeLoginPaths): void {
@@ -216,20 +216,19 @@ export function useClaudeLogin(rawName: string, opts: { home?: string; discardCu
         // never saved. The two look the same, so the copy being replaced is
         // kept one generation back rather than lost.
         if (owner.how === 'recorded') {
-          kept = `${file}.prev`;
+          kept = `${file}.${new Date().toISOString().replace(/[:.]/g, '-')}.prev`;
           writeProfile(paths, kept, stored);
+          pruneKept(paths);
         }
         writeProfile(paths, file, current.text);
       }
       savedBack = owner.name;
       // A Claude process may refresh while this runs: whatever it wrote is
-      // saved too before the file is replaced, so its new refresh token is kept.
-      let saved = current.text;
-      for (let i = 0; i < 3 && savedBack !== name; i++) {
+      // saved too before the file is replaced. This narrows that window; it
+      // cannot close it (hence the warning while Claude runs).
+      if (savedBack !== name) {
         const now = readIfThere(paths.credentials);
-        if (now === null || now === saved || !identityOf(now)) break;
-        writeProfile(paths, file, now);
-        saved = now;
+        if (now !== null && now !== current.text && identityOf(now)) writeProfile(paths, file, now);
       }
     } else if (!opts.discardCurrent) {
       throw new Error('the current Claude sign-in is not saved as any profile. Save it first (`ai-bridge claude-login save <name>`), or pass --discard-current to replace it anyway');
@@ -243,11 +242,22 @@ export function useClaudeLogin(rawName: string, opts: { home?: string; discardCu
     writePrivateFile(paths.credentials, chosen);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'EPERM' || code === 'EBUSY') throw new Error(`could not replace ${paths.credentials} (${code}): close Claude and try again`);
+    if (process.platform === 'win32' && (code === 'EPERM' || code === 'EBUSY')) throw new Error(`could not replace ${paths.credentials} (${code}): close Claude and try again`);
     throw err;
   }
   recordActive(paths, name);
   return { name, savedBack, already: false, kept };
+}
+
+/** Kept copies older than 30 days go; the newer ones stay, each its own file,
+ *  so a later switch never overwrites the one that mattered. */
+function pruneKept(paths: ClaudeLoginPaths): void {
+  const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+  for (const f of readdirSync(paths.profiles)) {
+    if (!f.endsWith('.prev')) continue;
+    const path = join(paths.profiles, f);
+    try { if (statSync(path).mtimeMs < cutoff) rmSync(path, { force: true }); } catch { /* gone already */ }
+  }
 }
 
 /** How many Claude CLI processes this user runs besides this one; null

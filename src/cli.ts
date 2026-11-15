@@ -898,7 +898,7 @@ claudeLoginCommand
       const running = runningClaudeProcesses();
       const result = useClaudeLogin(name, { discardCurrent: !!opts.discardCurrent });
       if (result.savedBack && !result.already) console.log(`Saved the current sign-in back into "${result.savedBack}".`);
-      if (result.kept) console.log(`The copy it replaced is kept as ${result.kept}; if you had signed in to another account with \`claude /login\` without saving it, move that file back over the profile.`);
+      if (result.kept) console.log(`The copy it replaced is kept as ${result.kept}; if you had signed in to another account with \`claude /login\` without saving it, move that file back over the profile (copies like it are removed after 30 days).`);
       console.log(result.already
         ? `"${result.name}" is already the sign-in in place (its latest tokens are saved).`
         : `Claude now signs in as "${result.name}", from the next start on.`);

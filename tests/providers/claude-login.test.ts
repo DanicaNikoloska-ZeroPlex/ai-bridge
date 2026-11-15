@@ -90,10 +90,16 @@ describe('Claude sign-in profiles', () => {
     signIn('acc-home-2', 'ref-home-2'); // signed in to home again, never saved
     const result = useClaudeLogin('home', { home });
     expect(result.savedBack).toBe('work');
-    expect(result.kept).toBe(join(paths.profiles, 'work.json.prev'));
+    expect(result.kept).toMatch(/work\.json\.[0-9TZ-]+\.prev$/);
     expect(readFileSync(result.kept!, 'utf8')).toBe(creds('acc-work-1', 'ref-work-1'));
     if (process.platform !== 'win32') expect(mode(result.kept!)).toBe(0o600);
     expect(listClaudeLogins(home).profiles).toEqual(['home', 'work']);
+    // A later ordinary switch keeps a copy of its own, never over this one.
+    useClaudeLogin('work', { home });
+    signIn('acc-x', 'ref-x');
+    const later = useClaudeLogin('home', { home });
+    expect(later.kept).not.toBe(result.kept);
+    expect(readFileSync(result.kept!, 'utf8')).toBe(creds('acc-work-1', 'ref-work-1'));
   });
 
   test('a save-back matched by tokens keeps no extra copy', () => {

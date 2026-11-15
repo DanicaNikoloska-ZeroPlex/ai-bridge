@@ -175,7 +175,7 @@ sign-in back into its own profile, then puts the chosen one in place atomically;
 it refuses to replace a sign-in that is saved as no profile (`--discard-current`
 to do it anyway), so run `save` after every `claude /login`. When the current
 sign-in matches its profile only by the name last used (its tokens changed
-since), the copy it replaces is kept as `<name>.json.prev`, in case that change
+since), the copy it replaces is kept as `<name>.json.<time>.prev` (each its own file, removed after 30 days), in case that change
 was an unsaved `/login`. On macOS Claude keeps its sign-in in the Keychain, not
 in this file, so these commands do not apply there. `claude /status` may go on
 showing the previous account's email for a while: only the sign-in file is
