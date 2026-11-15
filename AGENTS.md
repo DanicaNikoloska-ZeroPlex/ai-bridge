@@ -64,7 +64,7 @@ Node 22 or newer (CI runs 22 and 24).
 
 | Path | What |
 |---|---|
-| `src/cli.ts` | Entry point: options, env vars, `install` / `list` / `uninstall` |
+| `src/cli.ts` | Entry point: options, env vars, `install` / `list` / `uninstall` / `claude-token` |
 | `src/bridge.ts` | The WebSocket client: handshake, routing every frame, turn lifecycle |
 | `src/protocol/` | Frame types and `PROTOCOL_VERSION` |
 | `src/providers/` | One adapter per CLI (`claude.ts`, `codex.ts`, `gemini.ts`), spawn env, timeouts, usage |
@@ -99,6 +99,7 @@ Node 22 or newer (CI runs 22 and 24).
 - 0014 Claude gets the system prompt by file, rendered fresh on every turn.
 - 0015 Claude subagents get the bridge's session section too.
 - 0016 With `--allow-web-search`, a request may add Claude's built-in WebSearch, and only it, to an `isolated` turn.
+- 0017 The Claude token file may hold several named tokens and is read for every run.
 
 Full records and status: [docs/decisions/README.md](docs/decisions/README.md).
 Before changing what one covers, read it; if your change contradicts an

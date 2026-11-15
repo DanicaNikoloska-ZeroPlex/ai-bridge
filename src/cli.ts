@@ -29,7 +29,7 @@ import { loadOrCreateIdentity, saveIdentity, fingerprint, type Identity } from '
 import { buildAllowedRoots, type AllowedRoot } from './workspace/allowlist.js';
 import { resolveApiOrigin } from './attachments/origin.js';
 import { enrol, type EngramConfig } from './local/engram.js';
-import { loadClaudeToken } from './providers/claude-token.js';
+import { CLAUDE_TOKEN_KEY, listClaudeTokens, loadClaudeToken, useClaudeToken, useClaudeTokenFile } from './providers/claude-token.js';
 import { installBridge, listBridges, pathsFor, readEnvFile, uninstallBridge } from './service/index.js';
 import { SelfUpdater } from './selfupdate/updater.js';
 import { detect as detectService, pinVersion, prefetch } from './selfupdate/service.js';
@@ -154,7 +154,7 @@ program
   )
   .option(
     '--claude-env <file>',
-    'A file holding CLAUDE_CODE_OAUTH_TOKEN=<token> from `claude setup-token`, for a machine nobody signs into interactively (or set AI_BRIDGE_CLAUDE_ENV). Must be readable only by you (chmod 600). A token already in the environment wins.',
+    'A file holding CLAUDE_CODE_OAUTH_TOKEN=<token> from `claude setup-token` (or named CLAUDE_CODE_OAUTH_TOKEN_<NAME> tokens and CLAUDE_TOKEN_ACTIVE=<name>), for a machine nobody signs into interactively (or set AI_BRIDGE_CLAUDE_ENV). Read for every Claude run; switch with `ai-bridge claude-token use`. Must be readable only by you (chmod 600). A token already in the environment wins.',
     process.env['AI_BRIDGE_CLAUDE_ENV'] || undefined,
   )
   .option(
@@ -293,17 +293,23 @@ program
       log.info('Running in TEST MODE — AI requests will receive mock responses');
     }
 
-    // A long-lived Claude token, before anything spawns a CLI: every Claude
-    // turn inherits this process's environment. Said out loud either way,
+    // Long-lived Claude tokens, before anything spawns a CLI. The file is read
+    // again for every Claude run (so `ai-bridge claude-token use` switches
+    // without a restart); what it yields is said out loud whenever it changes,
     // because a service that silently lost its token answers every question
     // with "Not logged in" and nothing on the machine says why.
     if (opts.claudeEnv) {
-      const outcome = loadClaudeToken(opts.claudeEnv);
-      if (outcome.status === 'loaded') log.info('Claude signs in with the long-lived token', { file: outcome.path });
-      else if (outcome.status === 'already_set') log.info('Claude signs in with CLAUDE_CODE_OAUTH_TOKEN from the environment; --claude-env not read');
-      else if (outcome.status === 'too_open') log.warn(`not using ${outcome.path}: others can read it (mode ${outcome.mode}). chmod 600 it and restart; until then Claude uses its own sign-in, if any`);
-      else if (outcome.status === 'no_token') log.warn(`${outcome.path} has no CLAUDE_CODE_OAUTH_TOKEN= line; Claude uses its own sign-in, if any`);
-      else log.warn(`could not read the Claude token file ${outcome.path}: ${outcome.reason}; Claude uses its own sign-in, if any`);
+      if (process.env[CLAUDE_TOKEN_KEY]) {
+        log.info('Claude signs in with CLAUDE_CODE_OAUTH_TOKEN from the environment; --claude-env not read');
+      } else {
+        useClaudeTokenFile(opts.claudeEnv, (outcome) => {
+          if (outcome.status === 'loaded') log.info(`Claude signs in with the long-lived token "${outcome.name}"`, { file: outcome.path });
+          else if (outcome.status === 'too_open') log.warn(`not using ${outcome.path}: others can read it (mode ${outcome.mode}). chmod 600 it; until then Claude uses its own sign-in, if any`);
+          else if (outcome.status === 'unknown_active') log.warn(`${outcome.path} makes "${outcome.name}" active but has no line for it; Claude uses its own sign-in, if any`);
+          else if (outcome.status === 'no_token') log.info(`${outcome.path} has no token${outcome.name ? ` in slot "${outcome.name}"` : ''}; Claude uses its own sign-in, if any`);
+          else if (outcome.status === 'unreadable') log.warn(`could not read the Claude token file ${outcome.path}: ${outcome.reason}; Claude uses its own sign-in, if any`);
+        });
+      }
     }
 
     // Validate required options
@@ -752,9 +758,70 @@ function checkClaudeEnv(raw: string): string {
   const outcome = loadClaudeToken(path, probe);
   if (outcome.status === 'too_open') throw new Error(`${path} can be read by others (mode ${outcome.mode}). Run: chmod 600 ${path}`);
   if (outcome.status === 'unreadable') throw new Error(`cannot read ${path}: ${outcome.reason}`);
-  if (outcome.status === 'no_token') throw new Error(`${path} has no CLAUDE_CODE_OAUTH_TOKEN=<token> line`);
+  // A file whose slots are still empty is accepted: Claude keeps its own
+  // sign-in until a token is added, and runs pick it up without a restart.
+  if (outcome.status === 'no_token' || outcome.status === 'unknown_active') {
+    console.warn(`${path} holds no usable token yet; Claude uses its own sign-in until you add one (see \`ai-bridge claude-token list\`).`);
+  }
   return path;
 }
+
+/**
+ * The token file `claude-token` works on: --file, else AI_BRIDGE_CLAUDE_ENV,
+ * else the one the installed bridges name, when they all name the same one.
+ */
+function claudeTokenFile(file: string | undefined): string {
+  if (file) return resolve(file);
+  if (process.env['AI_BRIDGE_CLAUDE_ENV']) return resolve(process.env['AI_BRIDGE_CLAUDE_ENV']);
+  const named = new Set(listBridges().map((b) => readEnvFile(pathsFor(b.name).env).claudeEnv).filter((p): p is string => !!p));
+  if (named.size === 1) return [...named][0]!;
+  throw new Error(named.size
+    ? `the installed bridges name different token files (${[...named].join(', ')}); say which with --file`
+    : 'no token file: say which with --file <path> (or set AI_BRIDGE_CLAUDE_ENV)');
+}
+
+const claudeTokenCommand = program
+  .command('claude-token')
+  .description('List the long-lived Claude tokens in the token file, or choose which one Claude runs use');
+claudeTokenCommand
+  .command('list')
+  .description('The token names in the file and which one is active (never a value)')
+  .option('--file <path>', 'The token file (default: AI_BRIDGE_CLAUDE_ENV, else the one the installed bridges use)')
+  .action((opts: { file?: string }) => {
+    try {
+      const listing = listClaudeTokens(claudeTokenFile(opts.file));
+      console.log(listing.path);
+      if (!listing.slots.length) console.log('  (no token lines yet)');
+      for (const slot of listing.slots) {
+        console.log(`  ${slot.active ? '*' : ' '} ${slot.name}${slot.filled ? '' : '  (empty)'}`);
+      }
+      console.log(listing.inUse
+        ? `Claude runs use "${listing.inUse}".`
+        : listing.active && !listing.slots.some((s) => s.name === listing.active)
+          ? `Active is "${listing.active}", which has no line; Claude runs use Claude's own sign-in.`
+          : "No token in use; Claude runs use Claude's own sign-in.");
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+claudeTokenCommand
+  .command('use')
+  .description('Make <name> the token Claude runs use, from the next run on; no restart needed')
+  .argument('<name>', 'A token name, as `ai-bridge claude-token list` shows it')
+  .option('--file <path>', 'The token file (default: AI_BRIDGE_CLAUDE_ENV, else the one the installed bridges use)')
+  .action((name: string, opts: { file?: string }) => {
+    try {
+      const path = claudeTokenFile(opts.file);
+      const result = useClaudeToken(path, name);
+      console.log(result.filled
+        ? `Claude runs now use "${result.name}" (${path}), from the next run on.`
+        : `"${result.name}" is active but its line is empty: Claude runs use Claude's own sign-in until you fill it in ${path}.`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
 
 program
   .command('uninstall')

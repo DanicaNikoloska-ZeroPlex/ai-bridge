@@ -51,6 +51,7 @@
 import { createInterface } from 'node:readline';
 import type { InputClosedData, ModelInfo, TaskData, TaskPhase, TaskUsage } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
+import { applyClaudeToken } from './claude-token.js';
 import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
 import { startTurnTimeouts, clearRequestTimeout, type TurnTimeouts } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
@@ -543,6 +544,9 @@ export class ClaudeAdapter extends ProviderAdapter {
       const env = buildSpawnEnv(context.requestId, context.bridgeEnv);
       // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
       delete env['CLAUDECODE'];
+      // The active long-lived token, read from its file now, so a switch
+      // (`ai-bridge claude-token use`) reaches the next run without a restart.
+      applyClaudeToken(env);
 
       // An input-open turn hands over its opening message as the first NDJSON
       // frame and keeps stdin open; every other turn writes the bare prompt
