@@ -153,7 +153,8 @@ Claude run on, with no restart. Both find the file by `--file`, else
 `CLAUDE_CODE_OAUTH_TOKEN=` line is the token named `default`, used when there is
 no `CLAUDE_TOKEN_ACTIVE` line. An active slot that is empty means no token:
 Claude uses its own sign-in, so you can set up the file before you have tokens.
-Usage figures follow the token in use.
+Usage figures follow the token in use; if Anthropic will not report usage for a
+long-lived token, the bridge reports none rather than another account's.
 
 `--env-file` is available on its own, too, for anyone running the bridge some
 other way. A flag or an environment variable still wins over the file, so a

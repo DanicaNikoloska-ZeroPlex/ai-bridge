@@ -21,7 +21,8 @@
  * without a restart. A token already in the bridge's own environment wins, so
  * a person can still override the file for one run.
  */
-import { chmodSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { chmodSync, chownSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 export const CLAUDE_TOKEN_KEY = 'CLAUDE_CODE_OAUTH_TOKEN';
@@ -61,8 +62,7 @@ function pairOf(raw: string): [string, string] | null {
   return [key, value];
 }
 
-/** Every token slot in the file and which one is active. The first line for a
- *  name wins, as it always did for the single token. */
+/** Every token slot in the file and which one is active. */
 export function parseClaudeTokenFile(text: string): ClaudeTokenFile {
   const tokens = new Map<string, string>();
   let active: string | null = null;
@@ -71,14 +71,18 @@ export function parseClaudeTokenFile(text: string): ClaudeTokenFile {
     if (!pair) continue;
     const [key, value] = pair;
     if (key === CLAUDE_TOKEN_ACTIVE_KEY) {
-      if (active === null) active = value.toLowerCase();
+      // A value that is not a name (a token pasted in by mistake) is never
+      // echoed back: it becomes a placeholder that matches no slot.
+      if (active === null) active = value === '' ? '' : NAME.test(value.toLowerCase()) ? value.toLowerCase() : '(not a valid name)';
       continue;
     }
     let name: string;
     if (key === CLAUDE_TOKEN_KEY) name = DEFAULT_TOKEN_NAME;
     else if (key.startsWith(`${CLAUDE_TOKEN_KEY}_`)) name = key.slice(CLAUDE_TOKEN_KEY.length + 1).toLowerCase();
     else continue;
-    if (!NAME.test(name) || tokens.has(name)) continue;
+    // The first line for a name wins, except that a filled line beats an
+    // empty placeholder above it.
+    if (!NAME.test(name) || (tokens.has(name) && tokens.get(name) !== '')) continue;
     tokens.set(name, value);
   }
   return { tokens, active };
@@ -239,13 +243,18 @@ export function useClaudeToken(path: string, rawName: string): { name: string; f
     else out.push(`${CLAUDE_TOKEN_ACTIVE_KEY}=${name}`);
   }
   // Written beside the file and renamed over it: a run reading it meanwhile
-  // sees the old file or the new one, never half of one. Created 0600 so the
-  // tokens are never readable by others, not even for a moment.
-  const tmp = join(dirname(path), `.${basename(path)}.${process.pid}.tmp`);
+  // sees the old file or the new one, never half of one. Through a symlink to
+  // the real file, so the link stays a link; created exclusively and 0600 so
+  // the tokens are never readable by others, not even for a moment; given the
+  // original's owner, so `sudo` cannot leave a service a file it cannot read.
+  const real = realpathSync(path);
+  const owner = statSync(real);
+  const tmp = join(dirname(real), `.${basename(real)}.${randomBytes(6).toString('hex')}.tmp`);
   try {
-    writeFileSync(tmp, out.join('\n'), { mode: 0o600 });
+    writeFileSync(tmp, out.join('\n'), { mode: 0o600, flag: 'wx' });
     chmodSync(tmp, 0o600);
-    renameSync(tmp, path);
+    if (process.platform !== 'win32' && process.getuid?.() !== owner.uid) chownSync(tmp, owner.uid, owner.gid);
+    renameSync(tmp, real);
   } catch (err) {
     rmSync(tmp, { force: true });
     throw err;

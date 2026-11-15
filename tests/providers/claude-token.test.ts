@@ -1,10 +1,10 @@
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import {
   applyClaudeToken, currentClaudeToken, listClaudeTokens, loadClaudeToken, parseClaudeEnv, parseClaudeTokenFile,
-  useClaudeToken, useClaudeTokenFile, type ClaudeTokenOutcome,
+  selectClaudeToken, useClaudeToken, useClaudeTokenFile, type ClaudeTokenOutcome,
 } from '../../src/providers/claude-token.js';
 
 /**
@@ -72,6 +72,7 @@ describe('several named tokens, one active', () => {
     chmodSync(path, mode);
     return path;
   };
+  const selectClaudeTokenName = (f: ReturnType<typeof parseClaudeTokenFile>) => selectClaudeToken(f).token;
   const TWO = '# tokens\nCLAUDE_CODE_OAUTH_TOKEN_WORK=tok-work-1234\nCLAUDE_CODE_OAUTH_TOKEN_HOME="tok-home-5678"\nCLAUDE_TOKEN_ACTIVE=work\n';
 
   test('parses named slots, empty ones included, and the active name', () => {
@@ -128,6 +129,22 @@ describe('several named tokens, one active', () => {
     } finally {
       if (saved !== undefined) process.env['CLAUDE_CODE_OAUTH_TOKEN'] = saved;
     }
+  });
+
+  test('a filled line beats an empty placeholder above it; a non-name active value is never echoed', () => {
+    expect(parseClaudeEnv('CLAUDE_CODE_OAUTH_TOKEN=\nCLAUDE_CODE_OAUTH_TOKEN=real\n')).toBe('real');
+    const parsed = parseClaudeTokenFile('CLAUDE_CODE_OAUTH_TOKEN_A=x\nCLAUDE_TOKEN_ACTIVE=sk-ant-oat01-pasted\n');
+    expect(parsed.active).not.toMatch(/sk-ant/);
+    expect(selectClaudeTokenName(parsed)).toBeNull();
+  });
+
+  test.skipIf(process.platform === 'win32')('use through a symlink keeps the link and rewrites its target', () => {
+    const real = file(TWO);
+    const link = join(dir, 'link.env');
+    symlinkSync(real, link);
+    useClaudeToken(link, 'home');
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(parseClaudeEnv(readFileSync(real, 'utf8'))).toBe('tok-home-5678');
   });
 
   test('list names the slots and the active one, and never a value', () => {
