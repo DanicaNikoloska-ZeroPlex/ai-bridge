@@ -17,7 +17,7 @@ The server picks one and sends it as `cli_isolation` on the handshake.
 
 | Posture | The CLI may… | Needs from the bridge operator |
 |---|---|---|
-| `isolated` (default) | reach server-declared tools, and nothing else | nothing |
+| `isolated` (default) | reach server-declared tools, and nothing else (Claude: plus `WebSearch` on a turn that asks, when the operator allowed it) | nothing (`--allow-web-search` for the search) |
 | `workspace` | also use its own file and shell tools, inside the named directory | `--allow-dir` |
 | `native` | do anything the CLI can do, with the operator's own environment | `--allow-native` |
 
@@ -45,6 +45,24 @@ upstream server are withheld and refused by name), and it is **refused, never
 run wider**, on a provider that cannot be held to it (Codex keeps a read-only
 shell, Gemini has no lever) or when it also names a working folder. The
 decision is `turnPosture()` in `src/bridge.ts`.
+
+## Web search on an `isolated` turn
+
+A request may add one built-in tool to an `isolated` Claude turn, and only on a
+bridge whose operator passed `--allow-web-search`: `options.web_search: true`
+puts exactly `WebSearch` into `--allowedTools` (advertised as `hello.web_search`;
+`resolveWebSearch()` in `src/bridge.ts`, the adapter in
+`src/providers/claude.ts`). A search reads no file and runs no command here, but
+it runs on the operator's Claude account and sends words from the turn to a
+search backend, and with `--local-tools` a turn can hold what tools on this
+machine returned; so, like the postures above, it is the operator's to allow
+(decision 0016). Without the flag, or on Codex or Gemini, an isolated turn that
+asks is refused, never run without the tool. From 0.40.1 an isolated Claude turn
+also passes `--disallowedTools` for the web tools it may not use, so they are not
+listed at all (a denied but listed tool was still called, and its permission
+error read to the person as something to grant). `WebFetch` is never added: it
+fetches any URL the model writes, so a page's instructions could carry the
+turn's data to any host.
 
 ## How `isolated` is actually enforced
 

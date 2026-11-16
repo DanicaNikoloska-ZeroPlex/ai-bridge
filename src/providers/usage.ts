@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { createLogger } from '../utils/logger.js';
+import { currentClaudeToken } from './claude-token.js';
 
 const log = createLogger('usage');
 
@@ -54,6 +55,14 @@ const CLAUDE_CREDENTIALS = () => join(homedir(), '.claude', '.credentials.json')
 export async function readClaudeUsage(): Promise<UsageAnswer> {
   let accessToken: string;
 
+  // A long-lived token in use (from the environment or the active one in the
+  // token file) is the account Claude runs bill to, so its allowance is the one
+  // asked about; the CLI's own sign-in may be a different account entirely.
+  // When the vendor refuses to answer for that token, the answer is
+  // no_credential, never the other account's figures.
+  const longLived = currentClaudeToken();
+  if (longLived) return askUsage(longLived);
+
   try {
     const raw = await readFile(CLAUDE_CREDENTIALS(), 'utf-8');
     const parsed = JSON.parse(raw) as { claudeAiOauth?: { accessToken?: unknown } };
@@ -72,6 +81,11 @@ export async function readClaudeUsage(): Promise<UsageAnswer> {
     return { ok: false, reason: 'no_credential' };
   }
 
+  return askUsage(accessToken);
+}
+
+/** The vendor's figures for one access token. */
+async function askUsage(accessToken: string): Promise<UsageAnswer> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 

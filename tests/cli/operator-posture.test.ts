@@ -66,6 +66,20 @@ describe('--allow-native', () => {
   });
 });
 
+describe('--allow-web-search', () => {
+  it('is off unless passed (decision 0016)', () => {
+    expect(resolveOperatorPosture(options(), SERVER, {}).webSearch).toBe(false);
+  });
+
+  it('reaches the bridge when passed', () => {
+    expect(resolveOperatorPosture(options({ allowWebSearch: true }), SERVER, {}).webSearch).toBe(true);
+  });
+
+  it('is not switched on by an environment variable', () => {
+    expect(resolveOperatorPosture(options(), SERVER, { AI_BRIDGE_WEB_SEARCH: '1' }).webSearch).toBe(false);
+  });
+});
+
 describe('--allow-dir', () => {
   it('reaches the bridge as resolved roots', () => {
     const posture = resolveOperatorPosture(options({ allowDir: [`${repo}=Studio`] }), SERVER, {});

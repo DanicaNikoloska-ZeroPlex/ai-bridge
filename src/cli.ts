@@ -29,7 +29,8 @@ import { loadOrCreateIdentity, saveIdentity, fingerprint, type Identity } from '
 import { buildAllowedRoots, type AllowedRoot } from './workspace/allowlist.js';
 import { resolveApiOrigin } from './attachments/origin.js';
 import { enrol, type EngramConfig } from './local/engram.js';
-import { loadClaudeToken } from './providers/claude-token.js';
+import { listClaudeLogins, runningClaudeProcesses, saveClaudeLogin, useClaudeLogin } from './providers/claude-login.js';
+import { CLAUDE_TOKEN_KEY, listClaudeTokens, loadClaudeToken, useClaudeToken, useClaudeTokenFile } from './providers/claude-token.js';
 import { installBridge, listBridges, pathsFor, readEnvFile, uninstallBridge } from './service/index.js';
 import { SelfUpdater } from './selfupdate/updater.js';
 import { detect as detectService, pinVersion, prefetch } from './selfupdate/service.js';
@@ -53,6 +54,8 @@ export interface OperatorPosture {
   allowNative: boolean;
   keepAttachments: boolean;
   servedFilesPath: string;
+  /** Whether a request may ask for web search on an isolated Claude turn (--allow-web-search, decision 0016). */
+  webSearch: boolean;
 }
 
 /** Just the option fields this mapping reads. */
@@ -61,6 +64,8 @@ export interface OperatorOptions extends AttachmentOptionValues {
   api?: string;
   allowNative: boolean;
   keepAttachments: boolean;
+  /** true from `--allow-web-search`; absent or false means no request may ask for it. */
+  allowWebSearch?: boolean;
   /** The install this run is, when a service started it: from AI_BRIDGE_NAME
    *  or the env file. It keeps one install's attachment store from another's. */
   installName?: string | undefined;
@@ -94,6 +99,9 @@ export function resolveOperatorPosture(
     allowNative: opts.allowNative,
     keepAttachments: opts.keepAttachments,
     servedFilesPath: attachments.servedFilesPath,
+    // Off unless the operator passes the flag, like --allow-native: a flag on
+    // the command line works the same under systemd, launchd and by hand.
+    webSearch: opts.allowWebSearch === true,
   };
 }
 
@@ -147,7 +155,7 @@ program
   )
   .option(
     '--claude-env <file>',
-    'A file holding CLAUDE_CODE_OAUTH_TOKEN=<token> from `claude setup-token`, for a machine nobody signs into interactively (or set AI_BRIDGE_CLAUDE_ENV). Must be readable only by you (chmod 600). A token already in the environment wins.',
+    'A file holding CLAUDE_CODE_OAUTH_TOKEN=<token> from `claude setup-token` (or named CLAUDE_CODE_OAUTH_TOKEN_<NAME> tokens and CLAUDE_TOKEN_ACTIVE=<name>), for a machine nobody signs into interactively (or set AI_BRIDGE_CLAUDE_ENV). Read for every Claude run; switch with `ai-bridge claude-token use`. Must be readable only by you (chmod 600). A token already in the environment wins.',
     process.env['AI_BRIDGE_CLAUDE_ENV'] || undefined,
   )
   .option(
@@ -205,6 +213,13 @@ program
     + 'unit starts @tetrixdev/ai-bridge@${AI_BRIDGE_VERSION}; anywhere else it just logs.',
   )
   .option(
+    '--allow-web-search',
+    'Permit the server to give an isolated Claude turn Claude Code\'s built-in WebSearch tool (options.web_search), '
+    + 'and no other built-in tool. Off unless you pass it. Searches run at Anthropic on your Claude account, with '
+    + 'words the model takes from the turn; they reach no file or command on this machine.',
+    false,
+  )
+  .option(
     '--keep-attachments',
     'Keep downloaded attachments after a turn instead of deleting them. Debugging aid.',
     false,
@@ -238,6 +253,7 @@ program
     deviceLabel?: string; deviceMode: string; identityFile: string; localDataDir: string;
     allowDir: string[]; api?: string; keepAttachments: boolean; allowNative: boolean;
     envFile?: string; installName?: string; selfUpdate: boolean; mcpUpstreams?: string;
+    allowWebSearch: boolean;
   } & AttachmentOptionValues) => {
     opts.installName = process.env['AI_BRIDGE_NAME'] || undefined;
     // Before anything reads server or token. The file is the lowest precedence
@@ -278,17 +294,23 @@ program
       log.info('Running in TEST MODE — AI requests will receive mock responses');
     }
 
-    // A long-lived Claude token, before anything spawns a CLI: every Claude
-    // turn inherits this process's environment. Said out loud either way,
+    // Long-lived Claude tokens, before anything spawns a CLI. The file is read
+    // again for every Claude run (so `ai-bridge claude-token use` switches
+    // without a restart); what it yields is said out loud whenever it changes,
     // because a service that silently lost its token answers every question
     // with "Not logged in" and nothing on the machine says why.
     if (opts.claudeEnv) {
-      const outcome = loadClaudeToken(opts.claudeEnv);
-      if (outcome.status === 'loaded') log.info('Claude signs in with the long-lived token', { file: outcome.path });
-      else if (outcome.status === 'already_set') log.info('Claude signs in with CLAUDE_CODE_OAUTH_TOKEN from the environment; --claude-env not read');
-      else if (outcome.status === 'too_open') log.warn(`not using ${outcome.path}: others can read it (mode ${outcome.mode}). chmod 600 it and restart; until then Claude uses its own sign-in, if any`);
-      else if (outcome.status === 'no_token') log.warn(`${outcome.path} has no CLAUDE_CODE_OAUTH_TOKEN= line; Claude uses its own sign-in, if any`);
-      else log.warn(`could not read the Claude token file ${outcome.path}: ${outcome.reason}; Claude uses its own sign-in, if any`);
+      if (process.env[CLAUDE_TOKEN_KEY]) {
+        log.info('Claude signs in with CLAUDE_CODE_OAUTH_TOKEN from the environment; --claude-env not read');
+      } else {
+        useClaudeTokenFile(opts.claudeEnv, (outcome) => {
+          if (outcome.status === 'loaded') log.info(`Claude signs in with the long-lived token "${outcome.name}"`, { file: outcome.path });
+          else if (outcome.status === 'too_open') log.warn(`not using ${outcome.path}: others can read it (mode ${outcome.mode}). chmod 600 it; until then Claude uses its own sign-in, if any`);
+          else if (outcome.status === 'unknown_active') log.warn(`${outcome.path} makes "${outcome.name}" active but has no line for it; Claude uses its own sign-in, if any`);
+          else if (outcome.status === 'no_token') log.info(`${outcome.path} has no token${outcome.name ? ` in slot "${outcome.name}"` : ''}; Claude uses its own sign-in, if any`);
+          else if (outcome.status === 'unreadable') log.warn(`could not read the Claude token file ${outcome.path}: ${outcome.reason}; Claude uses its own sign-in, if any`);
+        });
+      }
     }
 
     // Validate required options
@@ -470,6 +492,9 @@ program
       process.exit(1);
     }
     const { allowedRoots, apiOrigin, attachmentLimits } = operatorPosture;
+    if (operatorPosture.webSearch) {
+      log.warn('web search is PERMITTED: this server may give an isolated Claude turn the built-in WebSearch tool, on your Claude account.');
+    }
 
     if (allowedRoots.length > 0) {
       log.warn(
@@ -529,6 +554,7 @@ program
       keepAttachments: operatorPosture.keepAttachments,
       servedFilesPath: operatorPosture.servedFilesPath,
       allowNative: operatorPosture.allowNative,
+      webSearch: operatorPosture.webSearch,
       ...(mcpUpstreams ? { mcpUpstreams } : {}),
     });
 
@@ -649,7 +675,8 @@ const installCommand = program
   .option('--local-tools', 'Pass --local-tools to the service (see the main options)', false)
   .option('--engram <url>', 'Engram\'s address (https://...), recorded as ENGRAM_URL so the service enrols this machine for vault secrets. Needs --local-tools.')
   .option('--claude-env <file>', 'A 0600 file holding CLAUDE_CODE_OAUTH_TOKEN=<token> (from `claude setup-token`) for the service to sign Claude in with. Kept on a reinstall that does not name it; pass "" to drop it.')
-  .option('--no-self-update', 'Do not follow the version the server asks for; stay on the installed one until you change AI_BRIDGE_VERSION by hand');
+  .option('--no-self-update', 'Do not follow the version the server asks for; stay on the installed one until you change AI_BRIDGE_VERSION by hand')
+  .option('--allow-web-search', 'Pass --allow-web-search to the service (see the main options)', false);
 // The same attachment settings as a direct run, recorded in the service's env
 // file. Left out, a reinstall keeps whatever the install it replaces had.
 for (const option of ATTACHMENT_OPTIONS) {
@@ -659,6 +686,7 @@ installCommand
   .action((opts: {
     server: string; token: string; allowDir?: string; name?: string; force: boolean;
     allowNative: boolean; localTools: boolean; selfUpdate: boolean; engram?: string; claudeEnv?: string;
+    allowWebSearch: boolean;
   } & AttachmentOptionValues) => {
     try {
       validateAttachmentOptions(opts);
@@ -676,6 +704,7 @@ installCommand
           ...(opts.allowNative ? ['--allow-native'] : []),
           ...(opts.localTools ? ['--local-tools'] : []),
           ...(opts.selfUpdate ? [] : ['--no-self-update']),
+          ...(opts.allowWebSearch ? ['--allow-web-search'] : []),
         ],
       });
       const paths = pathsFor(name);
@@ -730,9 +759,158 @@ function checkClaudeEnv(raw: string): string {
   const outcome = loadClaudeToken(path, probe);
   if (outcome.status === 'too_open') throw new Error(`${path} can be read by others (mode ${outcome.mode}). Run: chmod 600 ${path}`);
   if (outcome.status === 'unreadable') throw new Error(`cannot read ${path}: ${outcome.reason}`);
-  if (outcome.status === 'no_token') throw new Error(`${path} has no CLAUDE_CODE_OAUTH_TOKEN=<token> line`);
+  // A file whose slots are still empty is accepted: Claude keeps its own
+  // sign-in until a token is added, and runs pick it up without a restart.
+  if (outcome.status === 'no_token' || outcome.status === 'unknown_active') {
+    console.warn(`${path} holds no usable token yet; Claude uses its own sign-in until you add one (see \`ai-bridge claude-token list\`).`);
+  }
   return path;
 }
+
+/**
+ * The token file `claude-token` works on: --file, else AI_BRIDGE_CLAUDE_ENV,
+ * else the one the installed bridges name, when they all name the same one.
+ */
+function claudeTokenFile(file: string | undefined): string {
+  if (file) return resolve(file);
+  if (process.env['AI_BRIDGE_CLAUDE_ENV']) return resolve(process.env['AI_BRIDGE_CLAUDE_ENV']);
+  const named = new Set(listBridges().map((b) => readEnvFile(pathsFor(b.name).env).claudeEnv).filter((p): p is string => !!p));
+  if (named.size === 1) return [...named][0]!;
+  throw new Error(named.size
+    ? `the installed bridges name different token files (${[...named].join(', ')}); say which with --file`
+    : 'no token file: say which with --file <path> (or set AI_BRIDGE_CLAUDE_ENV)');
+}
+
+const claudeTokenCommand = program
+  .command('claude-token')
+  .description('List the long-lived Claude tokens in the token file, or choose which one Claude runs use');
+claudeTokenCommand
+  .command('list')
+  .description('The token names in the file and which one is active (never a value)')
+  .option('--file <path>', 'The token file (default: AI_BRIDGE_CLAUDE_ENV, else the one the installed bridges use)')
+  .action((opts: { file?: string }) => {
+    try {
+      const listing = listClaudeTokens(claudeTokenFile(opts.file));
+      console.log(listing.path);
+      if (!listing.slots.length) console.log('  (no token lines yet)');
+      for (const slot of listing.slots) {
+        console.log(`  ${slot.active ? '*' : ' '} ${slot.name}${slot.filled ? '' : '  (empty)'}`);
+      }
+      console.log(listing.inUse
+        ? `Claude runs use "${listing.inUse}".`
+        : listing.active && !listing.slots.some((s) => s.name === listing.active)
+          ? `Active is "${listing.active}", which has no line; Claude runs use Claude's own sign-in.`
+          : "No token in use; Claude runs use Claude's own sign-in.");
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+claudeTokenCommand
+  .command('use')
+  .description('Make <name> the token Claude runs use, from the next run on; no restart needed')
+  .argument('<name>', 'A token name, as `ai-bridge claude-token list` shows it')
+  .option('--file <path>', 'The token file (default: AI_BRIDGE_CLAUDE_ENV, else the one the installed bridges use)')
+  .action((name: string, opts: { file?: string }) => {
+    try {
+      const path = claudeTokenFile(opts.file);
+      const result = useClaudeToken(path, name);
+      console.log(result.filled
+        ? `Claude runs now use "${result.name}" (${path}), from the next run on.`
+        : `"${result.name}" is active but its line is empty: Claude runs use Claude's own sign-in until you fill it in ${path}.`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+
+/**
+ * Where a long-lived token would override the CLI's own sign-in: this shell's
+ * environment, or a token file a bridge reads with a filled active token. One
+ * line each, for `claude-login` to say plainly. Never a value.
+ */
+function claudeTokenOverrides(): string[] {
+  const lines: string[] = [];
+  if (process.env['ANTHROPIC_API_KEY']) lines.push("ANTHROPIC_API_KEY is set in this shell's environment: Claude started from here may use that key, not the sign-in.");
+  if (process.env[CLAUDE_TOKEN_KEY]) lines.push(`${CLAUDE_TOKEN_KEY} is set in this shell's environment: Claude started from here uses that token, not the sign-in.`);
+  const files = new Map<string, string[]>();
+  const fromEnv = process.env['AI_BRIDGE_CLAUDE_ENV'];
+  if (fromEnv) files.set(resolve(fromEnv), ['AI_BRIDGE_CLAUDE_ENV']);
+  let bridges: ReturnType<typeof listBridges> = [];
+  try { bridges = listBridges(); } catch { /* no installed bridges to ask */ }
+  for (const b of bridges) {
+    const file = readEnvFile(pathsFor(b.name).env).claudeEnv;
+    if (file) files.set(file, [...(files.get(file) ?? []), `bridge "${b.name}"`]);
+  }
+  for (const [file, who] of files) {
+    const outcome = loadClaudeToken(file, {});
+    if (outcome.status === 'loaded') {
+      lines.push(`${who.join(', ')}: Claude runs and usage use the long-lived token "${outcome.name}" from ${file}, which overrides this sign-in. To use the sign-in instead, make an empty slot active there (\`ai-bridge claude-token use <name> --file ${file}\`) or drop the file (\`install --claude-env ""\`).`);
+    }
+  }
+  return lines;
+}
+
+function warnClaudeTokenOverrides(): void {
+  for (const line of claudeTokenOverrides()) console.warn(`Note: ${line}`);
+}
+
+const claudeLoginCommand = program
+  .command('claude-login')
+  .description("Named profiles of the Claude CLI's own sign-in (~/.claude/.credentials.json): save one per account, switch between them");
+claudeLoginCommand
+  .command('list')
+  .description('The saved profiles and which one is signed in now (never a value)')
+  .action(() => {
+    try {
+      const listing = listClaudeLogins();
+      if (!listing.profiles.length) console.log('No profiles yet. Sign in with `claude /login`, then `ai-bridge claude-login save <name>`; repeat per account.');
+      for (const name of listing.profiles) console.log(`  ${listing.active?.name === name ? '*' : ' '} ${name}`);
+      if (!listing.signedIn) console.log(`No Claude sign-in at ${listing.credentials}.${process.platform === 'darwin' ? ' On macOS Claude keeps its sign-in in the Keychain, which claude-login does not switch.' : ''}`);
+      else if (!listing.active) console.log(`The current sign-in (${listing.credentials}) is not saved as any profile.`);
+      else console.log(`Signed in as "${listing.active.name}"${listing.active.how === 'recorded' ? ' (by the profile last saved or used: its tokens changed since, by a refresh or by a `claude /login`; after a /login, run `save` first)' : ''}.`);
+      warnClaudeTokenOverrides();
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+claudeLoginCommand
+  .command('save')
+  .description('Store the current Claude sign-in as profile <name>')
+  .argument('<name>', 'A name for this account, e.g. work or home')
+  .action((name: string) => {
+    try {
+      const result = saveClaudeLogin(name);
+      console.log(`${result.replaced ? 'Replaced' : 'Saved'} profile "${result.name}" from the current sign-in.`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
+claudeLoginCommand
+  .command('use')
+  .description('Make profile <name> the Claude sign-in, from the next Claude start on; no bridge restart needed')
+  .argument('<name>', 'A profile name, as `ai-bridge claude-login list` shows it')
+  .option('--discard-current', 'Replace a current sign-in that is saved as no profile (it is lost)')
+  .action((name: string, opts: { discardCurrent?: boolean }) => {
+    try {
+      const running = runningClaudeProcesses();
+      const result = useClaudeLogin(name, { discardCurrent: !!opts.discardCurrent });
+      if (result.savedBack && !result.already) console.log(`Saved the current sign-in back into "${result.savedBack}".`);
+      if (result.kept) console.log(`The copy it replaced is kept as ${result.kept}; if you had signed in to another account with \`claude /login\` without saving it, move that file back over the profile (copies like it are removed after 30 days).`);
+      console.log(result.already
+        ? `"${result.name}" is already the sign-in in place (its latest tokens are saved).`
+        : `Claude now signs in as "${result.name}", from the next start on.`);
+      if (running) {
+        console.warn(`Warning: ${running} Claude process${running === 1 ? ' is' : 'es are'} running. One may switch to the new sign-in at its next token check, or, refreshing at that moment, write the previous account back; if \`ai-bridge claude-login list\` later shows the wrong profile, run this again once they have finished.`);
+      }
+      warnClaudeTokenOverrides();
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  });
 
 program
   .command('uninstall')

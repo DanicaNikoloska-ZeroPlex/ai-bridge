@@ -105,6 +105,14 @@ export interface ExecutionContext {
    */
   bridgeHelperAddendum?: string | null;
   /**
+   * Whether this turn may use Claude Code's built-in WebSearch tool: an
+   * `isolated` turn whose request asked with `options.web_search: true`, on a
+   * bridge started with `--allow-web-search`. Resolved once by the bridge (resolveWebSearch);
+   * absent means no. Only the Claude adapter reads it, and only in `isolated`,
+   * where it adds exactly `WebSearch` to the allowed tools (decision 0016).
+   */
+  webSearch?: boolean;
+  /**
    * Present when this turn runs with its input open (`options.accepts_input`,
    * confirmed by the ack's `input_open`). The adapter keeps the CLI's stdin
    * open, opens the port once the CLI has started its session, and ends it

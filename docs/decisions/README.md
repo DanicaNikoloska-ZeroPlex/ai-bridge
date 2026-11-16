@@ -23,3 +23,6 @@ history. Format: Engram documentation standard v1, section 3.
 | [0013](0013-token-only-in-the-authorization-header.md) | The connection token travels only in the Authorization header | accepted | 2026-10-24 |
 | [0014](0014-system-prompt-by-file-fresh-every-turn.md) | Claude gets the system prompt by file, rendered fresh on every turn | accepted | 2026-10-25 |
 | [0015](0015-helpers-get-the-session-section.md) | Claude subagents get the bridge's session section too | accepted | 2026-10-25 |
+| [0016](0016-with-the-operators-opt-in-a-request-may-add-web-search.md) | With --allow-web-search, a request may add Claude's built-in WebSearch, and only it, to an isolated turn | accepted | 2026-11-14 |
+| [0017](0017-claude-token-file-read-per-run.md) | The Claude token file may hold several named tokens and is read for every run | accepted | 2026-11-15 |
+| [0018](0018-claude-sign-in-profiles-saved-back-before-a-switch.md) | Claude sign-in profiles, saved back before every switch | accepted | 2026-11-15 |

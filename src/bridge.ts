@@ -99,6 +99,7 @@ import { APP_CODE_REVISION } from './apps/guard.js';
 /** Revision of per-turn isolation (`ai_request.cli_isolation`), advertised as `hello.turn_isolation`. */
 export const TURN_ISOLATION_REVISION = 1;
 import { CLAUDE_EFFORT_LEVELS } from './providers/claude-effort.js';
+import { CLAUDE_THINKING_DISPLAYS } from './providers/claude-thinking-display.js';
 import { Readable } from 'node:stream';
 import { receiveUpload, type UploadOffer, type UploadSent } from './attachments/receive.js';
 import { createLogger } from './utils/logger.js';
@@ -214,6 +215,16 @@ export interface BridgeOptions {
    * doubling after each re-send; exists so tests need not wait that long.
    */
   liveAckTimeoutMs?: number;
+  /**
+   * Permit a request to ask for Claude Code's built-in WebSearch tool on an
+   * `isolated` turn (`options.web_search`, decision 0016).
+   *
+   * Absent means no, like `allowNative`: a search runs on the operator's Claude
+   * account and sends words from the turn to a search backend, so it is the
+   * operator's to allow (`--allow-web-search`); hello announces `web_search`
+   * only then.
+   */
+  webSearch?: boolean;
 }
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
@@ -596,6 +607,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly keepAttachments: boolean;
   /** Whether the operator permitted the server to select `native`. */
   private readonly allowNative: boolean;
+  /** Whether the operator lets a request ask for web search (`--allow-web-search`). */
+  private readonly webSearch: boolean;
   /** MCP Apps: MCP servers this bridge connects to itself (src/mcp/upstream.ts). */
   private readonly upstream: UpstreamHub | null;
   private upstreamStarted = false;
@@ -713,6 +726,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.servedFiles = new ServedFiles(options.servedFilesPath ?? null);
     this.spaceFiles = new SpaceFiles(this.allowedRootPaths, this.servedFiles);
     this.allowNative = options.allowNative ?? false;
+    this.webSearch = options.webSearch ?? false;
     this.upstream = options.mcpUpstreams && Object.keys(options.mcpUpstreams).length
       ? new UpstreamHub(options.mcpUpstreams, {
           resolveSecret: (ref) => this.resolveUpstreamSecret(ref),
@@ -2044,6 +2058,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       turn_isolation: TURN_ISOLATION_REVISION,
       // The levels `options.effort` takes (Claude only; others ignore the option).
       effort_levels: [...CLAUDE_EFFORT_LEVELS],
+      // The values `options.thinking_display` takes (Claude only; others ignore it).
+      thinking_displays: [...CLAUDE_THINKING_DISPLAYS],
+      // `options.web_search` is honoured (Claude, isolated turns; decision 0016).
+      // Only when the operator passed --allow-web-search, so the server knows.
+      ...(this.webSearch ? { web_search: true } : {}),
       // Follows welcome.desired_bridge_version by itself (src/selfupdate/).
       self_update: this.selfUpdate?.enabled ?? false,
       // Advertise the operator's allow-list so the server can offer a picker
@@ -2908,6 +2927,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // is revoked like on every other refusal.
     const posture = turnPosture(this.cliIsolation, request, adapter);
     const turnIsolation = posture.refusal ? this.cliIsolation : posture.isolation;
+    // Web search on this turn (options.web_search, decision 0016): decided on
+    // the posture the turn runs under; a refusal is thrown with the others below.
+    const search = resolveWebSearch(request, this.webSearch, turnIsolation, adapter);
     const serverToolsOnly = request.cli_isolation !== undefined && !posture.refusal;
 
     const mcpEnabled = this.mcpServer.hasTools() && this.mcpServer.isRunning();
@@ -2938,6 +2960,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     let turnDeadline: { at: number } | null = null;
     try {
       if (posture.refusal) throw posture.refusal;
+      if (search.refusal) throw search.refusal;
       if (serverToolsOnly) {
         log.info('Turn held to the server\'s tools only', { requestId: request_id, connection: this.cliIsolation });
       }
@@ -3051,6 +3074,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         bridgeAddendum: bridgePrompt.text,
         bridgeHelperAddendum: bridgePrompt.helperText,
         turnInput,
+        webSearch: search.webSearch,
       };
 
       // The adapter emits its own `done`, but the CLI session id is only known
@@ -3686,6 +3710,38 @@ function upstreamRedirectUri(message: WelcomeMessage): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Whether this turn gets Claude Code's built-in WebSearch tool (decision 0016).
+ *
+ * Only `options.web_search === true` asks: a stray truthy value ("1", "yes")
+ * must not be what widens a turn, and `false`, `null` or absent mean today's
+ * behaviour exactly. It matters only on an `isolated` turn: `workspace` and
+ * `native` already allow every built-in tool, so there it changes nothing.
+ * An isolated turn that asks is refused rather than run without search when
+ * the operator did not pass `--allow-web-search` (`web_search_not_allowed`;
+ * hello then has no `web_search`, so a server that checks never sends it) or
+ * on a provider that cannot be given exactly that one tool
+ * (`web_search_unsupported`; only Claude can). A turn that quietly ran without
+ * the tool its server asked for would look exactly like one that searched.
+ */
+export function resolveWebSearch(
+  request: Pick<AiRequestMessage, 'options'>,
+  operatorAllows: boolean,
+  isolation: CliIsolation,
+  adapter: Pick<ProviderAdapter, 'enforcesServerToolsOnly' | 'providerName'>,
+): { webSearch: boolean; refusal: RequestRefusal | null } {
+  if (request.options?.web_search !== true || isolation !== 'isolated') return { webSearch: false, refusal: null };
+  if (!operatorAllows) {
+    return { webSearch: false, refusal: new RequestRefusal('web_search_not_allowed',
+      'This turn asked for web search, and this machine\'s bridge was not started with --allow-web-search. It was not run.') };
+  }
+  if (!adapter.enforcesServerToolsOnly) {
+    return { webSearch: false, refusal: new RequestRefusal('web_search_unsupported',
+      `This turn asked for web search alone among the built-in tools, and the ${adapter.providerName} CLI cannot be given exactly that. It was not run.`) };
+  }
+  return { webSearch: true, refusal: null };
 }
 
 /**

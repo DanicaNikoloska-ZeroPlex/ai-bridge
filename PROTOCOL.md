@@ -383,6 +383,22 @@ A `session_lost` re-issue whose `ai_request` carries `first_seq` is numbered on 
 
 Since ai-bridge 0.32.0. The values this bridge takes for [`options.effort`](#additive-option-effort--the-claude-thinking-level), the Claude thinking level. Sent whichever providers are detected; Codex and Gemini ignore the option. Absent from a bridge that predates it, which drops the option and runs every turn at the CLI's default: a server that lets a person pick a level says it was not applied rather than implying it was.
 
+#### Additive field: `thinking_displays`
+
+```json
+{ "type": "hello", "...": "...", "thinking_displays": ["summarized", "omitted"] }
+```
+
+Since ai-bridge 0.39.0. The values this bridge takes for [`options.thinking_display`](#additive-option-thinking_display--readable-thinking). Sent whichever providers are detected; the flag itself reaches only Claude Code 2.1.310+. Absent from a bridge that predates it, which drops the option: thinking then comes back as the model's default (empty on current models).
+
+#### Additive field: `web_search`
+
+```json
+{ "type": "hello", "...": "...", "web_search": true }
+```
+
+Since ai-bridge 0.40.0. `true` when this bridge's operator passed `--allow-web-search`, so it honours [`options.web_search`](#additive-option-web_search--claudes-built-in-web-search) on Claude turns. Absent otherwise, and from every older bridge: a server must then not send the option, and should say its turns have no web search rather than imply they do.
+
 ### Bridge → Server: `providers_update`
 
 Sent mid-connection when the bridge's set of available provider CLIs changes after the `hello` — for example, the user installs or removes a CLI while the bridge stays connected.
@@ -508,7 +524,7 @@ An unrecognised value — a typo, a newer server — is also treated as `isolate
 
 The system prompt behaves the same in every mode: the server's `system_prompt` when there is one, and otherwise nothing, so the CLI keeps its own default prompt. The bridge writes no system prompt of its own; its lifecycle addendum (`bridge_prompt`) rides beside whichever prompt applies. Earlier bridges substituted a one-sentence neutral stand-in in `isolated` and `workspace`; a server that relied on it should send its own `system_prompt`.
 
-`bridge__attach_file` is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else, which is what the row above says and what it should keep meaning.
+`bridge__attach_file` is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else (plus, on Claude, the built-in `WebSearch` on a turn that asks with [`options.web_search`](#additive-option-web_search--claudes-built-in-web-search) on a bridge started with `--allow-web-search`), which is what the row above says and what it should keep meaning.
 
 **Gemini and `working_dir`.** Gemini is the one CLI with no per-invocation MCP config flag — it reads `.gemini/settings.json` from cwd. When cwd is a developer's checkout the bridge therefore writes into it, and handles that explicitly: it **refuses the turn rather than overwriting** a settings file the repository already has, removes the one it wrote when the turn ends (`done`, `error` or `cancel`), and removes the `.gemini` directory too if it created it and nothing else is in it. Because there is only one such path per directory and the file carries a per-spawn bearer token, **two concurrent Gemini turns in one directory are refused** rather than allowed to race — the loser would otherwise read the winner's credential and have its tool calls routed to the other turn's request.
 
@@ -1034,6 +1050,28 @@ It is still one process per turn: the process ends when the turn does. There is 
 Since ai-bridge 0.32.0. Claude only. One of `hello.effort_levels` — `low`, `medium`, `high`, `xhigh`, `max` — and the bridge starts the CLI with `--effort <level>`, on a fresh turn and on a resumed one alike (like `--model`, it is per invocation, so a server sends it on every turn it wants it for). Verified on Claude Code 2.1.287, also together with `--resume`. `--effort` itself is older; `xhigh` needs Claude Code 2.1.111+; on models without `xhigh` the CLI falls back to `high`.
 
 Any other value is **ignored**, logged at debug: the turn runs exactly as if the option were absent, at the CLI's default level, and nothing is reported to the server. Absent, `null` or `""` means today's behaviour exactly — no flag. Codex and Gemini ignore the option, and so does a bridge without `hello.effort_levels`.
+
+#### Additive option: `web_search` — Claude's built-in web search
+
+```json
+"options": { "web_search": true }
+```
+
+Since ai-bridge 0.40.0, advertised as `hello.web_search`, which a bridge sends only when its operator started it with `--allow-web-search`. Claude only. `true` adds exactly Claude Code's built-in `WebSearch` tool to an `isolated` turn's `--allowedTools` (beside `mcp__bridge__*` and any attachment read grant); everything else built in stays denied, `WebFetch` included. It applies alike to a connection that adopted `isolated` and to a turn narrowed to it with `cli_isolation`. In `workspace` and `native` every built-in tool is already allowed, so the field changes nothing there. Searches run at Anthropic, on the operator's Claude account, with words the model writes from the turn (decision 0016). Verified on Claude Code 2.1.325: a turn with the entry searched, and `WebFetch` and `Bash` were still denied.
+
+Since 0.40.1 an `isolated` Claude turn is also started with `--disallowedTools` naming the web tools it may not use (`WebSearch,WebFetch`, or `WebFetch` on a turn granted search), so the CLI does not list them at all: merely denied, a listed tool was still called and its permission error reported to the person as a permission to grant.
+
+Only the JSON value `true` asks: absent, `false`, `null` or any other value (`"yes"`, `1`) means today's behaviour exactly. An `isolated` turn that asks is **refused, never run without the tool**: `web_search_not_allowed` on a bridge without `--allow-web-search`, `web_search_unsupported` on Codex or Gemini. A server must not send the option to a bridge without `hello.web_search`; a bridge older than 0.40.0 ignores it and runs the turn without search.
+
+#### Additive option: `thinking_display` — readable thinking
+
+```json
+"options": { "thinking_display": "summarized" }
+```
+
+Since ai-bridge 0.39.0. Claude only. One of `hello.thinking_displays` — `summarized`, `omitted` — and the bridge starts the CLI with `--thinking-display <value>`, on a fresh turn and on a resumed one alike (per invocation, like `--effort`). Why: on the current Claude models (Opus 4.7 and later, Sonnet 5 and later) the API's default display is `omitted`: the model still thinks and is billed the same, but every thinking block reaches the CLI with an empty text, so the bridge has no `thinking` block to send. `summarized` returns a readable summary of the thinking instead; no model ever returns the raw chain of thought. Verified on Claude Code 2.1.310 and 2.1.311 with `--model opus`, also with `--resume`; the `showThinkingSummaries` setting does not reach `-p` runs.
+
+The flag is passed only to Claude Code 2.1.310 or newer (the first version this bridge has seen with it; an older CLI would refuse the unknown option). Any other value, or an older or unknown CLI, is **ignored**, logged at debug: the turn runs exactly as if the option were absent. Absent, `null` or `""` means today's behaviour exactly — no flag. Codex and Gemini ignore the option, and so does a bridge without `hello.thinking_displays`.
 
 #### Additive field: `working_dir`
 
@@ -2017,7 +2055,7 @@ A file the assistant produced and chose to hand back. Emitted when the model cal
 
 In `device` mode (`welcome.config.attachments: "device"`) nothing is uploaded: `id` is null, and the event carries `path` (for showing) and `file_id`, the id the bridge recorded the file under. The server fetches it later with [`file_read`](#handing-files-back), never by `path`.
 
-The tool is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else.
+The tool is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else (save `WebSearch` on a turn granted [`options.web_search`](#additive-option-web_search--claudes-built-in-web-search)).
 
 The model has to nominate the file, and that is not a limitation to work around: a transport cannot guess which of the hundred files a turn just touched is the answer. The path it names must resolve — **after `realpath`, because in `workspace` mode the model has a shell and can create a symlink** — inside the working directory or that turn's attachment directory, and it is subject to the same per-file cap and the same host binding as the inbound direction.
 
@@ -2637,6 +2675,8 @@ The server also tracks heartbeats. If no `ping` is received for 2x the heartbeat
 | `isolation_not_narrowing` | `ai_request.cli_isolation` named something other than `isolated`: a request may only narrow the connection's posture | Server sends `isolated` or nothing. Terminal: `done` follows |
 | `isolation_unsupported` | The turn must use the server's tools only, and its provider cannot be held to that (only Claude can) | Server uses Claude for such turns, or does not narrow. Terminal: `done` follows |
 | `isolation_conflict` | The turn must use the server's tools only and also named a `working_dir` | Server leaves `working_dir` out of such turns. Terminal: `done` follows |
+| `web_search_not_allowed` | An `isolated` turn asked for `options.web_search` and the bridge's operator did not pass `--allow-web-search` (hello has no `web_search`) | Server checks `hello.web_search` before sending the option. Terminal: `done` follows |
+| `web_search_unsupported` | An `isolated` turn asked for `options.web_search` on a provider that cannot be given exactly that one built-in tool (only Claude can) | Server uses Claude for such turns, or leaves the option out. Terminal: `done` follows |
 | `gemini_working_dir_unavailable` | Gemini cannot use this working directory: the repository already has a `.gemini/settings.json`, or another Gemini turn is running in it | Move the file aside, use Claude or Codex, or wait for the other turn. Terminal: `done` follows |
 
 All of the above are **refusals**: they carry their own code and are followed by `done`, which ends the turn. They are deliberately not reported as `session_lost` — that code tells the server to wipe the session and silently re-issue the turn, which for a refusal would retry it forever and never surface the reason.
@@ -2886,6 +2926,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Images in tool results do not bump the version.** `hello.tool_result_content` and `tool_resolve.content` are additive; a server must not send `content` to a bridge that did not advertise `tool_result_content`, and an older server sends `result` alone, which is what it always meant.
 
 **App backends do not bump the version.** `hello.app_backends`, `app_call` and `app_result` are additive; a server must not send `app_call` to a bridge that did not advertise `app_backends`. `hello.app_items` and `app_call.use` are additive the same way.
+
+**Web search does not bump the version.** `hello.web_search` and `options.web_search` are additive: an older bridge ignores the option (the turn runs without web search, as before), and an older server ignores the field. A server must not send the option to a bridge without `hello.web_search`.
 
 **Per-turn isolation does not bump the version.** `hello.turn_isolation` and `ai_request.cli_isolation` are additive; a server must not send the field to a bridge that did not advertise `turn_isolation`, since an older one ignores it and runs the turn with the connection's posture.
 

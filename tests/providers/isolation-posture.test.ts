@@ -49,6 +49,7 @@ async function launch(
   isolation: CliIsolation,
   withMcp = true,
   attachmentDir: string | null = null,
+  webSearch = false,
 ): Promise<Launch> {
   const recorded: Launch = { command: '', args: [] };
 
@@ -96,6 +97,7 @@ async function launch(
     attachmentDir,
     bridgeEnv: {},
     bridgeAddendum: null,
+    ...(webSearch ? { webSearch: true } : {}),
   };
 
   await new Probe().execute(context, (_e: AdapterStreamEvent) => undefined);
@@ -138,6 +140,14 @@ describe('claude', () => {
     expect(args[args.indexOf('--permission-mode') + 1]).toBe('manual');
   });
 
+  it('in isolated, takes the web tools out of the tool list unless the turn may search', async () => {
+    const flag = (args: string[]) => args[args.indexOf('--disallowedTools') + 1];
+    expect(flag((await launch(ClaudeAdapter, 'isolated')).args)).toBe('WebSearch,WebFetch');
+    expect(flag((await launch(ClaudeAdapter, 'isolated', true, null, true)).args)).toBe('WebFetch');
+    expect((await launch(ClaudeAdapter, 'workspace')).args).not.toContain('--disallowedTools');
+    expect((await launch(ClaudeAdapter, 'native')).args).not.toContain('--disallowedTools');
+  });
+
   it('in workspace, keeps strict-mcp-config but allows the built-in tools', async () => {
     const { args } = await launch(ClaudeAdapter, 'workspace');
     // The operator's own MCP servers stay out — that half of isolation holds.
@@ -178,6 +188,21 @@ describe('claude', () => {
     expect(allowed).toBe(`mcp__${BRIDGE_MCP_SERVER_NAME}__*`);
   });
 
+  it('adds exactly WebSearch to an isolated turn allowed to search, beside the attachment grant', async () => {
+    // Decision 0016. WebSearch runs at Anthropic and reaches nothing here;
+    // WebFetch (any URL), Bash and a bare Read stay denied.
+    const attachDir = '/home/dev/.cache/ai-bridge/attachments/req-2';
+    const { args } = await launch(ClaudeAdapter, 'isolated', true, attachDir, true);
+    const allowed = (args[args.indexOf('--allowedTools') + 1] ?? '').split(',');
+    expect(allowed).toEqual([`mcp__${BRIDGE_MCP_SERVER_NAME}__*`, `Read(/${attachDir}/**)`, 'WebSearch']);
+    expect(args[args.indexOf('--permission-mode') + 1]).toBe('manual');
+  });
+
+  it('adds no list to a workspace turn allowed to search (every built-in is already allowed)', async () => {
+    const { args } = await launch(ClaudeAdapter, 'workspace', true, null, true);
+    expect(args).not.toContain('--allowedTools');
+  });
+
   it('in native, bypasses permissions and does not restrict MCP config', async () => {
     const { args } = await launch(ClaudeAdapter, 'native');
     expect(args).not.toContain('--strict-mcp-config');
@@ -198,6 +223,17 @@ describe('claude', () => {
     const { args } = await launch(ClaudeAdapter, 'isolated', false);
     expect(args).toContain('--strict-mcp-config');
     expect(args).not.toContain('bypassPermissions');
+  });
+});
+
+describe('web search reaches only Claude', () => {
+  it('codex launches the same with or without it', async () => {
+    expect((await launch(CodexAdapter, 'isolated', true, null, true)).args)
+      .toEqual((await launch(CodexAdapter, 'isolated')).args);
+  });
+  it('gemini launches the same with or without it', async () => {
+    expect((await launch(GeminiAdapter, 'isolated', true, null, true)).args)
+      .toEqual((await launch(GeminiAdapter, 'isolated')).args);
   });
 });
 

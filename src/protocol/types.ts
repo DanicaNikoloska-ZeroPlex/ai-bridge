@@ -350,6 +350,21 @@ export interface HelloMessage {
    * and runs the turn at the CLI's default.
    */
   effort_levels?: string[];
+  /**
+   * The values `options.thinking_display` takes: `["summarized","omitted"]`,
+   * passed to Claude as `--thinking-display <display>` (Claude Code 2.1.310+).
+   * Claude only. Absent from a bridge that predates it, which drops the option:
+   * thinking then comes back as the model's default (empty on current models).
+   */
+  thinking_displays?: string[];
+  /**
+   * `true` when this bridge honours `options.web_search` (0.40.0+): its
+   * operator passed `--allow-web-search`, and an `isolated` Claude turn that
+   * asks gets Claude Code's built-in WebSearch tool and nothing else beside the
+   * server's tools. Absent otherwise and from every older bridge: a server must
+   * then not send the option (an isolated turn asking is refused). Decision 0016.
+   */
+  web_search?: boolean;
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -1113,6 +1128,22 @@ export interface AiRequestOptions {
    * the CLI's default). Claude only.
    */
   effort?: string | null;
+  /**
+   * Whether the turn's thinking comes back readable: one of
+   * `hello.thinking_displays`, passed to Claude as `--thinking-display`.
+   * Any other value, or a CLI too old for the flag, is ignored. Claude only.
+   */
+  thinking_display?: string | null;
+  /**
+   * `true` lets this turn search the web with Claude Code's built-in
+   * WebSearch tool, and nothing else built in (no WebFetch, no shell, no
+   * files). Only `true` turns it on; anything else is today's behaviour. Matters
+   * only in `isolated` (in `workspace` and `native` every built-in tool is
+   * already allowed); there it is refused without `hello.web_search`
+   * (`web_search_not_allowed`) and on a provider other than Claude
+   * (`web_search_unsupported`). Decision 0016.
+   */
+  web_search?: boolean | null;
 }
 
 /** Server responds with the result of a tool call. */

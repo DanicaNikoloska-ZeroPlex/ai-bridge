@@ -33,8 +33,8 @@ Node 22 or newer (CI runs 22 and 24).
   frames. Upstream OAuth tokens and the PKCE verifier never reach the server.
   Never log full request or response payloads by default. Decisions 0004, 0010.
 - **The server cannot widen what the operator allowed.** `--allow-dir`,
-  `--allow-native`, `--local-tools` and `--mcp-upstreams` are operator choices;
-  no frame or field turns one on. A request outside them is refused, or falls
+  `--allow-native`, `--allow-web-search`, `--local-tools` and `--mcp-upstreams`
+  are operator choices; no frame or field turns one on. A request outside them is refused, or falls
   back to `isolated` with a log line. Decisions 0004, 0006.
 - **Refuse, do not silently correct or fall back.** A path, value or call the
   bridge will not honour fails visibly with a reason. A turn that quietly ran
@@ -64,7 +64,7 @@ Node 22 or newer (CI runs 22 and 24).
 
 | Path | What |
 |---|---|
-| `src/cli.ts` | Entry point: options, env vars, `install` / `list` / `uninstall` |
+| `src/cli.ts` | Entry point: options, env vars, `install` / `list` / `uninstall` / `claude-token` / `claude-login` |
 | `src/bridge.ts` | The WebSocket client: handshake, routing every frame, turn lifecycle |
 | `src/protocol/` | Frame types and `PROTOCOL_VERSION` |
 | `src/providers/` | One adapter per CLI (`claude.ts`, `codex.ts`, `gemini.ts`), spawn env, timeouts, usage |
@@ -98,6 +98,9 @@ Node 22 or newer (CI runs 22 and 24).
 - 0013 The connection token travels only in the Authorization header.
 - 0014 Claude gets the system prompt by file, rendered fresh on every turn.
 - 0015 Claude subagents get the bridge's session section too.
+- 0016 With `--allow-web-search`, a request may add Claude's built-in WebSearch, and only it, to an `isolated` turn.
+- 0017 The Claude token file may hold several named tokens and is read for every run.
+- 0018 Claude sign-in profiles, saved back before every switch.
 
 Full records and status: [docs/decisions/README.md](docs/decisions/README.md).
 Before changing what one covers, read it; if your change contradicts an

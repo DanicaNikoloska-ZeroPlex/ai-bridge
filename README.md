@@ -130,12 +130,61 @@ enrols this machine for the vault on its first start.
 Claude token instead of an interactive login, which can run out unattended:
 run `claude setup-token`, put `CLAUDE_CODE_OAUTH_TOKEN=<token>` in a file only
 you can read (`chmod 600`), and install with `--claude-env <that file>`. The
-credentials file records the file's path, never the token; the bridge puts the
-token into Claude's environment at start, refuses a file others can read, and
-logs which sign-in it used. A token already in the environment wins. A
+credentials file records the file's path, never the token; the bridge reads the
+file again for every Claude run, refuses a file others can read, and logs which
+token it uses whenever that changes. A token already in the environment wins. A
 reinstall that does not name the file keeps it; `--claude-env ""` drops it. To
-renew, replace the line in the file and restart the service. The token reaches
+renew, replace the line in the file; the next run uses it. The token reaches
 the Claude CLI the bridge starts, like any login it has.
+
+**Two Claude accounts, switched in one command.** The token file may hold
+several named tokens and say which is active:
+
+```
+CLAUDE_CODE_OAUTH_TOKEN_WORK=<token from `claude setup-token`, signed in as one account>
+CLAUDE_CODE_OAUTH_TOKEN_HOME=<token for the other account>
+CLAUDE_TOKEN_ACTIVE=work
+```
+
+`ai-bridge claude-token list` shows the names, which are filled and which is
+active (never a value); `ai-bridge claude-token use home` switches, from the next
+Claude run on, with no restart. Both find the file by `--file`, else
+`AI_BRIDGE_CLAUDE_ENV`, else the one your installed bridges use. A single
+`CLAUDE_CODE_OAUTH_TOKEN=` line is the token named `default`, used when there is
+no `CLAUDE_TOKEN_ACTIVE` line. An active slot that is empty means no token:
+Claude uses its own sign-in, so you can set up the file before you have tokens.
+Usage figures follow the token in use; if Anthropic will not report usage for a
+long-lived token, the bridge reports none rather than another account's.
+
+**Two Claude accounts on the CLI's own sign-in.** Where Claude is signed in
+interactively (`~/.claude/.credentials.json`) rather than by token, keep one
+profile per account and swap the sign-in:
+
+```
+claude /login                          # sign in as the first account
+npx @tetrixdev/ai-bridge claude-login save work
+claude /login                          # sign in as the second account
+npx @tetrixdev/ai-bridge claude-login save home
+npx @tetrixdev/ai-bridge claude-login use work    # switch; again with home to switch back
+npx @tetrixdev/ai-bridge claude-login list        # names, and which is signed in (never a value)
+```
+
+Profiles live in `~/.claude/credentials-profiles/` (0700, files 0600). Claude
+rewrites its sign-in whenever it refreshes it, so `use` first copies the current
+sign-in back into its own profile, then puts the chosen one in place atomically;
+it refuses to replace a sign-in that is saved as no profile (`--discard-current`
+to do it anyway), so run `save` after every `claude /login`. When the current
+sign-in matches its profile only by the name last used (its tokens changed
+since), the copy it replaces is kept as `<name>.json.<time>.prev` (each its own file, removed after 30 days), in case that change
+was an unsaved `/login`. On macOS Claude keeps its sign-in in the Keychain, not
+in this file, so these commands do not apply there. `claude /status` may go on
+showing the previous account's email for a while: only the sign-in file is
+swapped, not Claude's cached account details in `~/.claude.json`. Claude reads the
+file at each start, and the usage report reads it on every ask, so no bridge
+needs a restart. `use` warns while Claude processes run: one refreshing at that
+moment may write the previous account back (`list` shows it; run `use` again).
+A long-lived token (above, or `CLAUDE_CODE_OAUTH_TOKEN` in the environment)
+overrides this sign-in; `list` and `use` say so when one is set.
 
 `--env-file` is available on its own, too, for anyone running the bridge some
 other way. A flag or an environment variable still wins over the file, so a
@@ -159,7 +208,7 @@ are left where they are.
 | `--log-file <path>` | `AI_BRIDGE_LOG_FILE` | Also append logs to this file. Rotates once past 5 MB, keeping one previous copy (`<path>.1`) |
 | `--local-tools` | | Allow the server to run tools **on this machine, as you**. Off unless you pass it |
 | `--engram <url>` | `ENGRAM_URL` | Engram base URL, for resolving secrets into local tools |
-| `--claude-env <file>` | `AI_BRIDGE_CLAUDE_ENV` | A 0600 file holding `CLAUDE_CODE_OAUTH_TOKEN=<token>` (from `claude setup-token`) for Claude to sign in with. A token already in the environment wins |
+| `--claude-env <file>` | `AI_BRIDGE_CLAUDE_ENV` | A 0600 file holding `CLAUDE_CODE_OAUTH_TOKEN=<token>` (from `claude setup-token`), or several named tokens and `CLAUDE_TOKEN_ACTIVE=<name>`, for Claude to sign in with; read for every run, switched with `ai-bridge claude-token use`. A token already in the environment wins |
 | `--engram-token <token>` | `ENGRAM_TOKEN` | Bearer credential for Engram. Defaults to `--token` |
 | `--device-label <label>` | hostname | How this machine appears when you approve it. Ignored when the token is for a machine paired for chat: the key goes onto that machine, under its paired name |
 | `--device-mode <mode>` | | `transcript` or `isolated`. Self-reported |
@@ -177,6 +226,7 @@ are left where they are.
 | `--attachment-cache-max-mb <n>` | `AI_BRIDGE_ATTACHMENT_CACHE_MAX_MB` | Cap on what is kept for later turns; least recently used go first (default `1024`). `0` turns the cache off |
 | `--allow-native` | | Permit the server to select `native` isolation — the CLI's full local environment, including your own MCP servers, hooks, plugins and a shell. **Off unless you pass it.** Only for a bridge you run against your own machine |
 | `--no-self-update` | `AI_BRIDGE_SELF_UPDATE=0` | Do not follow the version the server asks for; pin `AI_BRIDGE_VERSION` by hand. See [Following the server's version](#following-the-servers-version) |
+| `--allow-web-search` | | Permit the server to give an isolated Claude turn Claude Code's built-in `WebSearch` tool, and no other built-in (`options.web_search`). **Off unless you pass it.** See [Web search](#web-search) |
 | `--keep-attachments` | | Keep downloaded attachments after a turn instead of deleting them. Debugging aid |
 | `--mcp-upstreams <file>` | `AI_BRIDGE_MCP_UPSTREAMS` | MCP servers this bridge connects to itself and offers to the CLI, with their MCP Apps views passed to the web application. See [MCP servers of your own](#mcp-servers-of-your-own-mcp-apps) |
 
@@ -226,6 +276,19 @@ handshake. [PROTOCOL.md](PROTOCOL.md) gives the per-CLI flags; the shape is:
 > (Claude) or HOME redirection, and `--bare` breaks subscription auth. Those are
 > the operator's own configuration rather than something a server chooses, but
 > they do shape the turn.
+
+### Web search
+
+Started with `--allow-web-search` (or `install --allow-web-search`), the bridge
+lets a server ask for web search on one turn (`options.web_search: true`). On an
+`isolated` Claude turn it then allows exactly Claude Code's built-in `WebSearch`
+tool beside the server's tools; `WebFetch`, the shell and the file tools stay
+denied. The search runs at Anthropic, on your Claude account, with words the
+model takes from the turn (which can include what the server's tools returned):
+it reads no file and runs no command here, but it is your account and a new
+recipient for those words, so it is off unless you pass the flag (decision
+0016). Without it the handshake has no `web_search`, and an isolated turn that
+asks anyway is refused. Codex and Gemini turns asking are refused too.
 
 The bridge tells the server which posture it settled on, so an app can show "running `isolated`, because this bridge was started without `--allow-native`" rather than leaving you to find it in this machine's log.
 
@@ -290,7 +353,7 @@ It is a cache, and behaves like one:
 
 `--keep-attachments` is unrelated and unchanged: it keeps the per-turn directories, for debugging, and never cleans them up.
 
-The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. That tool is offered in `workspace` and `native` only. In `isolated`, Claude reaches server-declared tools plus — on a turn that has attachments — permission to read that turn's attachment directory, and nothing else. Codex and Gemini have no equivalent per-path grant: Codex sits at its own read-only sandbox and Gemini at its own defaults, both of which are broader than that. See the posture table in [PROTOCOL.md](PROTOCOL.md). It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
+The assistant can send a file back the same way, by calling a bridge-owned tool with a path inside the working directory or that turn's attachment directory. That tool is offered in `workspace` and `native` only. In `isolated`, Claude reaches server-declared tools plus — on a turn that has attachments — permission to read that turn's attachment directory, and — on a turn granted web search, see [Web search](#web-search) — the built-in `WebSearch`, and nothing else. Codex and Gemini have no equivalent per-path grant: Codex sits at its own read-only sandbox and Gemini at its own defaults, both of which are broader than that. See the posture table in [PROTOCOL.md](PROTOCOL.md). It has to nominate the file itself: nothing else can tell which of the files a turn touched is the answer.
 
 ### Files a person sends straight to this machine
 

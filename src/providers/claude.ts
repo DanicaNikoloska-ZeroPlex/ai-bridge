@@ -51,6 +51,7 @@
 import { createInterface } from 'node:readline';
 import type { InputClosedData, ModelInfo, TaskData, TaskPhase, TaskUsage } from '../protocol/types.js';
 import { ProviderAdapter, createFinalizer, type ExecutionContext, type AdapterStreamEvent } from './base.js';
+import { applyClaudeToken } from './claude-token.js';
 import { buildSpawnEnv, appendStderr, formatStderrMessage, resolveSystemPrompt } from './env.js';
 import { startTurnTimeouts, clearRequestTimeout, type TurnTimeouts } from './timeout.js';
 import { BRIDGE_MCP_SERVER_NAME, writeClaudeMcpConfig } from '../mcp/cli-config.js';
@@ -72,6 +73,7 @@ import { createTaskOutputWatch, outputPathFrom } from './task-output-watch.js';
 import { prepareClaudeSubagentPrompt } from './subagent-prompt.js';
 import { prepareClaudeSystemPrompt } from './claude-system-prompt.js';
 import { resolveClaudeEffort } from './claude-effort.js';
+import { claudeThinkingDisplayArgs } from './claude-thinking-display.js';
 
 /**
  * How long a turn with its input open waits for the CLI to start the turn it
@@ -257,6 +259,11 @@ export class ClaudeAdapter extends ProviderAdapter {
       args.push('--effort', effort);
     }
 
+    // Whether thinking comes back readable (`options.thinking_display`), per
+    // invocation like --effort. Without it the current models return every
+    // thinking block empty. See claude-thinking-display.ts.
+    args.push(...claudeThinkingDisplayArgs(request.options?.thinking_display));
+
     // Add max tokens if specified
     if (request.options?.max_tokens) {
       args.push('--max-tokens', String(request.options.max_tokens));
@@ -327,7 +334,27 @@ export class ClaudeAdapter extends ProviderAdapter {
       if (context.attachmentDir) {
         allowed.push(`Read(/${context.attachmentDir}/**)`);
       }
+      // Web search, when the request asked (`options.web_search: true`) on a
+      // bridge started with --allow-web-search; resolved by the bridge into
+      // `context.webSearch` (decision 0016). EXACTLY `WebSearch`: it runs at
+      // Anthropic and reads no file and runs no command here. Never `WebFetch`, which
+      // fetches any URL the model writes (a server's data could ride out in
+      // it to any host), and never a bare built-in that touches files or the
+      // shell. Verified against Claude 2.1.325: with this entry the turn
+      // searched, and WebFetch and Bash were still denied.
+      if (context.webSearch === true) {
+        allowed.push('WebSearch');
+      }
       args.push('--allowedTools', allowed.join(','));
+      // The web tools this turn may not use are also taken out of the CLI's
+      // tool list, not only denied on use. Merely denied, they stay listed
+      // (ToolSearch finds them), so a model asked to search calls one, gets a
+      // permission error and tells the person to "grant the permission",
+      // instead of following a server prompt that says search is off; seen on
+      // Dungeon Maister on 2026-11-14 after a turn that had searched.
+      // Verified on Claude 2.1.325: with --disallowedTools the init frame's
+      // tools list no longer has them. One comma-joined value: variadic flag.
+      args.push('--disallowedTools', context.webSearch === true ? 'WebFetch' : 'WebSearch,WebFetch');
     }
 
     // The two writes below can throw (a full or unwritable temp dir) after the
@@ -566,6 +593,9 @@ export class ClaudeAdapter extends ProviderAdapter {
       const env = buildSpawnEnv(context.requestId, context.bridgeEnv);
       // Claude CLI refuses to run if CLAUDECODE is set, even to empty string
       delete env['CLAUDECODE'];
+      // The active long-lived token, read from its file now, so a switch
+      // (`ai-bridge claude-token use`) reaches the next run without a restart.
+      applyClaudeToken(env);
 
       // An input-open turn hands over its opening message as the first NDJSON
       // frame and keeps stdin open; every other turn writes the bare prompt
