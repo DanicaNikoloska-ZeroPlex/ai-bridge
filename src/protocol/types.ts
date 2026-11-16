@@ -232,6 +232,26 @@ export interface HelloMessage {
    */
   attachment_limits?: AttachmentLimitsRef;
   /**
+   * This bridge numbers its stream frames (`seq`), keeps them until a
+   * `stream_ack` covers them, and keeps its turns running through a short drop
+   * (PROTOCOL.md, "Short drops"). Used only when the server's welcome carries
+   * `config.reconnect_grace_seconds`; an older server ignores the field.
+   */
+  reliable_delivery?: true;
+  /**
+   * With `reliable_delivery`: a `session_lost` re-issue that carries
+   * `ai_request.first_seq` is numbered on from there instead of from 1, so a
+   * re-send of the old run's frames is a plain duplicate on the server
+   * (PROTOCOL.md, "Short drops", re-issued turns). An older server ignores it.
+   */
+  continued_seq?: true;
+  /**
+   * After a reconnect: the turns this bridge still runs or still holds
+   * unconfirmed frames of, with the last seq the server confirmed. The server
+   * re-attaches these and fails every other turn it held detached.
+   */
+  running_turns?: { request_id: string; last_acked_seq: number }[];
+  /**
    * This bridge accepts `upload_offer`: a file a person picked in a chat,
    * streamed through the server into `<working folder>/file-uploads/` and not
    * kept by the server. Absent from a bridge that predates it, and a server
@@ -412,6 +432,8 @@ export interface StreamMessage {
   request_id: string;
   event: StreamEventType;
   data: StreamEventData;
+  /** 1, 2, 3... per request id; only against a server with reliable delivery. */
+  seq?: number;
 }
 
 /** Sent periodically to keep the connection alive. */
@@ -758,6 +780,13 @@ export interface ServerConfig {
    */
   silence_timeout?: number;
   /**
+   * How long, in seconds, a turn keeps running through a dropped connection
+   * (PROTOCOL.md, "Short drops"). Its presence is what says the server
+   * supports reliable delivery; absent means an older server, and a drop
+   * stops every running turn as before.
+   */
+  reconnect_grace_seconds?: number;
+  /**
    * What should happen to a file the assistant hands back.
    *
    * `server` uploads it, which is what has always happened and remains the
@@ -995,6 +1024,14 @@ export interface AiRequestMessage {
    * resuming — the resumed CLI session already holds the history.
    */
   history?: ConversationEntry[];
+  /**
+   * Only on a `session_lost` re-issue from a server that does reliable
+   * delivery, to a bridge that announced `continued_seq`: the `seq` the
+   * re-issued run's first stream frame gets (the error frame's + 1).
+   * Everything before it counts as confirmed. Absent: the re-issue is
+   * numbered from 1 again, as before.
+   */
+  first_seq?: number;
   /**
    * Absolute path the CLI should be spawned in.
    *
@@ -1299,7 +1336,20 @@ export interface UpstreamAuthForgetMessage {
   server: string;
 }
 
+/** The server stored a turn's frames up to and including `seq` (cumulative). */
+export interface StreamAckMessage {
+  type: 'stream_ack';
+  request_id: string;
+  seq: number;
+  /**
+   * The turn is over on the server's side: the bridge drops what it keeps of
+   * it, and stops it, silently, if it still runs.
+   */
+  closed?: boolean;
+}
+
 export type ServerToBridgeMessage =
+  | StreamAckMessage
   | UpstreamAuthStartMessage
   | UpstreamAuthCodeMessage
   | UpstreamAuthForgetMessage
@@ -1560,10 +1610,18 @@ export interface TaskData {
   /** How it went: `completed`, `failed`, `stopped`, `killed`… Updated and finished only. */
   status?: string;
   /**
-   * The helper's closing report. Finished only. Bounded to 8 KB, cut on a
-   * character boundary and marked as cut.
+   * The helper's closing report. Finished only, and on the frames a waiting
+   * helper's `finished` is forwarded as (`updated` `waiting`) and on the
+   * `updated` `completed` the bridge ends it with when no resume comes.
+   * Bounded to 8 KB, cut on a character boundary and marked as cut.
    */
   summary?: string;
+  /**
+   * True only on the `updated` `completed` the bridge ends a waiting helper
+   * with when no resume came in the window, so the chat can say a helper was
+   * still waiting. A real completion never carries it.
+   */
+  ended_waiting?: true;
   /** Running totals. Progress and finished only. */
   usage?: TaskUsage;
 }

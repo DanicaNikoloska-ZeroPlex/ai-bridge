@@ -87,9 +87,9 @@ describe('ToolResolver', () => {
 
       resolver.cancelAll();
 
-      await expect(p1).rejects.toThrow('bridge disconnected');
-      await expect(p2).rejects.toThrow('bridge disconnected');
-      await expect(p3).rejects.toThrow('bridge disconnected');
+      await expect(p1).rejects.toThrow('Result unknown');
+      await expect(p2).rejects.toThrow('Result unknown');
+      await expect(p3).rejects.toThrow('Result unknown');
       expect(resolver.pendingCount()).toBe(0);
     });
 

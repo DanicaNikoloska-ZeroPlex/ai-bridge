@@ -653,3 +653,46 @@ describe('a helper\'s heartbeat counts as activity', () => {
     expect(data(of(events, 'error')[0]!)['code']).toBe('silence_timeout_exceeded');
   });
 });
+
+describe('a helper\'s streamed chunks count as activity', () => {
+  /** A helper that streams for longer than the silence bound, then its whole message. */
+  const streamingHelper = (chunk: Record<string, unknown>) => [
+    { type: 'system', subtype: 'init', session_id: 's' },
+    { type: 'system', subtype: 'task_started', task_id: 't1', tool_use_id: 'toolu_agent', task_type: 'local_agent' },
+    ...Array.from({ length: 10 }, () => chunk),
+    {
+      type: 'assistant', parent_tool_use_id: 'toolu_agent',
+      message: { id: 'msg_helper', content: [{ type: 'text', text: 'helper answer' }] },
+    },
+    { type: 'system', subtype: 'task_notification', task_id: 't1', tool_use_id: 'toolu_agent', status: 'completed' },
+    { type: 'result', subtype: 'success', session_id: 's', usage: {} },
+  ];
+
+  it('so a helper streaming a long answer does not get the turn stopped as silent', async () => {
+    // ~1.3 s of nothing but the helper's streamed deltas against a 0.3 s bound.
+    const events = await replay({
+      lines: streamingHelper({
+        type: 'stream_event', parent_tool_use_id: 'toolu_agent', session_id: 's',
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'x' } },
+      }),
+      silenceTimeoutSeconds: 0.3,
+      dripMs: 100,
+    });
+
+    expect(of(events, 'error')).toHaveLength(0);
+    // Still not forwarded: the helper's text arrives once, from its whole message.
+    const deltas = of(events, 'block_delta').map((e) => data(e)['content']);
+    expect(deltas).toEqual(['helper answer']);
+    expect(of(events, 'done')).toHaveLength(1);
+  });
+
+  it('and the same stretch without them IS stopped — the chunks are what saved it', async () => {
+    const events = await replay({
+      lines: streamingHelper({ type: 'system', subtype: 'status', status: 'requesting', session_id: 's' }),
+      silenceTimeoutSeconds: 0.3,
+      dripMs: 100,
+    });
+
+    expect(data(of(events, 'error')[0]!)['code']).toBe('silence_timeout_exceeded');
+  });
+});

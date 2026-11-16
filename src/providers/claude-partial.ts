@@ -174,6 +174,10 @@ export class ClaudePartialStreamMapper {
     // with the frame's `parent_tool_use_id` on every block, so the helper's
     // work still reaches a consumer attributed to the call that spawned it.
     // Keep this guard; that attribution does not make it removable.
+    //
+    // Skipped here, NOT ignored: the adapter resets the silence clock for every
+    // such frame before handing it in, so a helper streaming a long answer is
+    // never mistaken for a silent turn while its whole message is still to come.
     if (frame['parent_tool_use_id'] != null) {
       log.debug('Ignoring a streamed sub-agent frame — delivered whole instead');
       return;

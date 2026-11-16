@@ -153,6 +153,10 @@ export async function runInputTurn(opts: {
   cliSessionId?: string | null;
   /** The silence bound; 0 (the default) for none. */
   silenceTimeoutSeconds?: number;
+  /** The wall-clock bound; 60 (the default). */
+  requestTimeoutSeconds?: number;
+  /** How long a waiting helper may take to be resumed; the adapter's own (30 s) by default. */
+  helperResumeWindowMs?: number;
 }): Promise<InputTurn> {
   const scratch = mkdtempSync(join(tmpdir(), 'input-turn-'));
   const stepsPath = join(scratch, 'steps.json');
@@ -162,6 +166,10 @@ export async function runInputTurn(opts: {
   const seen: { args: string[]; options?: SpawnOptions; stdinInput?: string } = { args: [] };
 
   class StandIn extends ClaudeAdapter {
+    protected override helperResumeWindowMs(): number {
+      return opts.helperResumeWindowMs ?? super.helperResumeWindowMs();
+    }
+
     protected override spawnCli(
       _command: string,
       args: string[],
@@ -210,7 +218,7 @@ export async function runInputTurn(opts: {
       cliIsolation: 'native',
       workingDir: process.cwd(),
       signal: opts.signal ?? new AbortController().signal,
-      requestTimeoutSeconds: 60,
+      requestTimeoutSeconds: opts.requestTimeoutSeconds ?? 60,
       silenceTimeoutSeconds: opts.silenceTimeoutSeconds ?? 0,
       cliSessionId: opts.cliSessionId ?? null,
       attachmentDir: null,

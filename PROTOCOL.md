@@ -123,6 +123,24 @@ The bridge implements exponential backoff reconnection:
 
 On reconnect, the bridge sends a new `hello` message. The server re-associates the connection with the user. The bridge holds no session state of its own — the server owns the `conversation_id → cli_session_id` mapping (see [Conversation Continuity](#conversation-continuity)), so a bridge restart loses nothing.
 
+### Short drops: reliable delivery
+
+A bridge sends `"reliable_delivery": true` in `hello` (flat, beside the other capability flags). It is used **only** when the server's `welcome.config` carries [`reconnect_grace_seconds`](#server--bridge-welcome); a server that does not send it gets exactly the behaviour described above: no `seq`, and a drop stops every running turn and reports it as `bridge_disconnected` after the reconnect.
+
+With a server that does:
+
+- **Numbered frames.** Every `stream` frame of a turn carries `seq`: 1 for the first frame of that `request_id`, +1 per frame, up to and including the `done` or `error` frame. A frame that cannot be encoded at all takes no number, so there is never a gap. Other frames (`ai_request_ack`, `tool_call`, `cancelled`, `turn_input_ack`, ...) are not numbered; see **Turn messages** below for what happens to them during a drop.
+- **Receipts.** The server answers with `{"type": "stream_ack", "request_id": "…", "seq": N}`, meaning "everything up to N arrived" (cumulative). The bridge keeps every frame of a turn until an ack covers it, and lets go of the turn once a `done` or `error` of it is confirmed.
+- **Closed.** `{"type": "stream_ack", "request_id": "…", "seq": N, "closed": true}` means "this turn is over on my side". The bridge drops everything it keeps for the turn; a turn still running on the bridge is stopped as a cancel stops it and sends no further stream frames (no `done`); once it has stopped it sends one unnumbered `cancelled` (with `pending_inputs` on a turn with its input open), so messages the assistant never read are reported back. That `cancelled` is not kept: if the connection is down at that moment it is dropped. A turn that had already finished sends nothing. That includes a turn whose re-sent frames are answered this way after a reconnect: it is released, and no longer keeps the bridge from being idle (for a self-update, say). An `ai_request` with the same `request_id` afterwards starts it again as usual.
+- **The grace period.** On a drop the bridge does **not** stop its running turns. For `reconnect_grace_seconds` (default 120 for a value that is not a number: the two minutes a short drop such as a closed laptop lid or a server deploy takes; at most 3600, the longest the bridge ever waits for a tool call's answer, as a backstop against a bad value) they keep working and their frames wait on the machine; frames produced before the next `welcome` are not written either. Work that needs the server waits for the reconnect instead of failing: a tool call the CLI makes during the drop, and a file handed back with `bridge__attach_file`. A tool call that was already waiting for its answer when the connection dropped fails at once: the server answers over the connection the call came in on, so that answer is gone, and the call is not sent again because the server may already have run it.
+- **After reconnecting**, `hello` lists what is still running or still holds unconfirmed frames: `"running_turns": [{"request_id": "…", "last_acked_seq": N}]`. After the `welcome` the bridge re-sends, per turn and in order, every frame after `last_acked_seq`, including a final frame that was never confirmed; then the waiting work goes ahead.
+- **Turn messages.** A turn's other messages (`cancelled`, `turn_input_ack`, a request-level `error`, ...) produced while the connection is down in the grace period are kept too, and written after the next `welcome`, after the turn's re-sent stream frames, so a `cancelled` still follows the turn's last frame. They carry no `seq`; a server ignores one it already has.
+- **Not taken back.** If the server does not confirm a re-attached turn's first frame on the new connection within 30 seconds, it no longer holds that turn (its own grace period ran out first, for instance): the bridge stops it and reports `bridge_disconnected`. A server that holds the turn acks within one round trip; 30 s is the bridge's heartbeat interval. **A finished answer is never given up this way:** when the turn's `done` or `error` is among the unconfirmed frames, the bridge writes them again instead, after 30 seconds and then each time waiting twice as long, until the server acks them or answers `closed`, or the connection drops again. After 4 such re-sends (about 15 minutes) without an ack it lets go of them, logs it, and reports nothing (the server may have the answer), so the bridge can become idle again.
+- **Bounded.** The frames kept while waiting for a receipt are limited, per turn (32 MiB, 20,000 frames) and in total (128 MiB, 80,000 frames), so a long grace period with a chatty turn cannot exhaust the machine's memory. A turn's final frame (`done` / `error`) is always kept, so a finished answer is never refused. A turn that would go over is stopped and reported as `bridge_disconnected`, with a message saying its answer grew too large to keep: while the connection was down, or, on a connection that is up, because the server was too slow to confirm it. A turn stopped because the other turns together had already filled the total, while it was within its own bound, gets a message saying so instead. All ask to send the message again.
+- **Grace expired.** A turn still kept when the grace period ends, or when the server that answers the reconnect does not do reliable delivery, is stopped and reported as `bridge_disconnected` after the reconnect, as before. What such a turn still emits while it stops, before the next `welcome` (an unnumbered `done`, say), is not written, so nothing of it reaches the server ahead of that report.
+- **Re-sent on a live connection.** The server stores a frame only when it is the next one, so a frame it did not store (it failed there, or its stream store refused it) holds back every later frame of the turn, `done` included, until it is written again. While the connection stays up, the bridge therefore checks that the server keeps confirming: when nothing more of a turn has been confirmed 10 seconds after a frame was written (a server confirms within about a second), it writes every unconfirmed frame of that turn again, in order, and the wait doubles (10, 20, 40 s). Once the server confirms more of the turn, the wait starts over at 10 seconds. After 3 such re-sends without progress it stops the turn and reports it as `bridge_disconnected`, with the message that the server was too slow to confirm (`outbox_unconfirmed`); when the turn's final frame is among the unconfirmed ones it lets go of them instead, as for a re-attached turn. A server with a stall bound ends such a turn itself first (laravel-ai-bridge: `stream_stalled` after 60 s, with `closed`). After a reconnect the same check takes over once the server has confirmed a re-attached turn's first frame.
+- **A `session_lost` re-issue** under the same `request_id`: when its `ai_request` carries **`first_seq`** (a server sends it to a bridge that announced `continued_seq`), the new run numbers its frames from `first_seq`, the error frame's `seq` + 1, and everything before it counts as confirmed: the old run's frames are dropped, and a late ack of them changes nothing. A re-send of the old error frame is then a plain duplicate on the server, never mistaken for the new run's first frame. Without `first_seq` (an older server) it numbers them **from 1 again** (that server accepts 1 or the error frame's `seq` + 1); the server's acks for the old run that arrive after the re-issued `ai_request`, up to and including the one for its error frame, are not applied to the new run (the server confirms the old run's frames before it stores any of the new run's).
+
 ---
 
 ## Handshake
@@ -341,6 +359,22 @@ Since ai-bridge 0.33.0. This bridge honours [`ai_request.cli_isolation`](#additi
 
 This bridge sends the [`input_closed`](#input_closed) stream event when a turn with its input open stops taking messages. A bridge without it still closes the input by the terminal rule but says nothing — and it may close it too early, before the CLI has read the opening message (see the terminal rule under [`accepts_input`](#additive-option-accepts_input--a-turn-that-takes-messages-while-it-runs)). A server can then learn of the close only from a `turn_input` answered `turn_ending`, or from the terminal frame. An older server ignores the field and the event.
 
+#### Additive field: `reliable_delivery`
+
+```json
+{ "type": "hello", "...": "...", "reliable_delivery": true, "running_turns": [{ "request_id": "req_abc123", "last_acked_seq": 7 }] }
+```
+
+This bridge numbers its stream frames, keeps them until `stream_ack`, and keeps its turns running through a short drop, when the server's welcome says it does too. `running_turns` is present only on a reconnect during the grace period. See [Short drops](#short-drops-reliable-delivery). An older server ignores both fields.
+
+#### Additive field: `continued_seq`
+
+```json
+{ "type": "hello", "...": "...", "reliable_delivery": true, "continued_seq": true }
+```
+
+A `session_lost` re-issue whose `ai_request` carries `first_seq` is numbered on from there instead of from 1. See [Short drops](#short-drops-reliable-delivery). An older server ignores the field and sends no `first_seq`, and the re-issue is numbered from 1 again, as before.
+
 #### Additive field: `effort_levels`
 
 ```json
@@ -455,6 +489,10 @@ Sent whether or not the posture matches the request, so a server always knows wh
   "refreshed_token": "<new JWT>"
 }
 ```
+
+#### `config.reconnect_grace_seconds`
+
+How long, in seconds, a turn keeps running through a dropped connection. Its presence is what tells the bridge the server does reliable delivery; see [Short drops](#short-drops-reliable-delivery). Absent: a drop stops every running turn, as it always did.
 
 #### `cli_isolation`
 
@@ -964,6 +1002,8 @@ When the server needs an AI response (triggered by a user message in the browser
 
 **`cli_session_id`**: The CLI session to resume, or `null` to start a fresh session. **The server owns this mapping** (persisted per conversation) and is the single source of truth — the bridge keeps no session map of its own. See [Conversation Continuity](#conversation-continuity).
 
+**`first_seq`** (integer, optional): Only on a `session_lost` re-issue to a bridge that announced `continued_seq`: the `seq` the re-issued run's first stream frame gets. See [Short drops](#short-drops-reliable-delivery).
+
 **`history`**: Prior conversation turns (`{role, content}`). Included only when `cli_session_id` is `null`, so a fresh CLI session can be seeded with context. Omitted when resuming — the resumed session already holds its history.
 
 **`options`**: Provider-agnostic generation options. The bridge maps these to CLI-specific flags where supported.
@@ -984,7 +1024,8 @@ What changes for such a turn:
 - **The turn ends by a rule, not at the first `result`.** The bridge closes stdin — after which the CLI finishes, exits, and the bridge sends `done` — only when **all** of these hold:
   1. the main assistant has **taken in the opening message** and is idle (its message ended, or a `result` arrived);
   2. **no task it or a helper started is still running**, whatever its `task_type` (`local_agent`, `local_bash`, anything else), as tracked from the task's `started` to its `finished` (or an `updated` to a status other than `running`/`pending`). That includes a command a helper left running after the helper itself finished (`owned_by_subagent` on its `task_started`): the CLI wakes that helper when the command ends, and it reads the result and carries on (seen on 2.1.283), so the command is still work in progress. Only when the silence bound runs out on such commands alone does the bridge end the turn early, and gently — see `leftovers_silent` under [`input_closed`](#input_closed);
-  3. every accepted `turn_input` has been read (its `user_input` was sent).
+  3. every accepted `turn_input` has been read (its `user_input` was sent);
+  4. **no helper is waiting.** A helper that reports `completed` while work it owns still runs (a shell command it started, or a helper it spawned, and theirs in turn; a helper's command that cannot be attributed to one counts for every helper) has not finished: the CLI resumes it (a new `task_started` for the same `task_id`) once that work ends. It counts as running while that work runs, and for **30 s** after it ends, the window in which the CLI resumes it. A resume makes it running again; a helper that ended `failed`, `killed` or `stopped` is not waited for; with no resume in the window the turn closes as before. The bridge shows this in the [`task`](#task) event as status `waiting` and `running`. Waiting is not activity: the silence and wall-clock bounds apply as usual. A helper's own streamed output does count as activity, so a helper writing a long answer does not get the turn stopped as silent.
 
   In addition, when a background task of the main assistant ends, the CLI answers it in a turn of its own (a background task here includes a command started in the foreground and moved to the background when it outlived its tool timeout, recognised by the reply to the call naming its output file); the bridge waits for that turn to start (up to 10 s) before closing, so a message sent meanwhile is still delivered.
 
@@ -1606,6 +1647,8 @@ Every streaming event follows this structure:
 }
 ```
 
+`seq` (integer) is added to every stream frame of a turn against a server with reliable delivery, from 1 per `request_id`; see [Short drops](#short-drops-reliable-delivery).
+
 ### Block Model
 
 Responses consist of **blocks** — logical units of content that have explicit open and close events. This allows the server to track what's currently being generated and render it appropriately.
@@ -1925,12 +1968,16 @@ The life of a **helper** the CLI runs for the main assistant: a sub-agent, or a 
 
 - **`tool_use_id` is the key to group by.** It is the `tool_call_id` of the block that spawned the helper, and the `parent_tool_use_id` on the helper's own blocks. The CLI omits it on some phases; the bridge fills it in from the task's `started`. `task_id` is the CLI's own id and is present on every phase. `task_type` is repeated on every phase too, though the CLI names it only at `started`.
 - **Every task a consumer sees was introduced by a `started`** in the same turn. On a resumed session the CLI first reports on work an *earlier* turn left running; those reports are not forwarded, because they are not helpers of this turn.
-- **A helper is finished only when `finished` says so.** Not when its spawning call's `tool_result` arrives, and not when the main assistant's reply ends: a background helper's spawning call returns at once ("launched"), and the helper keeps working — and keeps sending `task` events and blocks — after the main assistant has written its whole answer. `done` still comes last.
+- **A helper is finished only when `finished` says so, or when `updated` says `completed` for a helper shown `waiting` that was not resumed (see `status` below).** Not when its spawning call's `tool_result` arrives, and not when the main assistant's reply ends: a background helper's spawning call returns at once ("launched"), and the helper keeps working — and keeps sending `task` events and blocks — after the main assistant has written its whole answer. `done` still comes last.
 - **The end of the request ends every task.** `done`, a stream `error`, or `cancelled` for this `request_id` ends every task of that request, whatever phase it last reported. Most endings that cut a turn short send no `finished` at all — a stop, a silence or request timeout, a CLI that crashed, a `result` while a background shell was still running — so a consumer that waits for `finished` alone keeps a helper spinning forever after a stopped turn. Close them all on the terminal frame; show them as ended with the request, not as `completed`.
 - **`is_backgrounded`** says whether the main assistant waits. `false`: it is blocked inside the spawning call until the helper finishes, and `heartbeat`s arrive meanwhile. `true`: it is free to reply while the helper works; the CLI sends no heartbeat for such a helper, so `progress` and the helper's own blocks are its only signs of life.
 - **`task_type`** is the CLI's word for what the task is: `local_agent` for a helper, `local_bash` for a shell command run as a task — including one a helper runs for itself, whose `tool_use_id` is then the helper's call, not the main assistant's. Show `local_agent` tasks as helpers; do not assume the list is closed.
 - **`elapsed_seconds`** comes from the CLI's own clock, counted from the spawning call. Two buffers can sit between the bridge and a browser, and neither preserves timing, so compute nothing from arrival times.
-- **`status`** is the CLI's own word — `completed`, `failed`, `stopped`, `killed` have been seen.
+- **`status`** is the CLI's own word — `completed`, `failed`, `stopped`, `killed` have been seen — with two of the bridge's own, on a turn with its input open:
+  - `waiting` (phase `updated`): the helper reported `completed`, but work it owns still runs and the CLI will resume it when that ends (condition 4 of the terminal rule under [`accepts_input`](#additive-option-accepts_input--a-turn-that-takes-messages-while-it-runs)). Sent in place of each of the CLI's `completed` frames for it (so twice, `updated` and `finished`). It is not finished.
+  - `running` (phase `updated`): the CLI resumed a waiting helper. Sent in place of the CLI's second `task_started` for that `task_id`.
+
+  Its real end comes as usual, `completed` on `updated` and `finished`; or, if it is not resumed within the window, one `updated` with `completed` once the window has passed, and no `finished` after it. A `waiting` frame may carry the helper's `summary` (the CLI's `finished` frame it stands in for does), and so may that no-resume end: it carries the last summary the helper sent while waiting, if it sent one. That no-resume end also carries `ended_waiting: true` (a real completion never does), so the chat can say a helper was still waiting when the turn ended. **The `summary` of the last such frame is the helper's report:** keep it from a `waiting` frame without ending the helper, and show it when the helper ends without a summary of its own.
 - **`usage`** is the helper's running total: `total_tokens`, `tool_uses`, `duration_ms`, each present when the CLI reported it.
 - **`summary`** is the helper's closing report, meant to be shown. It is bounded to **8 KB** (JSON-encoded), cut on a character boundary and ending in a `…[truncated by the bridge: showing N of M characters]` marker when cut. `description` has the same bound.
 - **The helper's instructions are never sent.** The CLI reports the helper's whole prompt at `started`; it is the largest frame in the family, and a non-terminal frame over the frame cap is not trimmed: the bridge sends a `frame_too_large` stream `error` in its place, which ends the turn. Forwarding the prompt would put the whole turn at risk. `description` is what a person reads. Local file paths the CLI reports (the helper's output file) are not forwarded either.
@@ -1977,7 +2024,7 @@ On a turn with its input open: the bridge has closed the CLI's input, and the tu
 - Sent when the terminal rule closes the input (see [`accepts_input`](#additive-option-accepts_input--a-turn-that-takes-messages-while-it-runs)), while the turn is still running — the CLI then finishes what it has and exits, and `done` follows. That gap is usually short, but it is not bounded by anything the bridge controls.
 - At most once per turn, and never after the turn's terminal frame. A turn that ends any other way — a `cancel`, a bound, a dropped connection, a CLI that exits or crashes with its input still open — does not send it.
 - **`reason`**: one of
-  - `idle` — the main assistant has taken in the opening message and is idle, no task it or a helper started is running, and every accepted `turn_input` has been read.
+  - `idle` — the main assistant has taken in the opening message and is idle, no task it or a helper started is running, no helper is waiting to be resumed (condition 4 of the terminal rule), and every accepted `turn_input` has been read.
   - `leftovers_silent` — the silence bound ran out while the main assistant had answered (idle, every accepted `turn_input` read) and the only tasks still running were commands left behind by helpers that have all finished. Instead of stopping the turn as `silence_timeout_exceeded`, the bridge closes the input; the CLI stops those commands itself (`task_updated` `killed`, `task_notification` `stopped`) and exits, and the turn ends with an ordinary `done`, no `error`. Carries **`stopped_tasks`**, how many such commands were stopped, so a server can say so beside the finished answer. A command whose output kept growing was not silent, so it was never stopped this way. If the CLI then does not exit, the bound fires on its next run-out and ends the turn as before.
 
   **A server must accept a reason it does not know** and treat it the same way.
@@ -2799,6 +2846,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | Type | When |
 |------|------|
 | `welcome` | After receiving `hello` |
+| `stream_ack` | Receipt for a turn's numbered stream frames, up to `seq`; with `closed: true`, the turn is over on the server (reliable delivery) |
 | `pong` | After receiving `ping` |
 | `ai_request` | New AI request for a conversation |
 | `cancel` | Stop a turn that is running |
@@ -2864,6 +2912,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Person uploads and handing files back do not bump the version.** `hello.file_uploads`, `hello.file_downloads`, the four `upload_*` frames and the three `file_read*` frames are additive; a server must not send `upload_offer` to a bridge that did not advertise `file_uploads`.
 
 **The thinking level does not bump the version.** `hello.effort_levels` and `options.effort` are additive: an older bridge ignores the option, and an older server ignores the field.
+
+**Reliable delivery does not bump the version.** `hello.reliable_delivery`, `hello.continued_seq`, `ai_request.first_seq`, `hello.running_turns`, `welcome.config.reconnect_grace_seconds`, `stream.seq` and `stream_ack` (with `closed`) are additive: a bridge numbers nothing unless the welcome carries the grace period, and a server must not send `stream_ack` to a bridge that did not advertise `reliable_delivery`. The `waiting` and `running` task statuses are additive too: they come on phase `updated`, and the helper's real end still comes as `completed`.
 
 **Announcing the input's close does not bump the version.** `hello.input_closed` and the `input_closed` stream event are additive: a consumer ignores an event it does not know, and a server that does not see the flag learns the close the way it always did, from `turn_ending`.
 
