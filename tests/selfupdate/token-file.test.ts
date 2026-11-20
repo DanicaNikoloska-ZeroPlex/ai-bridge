@@ -3,10 +3,10 @@
  * from, so a restart past the original token's expiry is not refused.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { locateTokenFile, saveToken, tokenIn, type DetectDeps } from '../../src/selfupdate/service.js';
+import { locateTokenFile, saveToken, tokenIn, tokenSaver, type DetectDeps } from '../../src/selfupdate/service.js';
 
 const CGROUP = '0::/user.slice/user-1000.slice/user@1000.service/app.slice/ai-bridge-studio.service\n';
 const ENV = '/home/u/.config/ai-bridge-studio.env';
@@ -39,6 +39,11 @@ describe('reading the token out of an env file', () => {
     expect(tokenIn("AI_BRIDGE_TOKEN=a\nAI_BRIDGE_TOKEN='c'\n")).toBe('c');
     expect(tokenIn('AI_BRIDGE_SERVER=x\n')).toBeNull();
   });
+
+  it('reads a file with Windows line endings', () => {
+    expect(tokenIn('AI_BRIDGE_SERVER=x\r\nAI_BRIDGE_TOKEN=a\r\n')).toBe('a');
+    expect(tokenIn('AI_BRIDGE_TOKEN="b"\r\n')).toBe('b');
+  });
 });
 
 describe('which file a refreshed token is saved to', () => {
@@ -64,6 +69,10 @@ describe('which file a refreshed token is saved to', () => {
     no(locateTokenFile('from-flag', undefined, deps({ [ENV]: 'AI_BRIDGE_TOKEN=t1\n' })), /not the AI_BRIDGE_TOKEN/));
   it('none, in a terminal without --env-file', () =>
     no(locateTokenFile('t1', undefined, deps({ [ENV]: 'AI_BRIDGE_TOKEN=t1\n' }, { env: {} })), /not running as a systemd service/));
+  it('none, on a machine without systemd and without --env-file, saying so', () =>
+    no(locateTokenFile('t1', undefined, deps({ [ENV]: 'AI_BRIDGE_TOKEN=t1\n' }, { platform: 'darwin' })), /no --env-file or AI_BRIDGE_ENV_FILE/));
+  it('none, when AI_BRIDGE_ENV_FILE holds another token, naming that file', () =>
+    no(locateTokenFile('t1', undefined, deps({ [OTHER]: 'AI_BRIDGE_TOKEN=t0\n' }, { env: { AI_BRIDGE_ENV_FILE: OTHER } })), /not the AI_BRIDGE_TOKEN in .*other\.env/));
   it('none, when two files hold it', () =>
     no(locateTokenFile('t1', undefined, deps({ [ENV]: 'AI_BRIDGE_TOKEN=t1\n', [OTHER]: 'AI_BRIDGE_TOKEN=t1\n' })), /more than one/));
   it('none, when the file is not writable', () =>
@@ -86,7 +95,61 @@ describe('saving a refreshed token', () => {
     const path = file('AI_BRIDGE_SERVER=wss://x\nAI_BRIDGE_TOKEN=old.jwt.sig\nAI_BRIDGE_VERSION=0.43.0\n');
     expect(saveToken(path, 'old.jwt.sig', 'new.jwt-sig_2')).toBe('saved');
     expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_SERVER=wss://x\nAI_BRIDGE_TOKEN=new.jwt-sig_2\nAI_BRIDGE_VERSION=0.43.0\n');
-    expect(statSync(path).mode & 0o777).toBe(0o600);
+    // Windows has no separate group and other bits to keep.
+    if (process.platform !== 'win32') expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(readdirSync(dir)).toEqual(['bridge.env']);
+  });
+
+  it('keeps export, quotes, Windows line endings and the other lines as they were', () => {
+    const path = file('export AI_BRIDGE_TOKEN="old"\r\nX=1\r\n');
+    expect(saveToken(path, 'old', 'new')).toBe('saved');
+    expect(readFileSync(path, 'utf8')).toBe('export AI_BRIDGE_TOKEN="new"\r\nX=1\r\n');
+    expect(tokenIn(readFileSync(path, 'utf8'))).toBe('new');
+  });
+
+  it('replaces the last assignment, the one systemd uses', () => {
+    const path = file('AI_BRIDGE_TOKEN=stale\nAI_BRIDGE_TOKEN=old\n');
+    expect(saveToken(path, 'old', 'new')).toBe('saved');
+    expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_TOKEN=stale\nAI_BRIDGE_TOKEN=new\n');
+  });
+
+  it('saves refresh after refresh, each against the token it saved last', () => {
+    const path = file('AI_BRIDGE_TOKEN=t0\n');
+    const save = tokenSaver(path, 't0');
+    expect(save('t1')).toBe('saved');
+    expect(save('t2')).toBe('saved');
+    expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_TOKEN=t2\n');
+  });
+
+  it('once somebody installed another token, keeps leaving it alone', () => {
+    const path = file('AI_BRIDGE_TOKEN=t0\n');
+    const save = tokenSaver(path, 't0');
+    expect(save('t1')).toBe('saved');
+    writeFileSync(path, 'AI_BRIDGE_TOKEN=reinstalled\n');
+    expect(save('t2')).toBe('changed');
+    expect(save('t3')).toBe('changed');
+    expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_TOKEN=reinstalled\n');
+  });
+
+  it('a failed save leaves the file, no temporary copy, and is tried again on the next refresh', () => {
+    if (process.platform === 'win32' || process.getuid?.() === 0) return; // a read-only directory stops neither
+    const path = file('AI_BRIDGE_TOKEN=t0\n');
+    const save = tokenSaver(path, 't0');
+    chmodSync(dir, 0o500);
+    try {
+      expect(() => save('t1')).toThrow();
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+    expect(readdirSync(dir)).toEqual(['bridge.env']);
+    expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_TOKEN=t0\n');
+    expect(save('t2')).toBe('saved');
+    expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_TOKEN=t2\n');
+  });
+
+  it('never puts the token in the error it throws', () => {
+    const path = file('AI_BRIDGE_TOKEN=old\n');
+    expect(() => saveToken(path, 'old', 'secret value')).toThrow(/^(?!.*secret).*$/);
   });
 
   it('leaves a token somebody installed since the bridge started', () => {

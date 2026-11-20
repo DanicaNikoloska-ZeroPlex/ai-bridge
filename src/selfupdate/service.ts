@@ -23,7 +23,7 @@
  * more than one; every other check still applies.
  */
 import { execFile, execFileSync } from 'node:child_process';
-import { accessSync, constants, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, closeSync, constants, fchmodSync, fchownSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -194,14 +194,36 @@ export function pinVersion(envFile: string, version: string, previous: string): 
 
 /**
  * Write a file's new content to a temporary file beside it and rename it over
- * the original, keeping its mode: a crash mid-write leaves the old file whole
- * rather than a truncated one with the token cut off.
+ * the original, keeping its mode (and, as root, its owner): a crash mid-write
+ * leaves the old file whole rather than a truncated one with the token cut
+ * off. The temporary file is flushed to disk before the rename and removed
+ * when anything fails, so a failed write leaves no copy of the token behind.
+ * `stillCurrent`, when given, is asked right before the rename; false drops
+ * the new content and returns false.
  */
-function replaceFile(target: string, content: string): void {
-  const mode = statSync(target).mode & 0o777;
+function replaceFile(target: string, content: string, stillCurrent?: () => boolean): boolean {
+  const st = statSync(target);
   const tmp = join(dirname(target), `.${Date.now()}-${process.pid}.ai-bridge-env.tmp`);
-  writeFileSync(tmp, content, { mode });
-  renameSync(tmp, target);
+  let renamed = false;
+  try {
+    const fd = openSync(tmp, 'wx', 0o600);
+    try {
+      writeSync(fd, content);
+      fchmodSync(fd, st.mode & 0o777);
+      if (process.getuid?.() === 0) fchownSync(fd, st.uid, st.gid);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    if (stillCurrent && !stillCurrent()) return false;
+    renameSync(tmp, target);
+    renamed = true;
+    return true;
+  } finally {
+    if (!renamed) {
+      try { unlinkSync(tmp); } catch { /* never created */ }
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,14 +239,17 @@ function replaceFile(target: string, content: string): void {
 // refused with token_invalid, and stayed refused until somebody installed it
 // again. So the fresh token is written back to the file it came from.
 
-const TOKEN_LINE = /^\s*(?:export\s+)?AI_BRIDGE_TOKEN\s*=(.*)$/;
+// Group 1: everything up to the value (indent, `export`, spaces around `=`),
+// kept when the line is rewritten; group 2: the value; group 3: a CR, so a
+// file saved with Windows line endings is read and written as it was.
+const TOKEN_LINE = /^(\s*(?:export\s+)?AI_BRIDGE_TOKEN\s*=\s*)(.*?)(\r?)$/;
 
 /** The AI_BRIDGE_TOKEN a file sets (the last one, as systemd reads it), unquoted; null when none. */
 export function tokenIn(text: string): string | null {
   let found: string | null = null;
   for (const line of text.split('\n')) {
     const m = TOKEN_LINE.exec(line);
-    if (m) found = unquote(m[1]!.trim());
+    if (m) found = unquote(m[2]!.trim());
   }
   return found;
 }
@@ -254,7 +279,11 @@ export function locateTokenFile(token: string, envFileFlag: string | undefined, 
     where = deps.env['AI_BRIDGE_ENV_FILE'];
   } else {
     const own = ownUnit(deps);
-    if ('reason' in own) return own;
+    if ('reason' in own) {
+      return deps.platform === 'linux'
+        ? { reason: `no --env-file or AI_BRIDGE_ENV_FILE, and ${own.reason}` }
+        : { reason: 'no --env-file or AI_BRIDGE_ENV_FILE names the file the token came from' };
+    }
     candidates = environmentFiles(own.props);
     where = `the env files of ${own.unit}`;
   }
@@ -284,9 +313,36 @@ export function saveToken(file: string, expected: string, next: string): 'saved'
   let at = -1;
   lines.forEach((line, i) => { if (TOKEN_LINE.test(line)) at = i; });
   if (at < 0 || tokenIn(lines[at]!) !== expected) return 'changed';
-  lines[at] = `AI_BRIDGE_TOKEN=${next}`;
-  replaceFile(target, lines.join('\n'));
-  return 'saved';
+  const [, prefix, value, cr] = TOKEN_LINE.exec(lines[at]!)!;
+  const q = value!.trim()[0];
+  const quote = (q === '"' || q === "'") ? q : '';
+  lines[at] = `${prefix}${quote}${next}${quote}${cr}`;
+  // Asked again right before the rename: an `ai-bridge install` that wrote a
+  // new token while this one was being prepared keeps its token. (Not a lock:
+  // a reinstall landing in the instant between this read and the rename
+  // still loses, to a refreshed token that is itself valid.)
+  const stillExpected = (): boolean => {
+    try { return tokenIn(readFileSync(target, 'utf8')) === expected; } catch { return false; }
+  };
+  return replaceFile(target, lines.join('\n'), stillExpected) ? 'saved' : 'changed';
+}
+
+/**
+ * Saves each refreshed token in turn: each save expects the token the last
+ * one wrote (the one the bridge started with, at first). Once the file holds
+ * a token this bridge did not write, it stays 'changed'. A save that threw
+ * keeps the expected token, so the next refresh tries again.
+ */
+export function tokenSaver(file: string, initial: string): (next: string) => 'saved' | 'changed' {
+  let expected = initial;
+  let changed = false;
+  return (next) => {
+    if (changed) return 'changed';
+    const result = saveToken(file, expected, next);
+    if (result === 'saved') expected = next;
+    else changed = true;
+    return result;
+  };
 }
 
 /** What prefetch() runs and touches, injectable for tests. */
