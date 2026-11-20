@@ -33,7 +33,7 @@ import { listClaudeLogins, runningClaudeProcesses, saveClaudeLogin, useClaudeLog
 import { CLAUDE_TOKEN_KEY, listClaudeTokens, loadClaudeToken, useClaudeToken, useClaudeTokenFile } from './providers/claude-token.js';
 import { installBridge, listBridges, pathsFor, readEnvFile, uninstallBridge } from './service/index.js';
 import { SelfUpdater } from './selfupdate/updater.js';
-import { detect as detectService, pinVersion, prefetch } from './selfupdate/service.js';
+import { detect as detectService, locateTokenFile, pinVersion, prefetch, saveToken } from './selfupdate/service.js';
 import {
   ATTACHMENT_OPTIONS,
   resolveAttachmentSettings,
@@ -535,7 +535,34 @@ program
     }
     updater.start();
 
+    // Where a token the server tops up is saved, so the next start does not
+    // come back with the one this bridge was installed with, long expired.
+    const tokenFile = locateTokenFile(token, opts.envFile);
+    let savedToken = token;
+    if ('file' in tokenFile) {
+      log.info(`Refreshed connection tokens are saved to ${tokenFile.file}`);
+    } else {
+      log.warn(`Refreshed connection tokens are NOT saved (${tokenFile.reason}); after a restart past the token's expiry this bridge needs a new token`);
+    }
+    const onTokenRefreshed = (next: string): void => {
+      if (!('file' in tokenFile)) return;
+      try {
+        if (saveToken(tokenFile.file, savedToken, next) === 'saved') {
+          savedToken = next;
+          log.info('Saved the refreshed connection token', { file: tokenFile.file });
+        } else {
+          log.warn('Did not save the refreshed connection token: the token in the file changed since this bridge started, and that newer one stays', { file: tokenFile.file });
+        }
+      } catch (err) {
+        log.warn('Could not save the refreshed connection token; a restart past its expiry will be refused', {
+          file: tokenFile.file,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+
     const bridge: Bridge = new Bridge({
+      onTokenRefreshed,
       selfUpdate: { enabled: updater.enabled, onDesired: (version) => updater.onDesired(version) },
       serverUrl,
       token,

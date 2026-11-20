@@ -107,7 +107,9 @@ CLI bridge tokens are long-lived (default 30 days) — a bridge is a semi-perman
 - in the `welcome` message (`refreshed_token` field) — at the handshake, covering bridges that reconnect; or
 - in a `token_refresh` message — pushed by a slow background timer, covering a bridge that stays connected without ever reconnecting.
 
-The bridge adopts the new token for subsequent reconnects, so a bridge used at least once per token lifetime never expires.
+The bridge adopts the new token for subsequent reconnects, and writes it back to the env file its token came from (`--env-file`, `AI_BRIDGE_ENV_FILE`, or the env file of the systemd unit running it whose `AI_BRIDGE_TOKEN` is the token in use), so a restart also starts with the fresh token. A bridge used at least once per token lifetime therefore never expires, across restarts too. The file is only rewritten while it still holds the token the bridge last knew: a token somebody installed in the meantime stays. A bridge whose token came from `--token` cannot save it, and says so at startup.
+
+Before 0.44.0 the fresh token lived in memory only. A bridge that ran longer than the token's lifetime restarted (self-update, reboot) with the token it was installed with, already expired, and was refused with `token_invalid` until it was installed again.
 
 ### Reconnection
 

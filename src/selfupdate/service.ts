@@ -73,7 +73,10 @@ export const realDetectDeps: DetectDeps = {
 const VERSION_LINE = /^\s*(?:export\s+)?AI_BRIDGE_VERSION\s*=/m;
 const PINNED_EXEC = /@tetrixdev\/ai-bridge@(?:\$\{AI_BRIDGE_VERSION\}|\$AI_BRIDGE_VERSION)(?:\s|$|;)/;
 
-export function detect(deps: DetectDeps = realDetectDeps): Detection {
+/** The systemd unit this process runs in, with what `systemctl show` says about it. */
+type OwnUnit = { scope: 'user' | 'system'; unit: string; props: Map<string, string> } | { reason: string };
+
+function ownUnit(deps: DetectDeps): OwnUnit {
   if (deps.platform !== 'linux') {
     return { reason: `self-update needs systemd; on ${deps.platform} the version is updated by hand` };
   }
@@ -99,7 +102,21 @@ export function detect(deps: DetectDeps = realDetectDeps): Detection {
   } catch {
     return { reason: `systemctl show ${unit} failed` };
   }
-  const props = parseShow(shown);
+  return { scope, unit, props: parseShow(shown) };
+}
+
+/** The env files a unit loads, in the order systemd reads them. */
+function environmentFiles(props: Map<string, string>): string[] {
+  return (props.get('EnvironmentFiles') ?? '')
+    .split('\n')
+    .map((l) => l.replace(/\s*\(ignore_errors=\w+\)\s*$/, '').trim())
+    .filter(Boolean);
+}
+
+export function detect(deps: DetectDeps = realDetectDeps): Detection {
+  const own = ownUnit(deps);
+  if ('reason' in own) return own;
+  const { scope, unit, props } = own;
 
   const restart = props.get('Restart') ?? '';
   if (restart !== 'always' && restart !== 'on-failure') {
@@ -110,10 +127,7 @@ export function detect(deps: DetectDeps = realDetectDeps): Detection {
   }
 
   const explicit = deps.env['AI_BRIDGE_ENV_FILE'];
-  const listed = (props.get('EnvironmentFiles') ?? '')
-    .split('\n')
-    .map((l) => l.replace(/\s*\(ignore_errors=\w+\)\s*$/, '').trim())
-    .filter(Boolean);
+  const listed = environmentFiles(props);
   const candidates = explicit ? [explicit] : listed;
   const withVersion = candidates.filter((file) => {
     try {
@@ -162,8 +176,7 @@ export function parseShow(out: string): Map<string, string> {
  */
 export function pinVersion(envFile: string, version: string, previous: string): void {
   const target = realpathSync(envFile);
-  const before = readFileSync(target, 'utf8');
-  const lines = before.split('\n');
+  const lines = readFileSync(target, 'utf8').split('\n');
   const set = (key: string, value: string): void => {
     const re = new RegExp(`^\\s*(?:export\\s+)?${key}\\s*=`);
     const at = lines.findIndex((l) => re.test(l));
@@ -176,10 +189,104 @@ export function pinVersion(envFile: string, version: string, previous: string): 
   };
   set('AI_BRIDGE_VERSION', version);
   set('AI_BRIDGE_PREVIOUS_VERSION', previous);
+  replaceFile(target, lines.join('\n'));
+}
+
+/**
+ * Write a file's new content to a temporary file beside it and rename it over
+ * the original, keeping its mode: a crash mid-write leaves the old file whole
+ * rather than a truncated one with the token cut off.
+ */
+function replaceFile(target: string, content: string): void {
   const mode = statSync(target).mode & 0o777;
   const tmp = join(dirname(target), `.${Date.now()}-${process.pid}.ai-bridge-env.tmp`);
-  writeFileSync(tmp, lines.join('\n'), { mode });
+  writeFileSync(tmp, content, { mode });
   renameSync(tmp, target);
+}
+
+// ---------------------------------------------------------------------------
+// The connection token on disk
+// ---------------------------------------------------------------------------
+//
+// A bridge token expires (the server's bridge_ttl, 30 days by default). While
+// connected, the server tops it up: `welcome.refreshed_token` and
+// `token_refresh`. The bridge used to keep the fresh token in memory only, so
+// the file it started from still held the token it was installed with. A
+// bridge that ran for more than the token's lifetime then came back from its
+// next restart (a self-update, a reboot, a crash) with an expired token, was
+// refused with token_invalid, and stayed refused until somebody installed it
+// again. So the fresh token is written back to the file it came from.
+
+const TOKEN_LINE = /^\s*(?:export\s+)?AI_BRIDGE_TOKEN\s*=(.*)$/;
+
+/** The AI_BRIDGE_TOKEN a file sets (the last one, as systemd reads it), unquoted; null when none. */
+export function tokenIn(text: string): string | null {
+  let found: string | null = null;
+  for (const line of text.split('\n')) {
+    const m = TOKEN_LINE.exec(line);
+    if (m) found = unquote(m[1]!.trim());
+  }
+  return found;
+}
+
+function unquote(value: string): string {
+  const q = value[0];
+  return (q === '"' || q === "'") && value.length >= 2 && value.endsWith(q) ? value.slice(1, -1) : value;
+}
+
+export type TokenFile = { file: string } | { reason: string };
+
+/**
+ * The file a refreshed token is saved to: the one this bridge's token came
+ * from. That is `--env-file` when given, else AI_BRIDGE_ENV_FILE, else the env
+ * files of the systemd unit running it. Only a file whose AI_BRIDGE_TOKEN is
+ * exactly the token this bridge runs with qualifies, so a token given with
+ * --token or set elsewhere never lands in a file it did not come from.
+ */
+export function locateTokenFile(token: string, envFileFlag: string | undefined, deps: DetectDeps = realDetectDeps): TokenFile {
+  let candidates: string[];
+  let where: string;
+  if (envFileFlag) {
+    candidates = [envFileFlag];
+    where = envFileFlag;
+  } else if (deps.env['AI_BRIDGE_ENV_FILE']) {
+    candidates = [deps.env['AI_BRIDGE_ENV_FILE']];
+    where = deps.env['AI_BRIDGE_ENV_FILE'];
+  } else {
+    const own = ownUnit(deps);
+    if ('reason' in own) return own;
+    candidates = environmentFiles(own.props);
+    where = `the env files of ${own.unit}`;
+  }
+  const matching = candidates.filter((file) => {
+    try {
+      return tokenIn(deps.readFile(file)) === token;
+    } catch {
+      return false;
+    }
+  });
+  if (matching.length === 0) return { reason: `the token this bridge runs with is not the AI_BRIDGE_TOKEN in ${where}` };
+  if (matching.length > 1) return { reason: `more than one env file holds this token; name one with AI_BRIDGE_ENV_FILE` };
+  const file = matching[0]!;
+  if (!deps.writable(file)) return { reason: `${file} is not writable by this bridge` };
+  return { file };
+}
+
+/**
+ * Replace the token in the file, only if it still holds the one this bridge
+ * last knew. A different token there means somebody installed a new one since
+ * this bridge started; theirs is newer than anything in memory, so it stays.
+ */
+export function saveToken(file: string, expected: string, next: string): 'saved' | 'changed' {
+  if (!/^[A-Za-z0-9._~+/=-]+$/.test(next)) throw new Error('the refreshed token has characters an env file line cannot hold');
+  const target = realpathSync(file);
+  const lines = readFileSync(target, 'utf8').split('\n');
+  let at = -1;
+  lines.forEach((line, i) => { if (TOKEN_LINE.test(line)) at = i; });
+  if (at < 0 || tokenIn(lines[at]!) !== expected) return 'changed';
+  lines[at] = `AI_BRIDGE_TOKEN=${next}`;
+  replaceFile(target, lines.join('\n'));
+  return 'saved';
 }
 
 /** What prefetch() runs and touches, injectable for tests. */
