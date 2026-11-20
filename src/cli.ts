@@ -33,7 +33,7 @@ import { listClaudeLogins, runningClaudeProcesses, saveClaudeLogin, useClaudeLog
 import { CLAUDE_TOKEN_KEY, listClaudeTokens, loadClaudeToken, useClaudeToken, useClaudeTokenFile } from './providers/claude-token.js';
 import { installBridge, listBridges, pathsFor, readEnvFile, uninstallBridge } from './service/index.js';
 import { SelfUpdater } from './selfupdate/updater.js';
-import { detect as detectService, pinVersion, prefetch } from './selfupdate/service.js';
+import { detect as detectService, locateTokenFile, pinVersion, prefetch, tokenSaver, type TokenFile } from './selfupdate/service.js';
 import {
   ATTACHMENT_OPTIONS,
   resolveAttachmentSettings,
@@ -260,9 +260,14 @@ program
     // of the three sources -- a flag or an environment variable still wins --
     // so a service can be pointed at one and still be overridden by hand for a
     // one-off run.
+    // Where the token came from decides where a refreshed one may be saved:
+    // only to the source the next start reads it from again.
+    const tokenFromFlag = program.getOptionValueSource('token') === 'cli';
+    let tokenFromFile = false;
     if (opts.envFile) {
       const fromFile = readEnvFile(opts.envFile);
       opts.server ??= fromFile.server;
+      tokenFromFile = opts.token === undefined && fromFile.token !== undefined;
       opts.token ??= fromFile.token;
       opts.installName ??= fromFile.name;
       opts.engram ??= fromFile.engram;
@@ -535,7 +540,38 @@ program
     }
     updater.start();
 
+    // Where a token the server tops up is saved, so the next start does not
+    // come back with the one this bridge was installed with, long expired.
+    // A --token flag wins over every file, so a token saved to one would not
+    // be what the next start uses; --env-file counts only when the token came
+    // from it (a flag or AI_BRIDGE_TOKEN in the environment wins over it).
+    const tokenFile: TokenFile = tokenFromFlag
+      ? { reason: 'the token was given with --token' }
+      : locateTokenFile(token, tokenFromFile ? opts.envFile : undefined);
+    if ('file' in tokenFile) {
+      log.info(`Refreshed connection tokens are saved to ${tokenFile.file}`);
+    } else {
+      log.warn(`Refreshed connection tokens are NOT saved (${tokenFile.reason}); after a restart past the token's expiry this bridge needs a new token`);
+    }
+    const saveRefreshed = 'file' in tokenFile ? tokenSaver(tokenFile.file, token) : undefined;
+    const onTokenRefreshed = (next: string): void => {
+      if (!('file' in tokenFile)) return;
+      try {
+        if (saveRefreshed!(next) === 'saved') {
+          log.info('Saved the refreshed connection token', { file: tokenFile.file });
+        } else {
+          log.warn('Did not save the refreshed connection token: the token in the file changed since this bridge started, and that newer one stays', { file: tokenFile.file });
+        }
+      } catch (err) {
+        log.warn('Could not save the refreshed connection token; a restart past its expiry will be refused', {
+          file: tokenFile.file,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+
     const bridge: Bridge = new Bridge({
+      onTokenRefreshed,
       selfUpdate: { enabled: updater.enabled, onDesired: (version) => updater.onDesired(version) },
       serverUrl,
       token,

@@ -130,6 +130,12 @@ export interface BridgeOptions {
    * `desired_bridge_version`, undefined when it carried none.
    */
   selfUpdate?: { enabled: boolean; onDesired: (version: unknown) => void };
+  /**
+   * Called when the server hands over a fresh connection token (welcome or
+   * token_refresh), after the bridge adopted it, so the CLI can save it where
+   * the next start reads its token from. Errors are logged, never thrown.
+   */
+  onTokenRefreshed?: (token: string, previous: string) => void;
   /** WebSocket server URL (wss://...). The token never goes in it: see connect(). */
   serverUrl: string;
   /** Authentication token, sent as an Authorization: Bearer header (never in the URL or hello) */
@@ -471,6 +477,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   // the fresh token (via welcome.refreshed_token or a token_refresh message)
   // for subsequent reconnects.
   private token: string;
+  private readonly onTokenRefreshed: ((token: string, previous: string) => void) | undefined;
   // Not readonly: re-detected at each handshake and after a provider spawn
   // failure, so a CLI installed or removed mid-life is picked up without a
   // bridge restart. See refreshProviders().
@@ -699,6 +706,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
     this.serverUrl = options.serverUrl;
     this.token = options.token;
+    this.onTokenRefreshed = options.onTokenRefreshed;
     this.providers = options.providers;
     this.adapters = options.adapters;
     // Absent means off. A server cannot turn this on by sending a field.
@@ -3204,8 +3212,14 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (!token || token === this.token) {
       return;
     }
+    const previous = this.token;
     this.token = token;
     log.info('Adopted refreshed connection token', { source });
+    try {
+      this.onTokenRefreshed?.(token, previous);
+    } catch (err) {
+      log.warn('Could not hand on the refreshed connection token', { error: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   // -------------------------------------------------------------------------

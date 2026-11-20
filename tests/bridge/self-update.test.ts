@@ -128,3 +128,25 @@ describe('self-update over the wire', () => {
     expect(bridge!.isIdle()).toBe(true);
   });
 });
+
+describe('a refreshed connection token', () => {
+  it('is handed on, with the one it replaces, from the welcome and from token_refresh', async () => {
+    const seen: [string, string][] = [];
+    bridge = new Bridge({
+      serverUrl: url,
+      token: 'tok',
+      providers: [],
+      adapters: new Map(),
+      sessionStorePath: null,
+      allowedRoots: [],
+      onTokenRefreshed: (next, previous) => { seen.push([next, previous]); },
+    });
+    bridge.connect();
+    await waitFor((f) => f['type'] === 'hello', 'hello');
+    socket.send(welcome({ refreshed_token: 'tok2' }));
+    socket.send(JSON.stringify({ type: 'token_refresh', token: 'tok3' }));
+    const deadline = Date.now() + 2000;
+    while (seen.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    expect(seen).toEqual([['tok2', 'tok'], ['tok3', 'tok2']]);
+  });
+});
