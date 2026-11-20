@@ -81,7 +81,7 @@ describe('which file a refreshed token is saved to', () => {
 
 describe('saving a refreshed token', () => {
   let dir: string;
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); });
 
   const file = (content: string): string => {
     dir = mkdtempSync(join(tmpdir(), 'aib-token-'));
@@ -107,10 +107,10 @@ describe('saving a refreshed token', () => {
     expect(tokenIn(readFileSync(path, 'utf8'))).toBe('new');
   });
 
-  it('replaces the last assignment, the one systemd uses', () => {
-    const path = file('AI_BRIDGE_TOKEN=stale\nAI_BRIDGE_TOKEN=old\n');
+  it('replaces every assignment holding the token, whichever one the next start reads', () => {
+    const path = file('AI_BRIDGE_TOKEN=stale\nAI_BRIDGE_TOKEN=old\nexport AI_BRIDGE_TOKEN=old\n');
     expect(saveToken(path, 'old', 'new')).toBe('saved');
-    expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_TOKEN=stale\nAI_BRIDGE_TOKEN=new\n');
+    expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_TOKEN=stale\nAI_BRIDGE_TOKEN=new\nexport AI_BRIDGE_TOKEN=new\n');
   });
 
   it('saves refresh after refresh, each against the token it saved last', () => {
@@ -131,8 +131,8 @@ describe('saving a refreshed token', () => {
     expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_TOKEN=reinstalled\n');
   });
 
-  it('a failed save leaves the file, no temporary copy, and is tried again on the next refresh', () => {
-    if (process.platform === 'win32' || process.getuid?.() === 0) return; // a read-only directory stops neither
+  // A read-only directory stops neither Windows nor root.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('a failed save leaves the file, no temporary copy, and is tried again on the next refresh', () => {
     const path = file('AI_BRIDGE_TOKEN=t0\n');
     const save = tokenSaver(path, 't0');
     chmodSync(dir, 0o500);

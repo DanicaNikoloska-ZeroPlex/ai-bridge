@@ -313,22 +313,23 @@ export function locateTokenFile(token: string, envFileFlag: string | undefined, 
 export function saveToken(file: string, expected: string, next: string): 'saved' | 'changed' {
   if (!/^[A-Za-z0-9._~+/=-]+$/.test(next)) throw new Error('the refreshed token has characters an env file line cannot hold');
   const target = realpathSync(file);
-  const lines = readFileSync(target, 'utf8').split('\n');
-  let at = -1;
-  lines.forEach((line, i) => { if (TOKEN_LINE.test(line)) at = i; });
-  if (at < 0 || tokenIn(lines[at]!) !== expected) return 'changed';
-  const [, prefix, value, cr] = TOKEN_LINE.exec(lines[at]!)!;
-  const q = value!.trim()[0];
-  const quote = (q === '"' || q === "'") ? q : '';
-  lines[at] = `${prefix}${quote}${next}${quote}${cr}`;
-  // Asked again right before the rename: an `ai-bridge install` that wrote a
-  // new token while this one was being prepared keeps its token. (Not a lock:
-  // a reinstall landing in the instant between this read and the rename
-  // still loses, to a refreshed token that is itself valid.)
-  const stillExpected = (): boolean => {
-    try { return tokenIn(readFileSync(target, 'utf8')) === expected; } catch { return false; }
-  };
-  return replaceFile(target, lines.join('\n'), stillExpected) ? 'saved' : 'changed';
+  const before = readFileSync(target, 'utf8');
+  if (tokenIn(before) !== expected) return 'changed';
+  // Every assignment holding the token is rewritten, not only the last: the
+  // readers differ (systemd takes the last line, `--env-file` skips an
+  // `export` line), and whichever one the next start uses must be fresh.
+  const lines = before.split('\n').map((line) => {
+    const m = TOKEN_LINE.exec(line);
+    if (!m || unquote(m[2]!.trim()) !== expected) return line;
+    const q = m[2]!.trim()[0];
+    const quote = q === '"' || q === "'" ? q : '';
+    return `${m[1]}${quote}${next}${quote}${m[3]}`;
+  });
+  // The whole file is asked again right before the rename: an `ai-bridge
+  // install` or a version pin written meanwhile keeps what it wrote. (Not a
+  // lock: a write landing in the instant between this read and the rename
+  // still loses.) A read that fails here throws, so the next refresh retries.
+  return replaceFile(target, lines.join('\n'), () => readFileSync(target, 'utf8') === before) ? 'saved' : 'changed';
 }
 
 /**
