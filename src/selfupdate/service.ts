@@ -313,6 +313,16 @@ export function locateTokenFile(token: string, envFileFlag: string | undefined, 
 export function saveToken(file: string, expected: string, next: string): 'saved' | 'changed' {
   if (!/^[A-Za-z0-9._~+/=-]+$/.test(next)) throw new Error('the refreshed token has characters an env file line cannot hold');
   const target = realpathSync(file);
+  // Another line written in the instant before the rename starts it over;
+  // only the token itself having changed is 'changed'.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = saveTokenOnce(target, expected, next);
+    if (result !== 'raced') return result;
+  }
+  return 'changed';
+}
+
+function saveTokenOnce(target: string, expected: string, next: string): 'saved' | 'changed' | 'raced' {
   const before = readFileSync(target, 'utf8');
   if (tokenIn(before) !== expected) return 'changed';
   // Every assignment holding the token is rewritten, not only the last: the
@@ -329,7 +339,7 @@ export function saveToken(file: string, expected: string, next: string): 'saved'
   // install` or a version pin written meanwhile keeps what it wrote. (Not a
   // lock: a write landing in the instant between this read and the rename
   // still loses.) A read that fails here throws, so the next refresh retries.
-  return replaceFile(target, lines.join('\n'), () => readFileSync(target, 'utf8') === before) ? 'saved' : 'changed';
+  return replaceFile(target, lines.join('\n'), () => readFileSync(target, 'utf8') === before) ? 'saved' : 'raced';
 }
 
 /**
