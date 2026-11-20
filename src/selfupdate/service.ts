@@ -23,7 +23,7 @@
  * more than one; every other check still applies.
  */
 import { execFile, execFileSync } from 'node:child_process';
-import { accessSync, closeSync, constants, fchmodSync, fchownSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
+import { accessSync, closeSync, constants, fchmodSync, fchownSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -201,14 +201,18 @@ export function pinVersion(envFile: string, version: string, previous: string): 
  * `stillCurrent`, when given, is asked right before the rename; false drops
  * the new content and returns false.
  */
-function replaceFile(target: string, content: string, stillCurrent?: () => boolean): boolean {
+export function replaceFile(target: string, content: string, stillCurrent?: () => boolean): boolean {
   const st = statSync(target);
   const tmp = join(dirname(target), `.${Date.now()}-${process.pid}.ai-bridge-env.tmp`);
+  let created = false;
   let renamed = false;
   try {
     const fd = openSync(tmp, 'wx', 0o600);
+    created = true;
     try {
-      writeSync(fd, content);
+      // writeFileSync on a descriptor loops until all is written; a bare
+      // writeSync may write part of it on a filling disk without an error.
+      writeFileSync(fd, content);
       fchmodSync(fd, st.mode & 0o777);
       if (process.getuid?.() === 0) fchownSync(fd, st.uid, st.gid);
       fsyncSync(fd);
@@ -220,8 +224,8 @@ function replaceFile(target: string, content: string, stillCurrent?: () => boole
     renamed = true;
     return true;
   } finally {
-    if (!renamed) {
-      try { unlinkSync(tmp); } catch { /* never created */ }
+    if (created && !renamed) {
+      try { unlinkSync(tmp); } catch { /* already gone */ }
     }
   }
 }

@@ -6,7 +6,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { locateTokenFile, saveToken, tokenIn, tokenSaver, type DetectDeps } from '../../src/selfupdate/service.js';
+import { locateTokenFile, replaceFile, saveToken, tokenIn, tokenSaver, type DetectDeps } from '../../src/selfupdate/service.js';
 
 const CGROUP = '0::/user.slice/user-1000.slice/user@1000.service/app.slice/ai-bridge-studio.service\n';
 const ENV = '/home/u/.config/ai-bridge-studio.env';
@@ -145,6 +145,13 @@ describe('saving a refreshed token', () => {
     expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_TOKEN=t0\n');
     expect(save('t2')).toBe('saved');
     expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_TOKEN=t2\n');
+  });
+
+  it('a file that changed just before the rename is left alone, with no temporary copy', () => {
+    const path = file('AI_BRIDGE_TOKEN=old\n');
+    expect(replaceFile(path, 'AI_BRIDGE_TOKEN=new\n', () => false)).toBe(false);
+    expect(readFileSync(path, 'utf8')).toBe('AI_BRIDGE_TOKEN=old\n');
+    expect(readdirSync(dir)).toEqual(['bridge.env']);
   });
 
   it('never puts the token in the error it throws', () => {
