@@ -816,15 +816,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         this.toolWaitFor(requestId),
       );
     });
-    // A turn starting asks for the tool list: re-read upstream lists that are
-    // stale first (D10067), so a server's new tools show without a reconnect.
-    if (this.upstream) {
-      const upstream = this.upstream;
-      // An isolated connection offers no upstream tools (registerBridgeTools), so it never waits for them.
-      this.mcpServer.setBeforeListTools(async () => {
-        if (this.cliIsolation !== 'isolated') await upstream.refreshTools();
-      });
-    }
 
   }
 

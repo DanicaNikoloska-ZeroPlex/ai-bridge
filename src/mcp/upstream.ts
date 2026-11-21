@@ -62,14 +62,13 @@ export const MCP_APPS_BRIDGE_REVISION = 1;
 export const DEFAULT_CALL_TIMEOUT_MS = 60_000;
 export const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
 /**
- * A server's tool list is re-read when a turn starts and it is older than this.
+ * While connected, a server's tool list is re-read in the background this often.
  * Many servers decide per user which tools they offer and never send
  * tools/list_changed (Alex: a permission granted mid-day), so a list read at
- * connect would otherwise stay as it was until the bridge reconnects.
+ * connect would otherwise stay as it was until the bridge reconnects. A turn
+ * never waits for it: tools/list always answers from the stored list.
  */
 export const DEFAULT_TOOLS_REFRESH_MS = 60_000;
-/** How long a turn's tools/list waits for those re-reads; a slower one finishes in the background. */
-export const TOOLS_REFRESH_BUDGET_MS = 3_000;
 /** Reconnect backoff: first wait, doubled each failure, capped. */
 export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_MAX_MS = 60_000;
@@ -90,8 +89,8 @@ interface UpstreamCommon {
   /** Connect and initialize, in ms. Default 30000. */
   connect_timeout_ms?: number;
   /**
-   * Re-read the server's tool list when a turn starts and the list is older than
-   * this, in ms. Default 60000; 0 = only on connect and on tools/list_changed.
+   * Re-read the server's tool list in the background this often while connected,
+   * in ms. Default 60000; 0 = only on connect and on tools/list_changed.
    */
   tools_refresh_ms?: number;
 }
@@ -362,10 +361,10 @@ interface Conn {
   quiet: boolean;
   /** The server connection (session number) this upstream last sent upstream_auth_required on. */
   promptedIn: number;
-  /** When `tools` was last read from this connection (ms since epoch); 0 = never. */
-  listedAt: number;
-  /** A re-read of the tool list in flight, shared by concurrent turns. */
-  refreshing: Promise<void> | null;
+  /** The background re-read of the tool list for the current connection; null while not connected. */
+  refreshTimer: NodeJS.Timeout | null;
+  /** A background re-read in flight, so a slow server never gets a second one on top. */
+  refreshing: boolean;
 }
 
 /** One entry of `upstream_status`. */
@@ -430,7 +429,7 @@ export class UpstreamHub {
         secrets: [], failures: 0, retryTimer: null, lastError: null,
         auth: oauth ? 'oauth' : refs ? 'secrets' : 'none',
         oauth, needsAuth: null, quiet: false, promptedIn: 0,
-        listedAt: 0, refreshing: null,
+        refreshTimer: null, refreshing: false,
       });
     }
   }
@@ -552,7 +551,6 @@ export class UpstreamHub {
     try {
       await withTimeout(client.connect(transport), c.cfg.connect_timeout_ms ?? DEFAULT_CONNECT_TIMEOUT_MS, `connecting to ${c.name}`);
       const tools = await this.listAllTools(client, c);
-      c.listedAt = Date.now();
       if (this.closed) throw new UpstreamError('unavailable', 'the bridge is shutting down');
       c.client = client;
       c.tools = tools;
@@ -568,7 +566,6 @@ export class UpstreamHub {
     client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
       try {
         c.tools = await this.listAllTools(client, c);
-        c.listedAt = Date.now();
         this.options.onToolsChanged?.();
         this.statusMaybeChanged();
       } catch (err) {
@@ -576,41 +573,36 @@ export class UpstreamHub {
       }
     });
     log.info('upstream MCP server connected', { name: c.name, tools: c.tools.map((t) => t.name) });
+    this.startRefresh(c, client);
     this.options.onToolsChanged?.();
     return client;
   }
 
   /**
-   * Called when a turn asks for the tool list: re-read every connected server's
-   * list that is older than its `tools_refresh_ms`, so tools a server added or
-   * withdrew since (often a permission change) show in this turn. Waits at most
-   * `budgetMs`, and only for re-reads THIS call started: a turn that finds one
-   * already in flight (a slow upstream) answers at once with the stored list
-   * instead of waiting again. A slower re-read finishes in the background and a
-   * later turn sees it. A failed re-read keeps the old list and the connection.
-   * Never throws.
+   * Re-read this connection's tool list in the background every
+   * `tools_refresh_ms` (D10067), so tools a server added or withdrew since
+   * (often a permission change) show in the next turn without a reconnect and
+   * without any turn waiting for it. One re-read at a time; a failed one keeps
+   * the old list and the connection and is simply tried again next tick.
    */
-  async refreshTools(budgetMs = TOOLS_REFRESH_BUDGET_MS): Promise<void> {
-    const now = Date.now();
-    const due = [...this.conns.values()].filter((c) => {
-      const every = c.cfg.tools_refresh_ms ?? DEFAULT_TOOLS_REFRESH_MS;
-      return c.client !== null && every > 0 && now - c.listedAt >= every;
-    });
-    const started = due.filter((c) => c.refreshing === null);
-    if (started.length === 0) return;
-    const all = Promise.all(started.map((c) => (c.refreshing = this.refreshOne(c).finally(() => { c.refreshing = null; }))));
-    let timer: NodeJS.Timeout | undefined;
-    await Promise.race([all, new Promise<void>((r) => { timer = setTimeout(r, budgetMs); timer.unref?.(); })]);
-    if (timer) clearTimeout(timer);
+  private startRefresh(c: Conn, client: Client): void {
+    this.stopRefresh(c);
+    const every = c.cfg.tools_refresh_ms ?? DEFAULT_TOOLS_REFRESH_MS;
+    if (every <= 0) return;
+    c.refreshTimer = setInterval(() => { void this.refreshOne(c, client); }, every);
+    c.refreshTimer.unref?.();
   }
 
-  private async refreshOne(c: Conn): Promise<void> {
-    const client = c.client;
-    if (!client) return;
+  private stopRefresh(c: Conn): void {
+    if (c.refreshTimer) { clearInterval(c.refreshTimer); c.refreshTimer = null; }
+  }
+
+  private async refreshOne(c: Conn, client: Client): Promise<void> {
+    if (c.refreshing || c.client !== client || this.closed) return;
+    c.refreshing = true;
     try {
       const tools = await this.listAllTools(client, c);
       if (c.client !== client || this.closed) return;
-      c.listedAt = Date.now();
       const key = (list: UpstreamTool[]) => JSON.stringify(list.map((t) => [t.name, t.description ?? '', t.inputSchema, t._meta ?? null]));
       if (key(tools) === key(c.tools)) return;
       const before = new Set(c.tools.map((t) => t.name));
@@ -624,9 +616,9 @@ export class UpstreamHub {
       this.options.onToolsChanged?.();
       this.statusMaybeChanged();
     } catch (err) {
-      // Keep the list we had; try again after the next interval, not on every turn.
-      c.listedAt = Date.now();
       log.warn('upstream tools refresh failed; keeping the previous list', { name: c.name, error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      c.refreshing = false;
     }
   }
 
@@ -654,6 +646,7 @@ export class UpstreamHub {
   private dropped(c: Conn, client: Client, why: string): void {
     if (c.client !== client) return;
     c.client = null;
+    this.stopRefresh(c);
     c.lastError = why;
     if (this.closed) return;
     log.warn('upstream MCP server disconnected; reconnecting', { name: c.name, why });
@@ -888,6 +881,7 @@ export class UpstreamHub {
   private enterNeedsAuth(c: Conn, reason: Exclude<AuthRequiredReason, 'requested'>): void {
     const client = c.client;
     c.client = null;
+    this.stopRefresh(c);
     if (client) { client.onclose = undefined; void client.close().catch(() => undefined); }
     if (c.retryTimer) { clearTimeout(c.retryTimer); c.retryTimer = null; }
     const hadTools = c.tools.length > 0;
@@ -964,6 +958,7 @@ export class UpstreamHub {
     // Connect with the new token: lists the tools, tells the CLI (onToolsChanged), sends upstream_status.
     const old = c.client;
     c.client = null;
+    this.stopRefresh(c);
     if (old) { old.onclose = undefined; await old.close().catch(() => undefined); }
     c.needsAuth = null;
     c.quiet = false;
@@ -997,6 +992,7 @@ export class UpstreamHub {
     this.closed = true;
     for (const c of this.conns.values()) {
       if (c.retryTimer) { clearTimeout(c.retryTimer); c.retryTimer = null; }
+      this.stopRefresh(c);
       const client = c.client;
       c.client = null;
       if (client) { client.onclose = undefined; await client.close().catch(() => undefined); }

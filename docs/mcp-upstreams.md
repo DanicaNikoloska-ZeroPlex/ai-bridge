@@ -56,7 +56,7 @@ servers is accepted too):
 | `oauth` | HTTP | With `"auth": "oauth"`, optional: `scope` (space-separated) and `client_name` (default `AI Bridge`). No other keys. |
 | `timeout_ms` | both | Per request (a tool call, a resource read). Default `60000`. |
 | `connect_timeout_ms` | both | Starting and initializing. Default `30000`. |
-| `tools_refresh_ms` | both | When a turn starts and the server's tool list is older than this, it is read again first (at most 3 seconds; a slower read finishes in the background, a failed one keeps the old list). For servers that decide per user which tools they offer and never send `tools/list_changed`. Default `60000`; `0` = only on connect and on `tools/list_changed`. |
+| `tools_refresh_ms` | both | While connected, the server's tool list is re-read in the background this often, so tools it added or withdrew (for example after a permission change) show in the next turn without a reconnect. No turn waits for it; a failed read keeps the stored list and is tried again next time. For servers that decide per user which tools they offer and never send `tools/list_changed`. Default `60000`; `0` = only on connect and on `tools/list_changed`. |
 
 ## Secrets
 
@@ -168,7 +168,7 @@ A view may only read `ui://` resources of its own server.
   **stay listed**, and the next use reconnects at once rather than waiting for
   the backoff. An error the server itself answered keeps the connection.
 - A slow request times out after `timeout_ms` (`timeout`); the connection is kept.
-- `notifications/tools/list_changed` refreshes that server's tools. Without one, a turn that starts re-reads a list older than `tools_refresh_ms` (default one minute), so tools a server added or withdrew later (for example after a permission change) show in that turn. Only the turn that starts a re-read waits for it, at most 3 seconds; when the server is slower, that turn and any turn starting meanwhile get the stored list, and the new tools show in the first turn after the read finishes. A failed re-read keeps the stored list and is tried again one interval later, so a new tool can then take up to `tools_refresh_ms` longer to appear. Turns held to the server's own tools, and an isolated connection, never wait for this.
+- `notifications/tools/list_changed` refreshes that server's tools. Without one, the list is re-read in the background every `tools_refresh_ms` (default one minute) while connected, so tools a server added or withdrew later (for example after a permission change) show in the first turn after that read. A turn never waits for it.
 - Stopping the bridge stops every stdio server it started.
 
 Upstream tools are offered only when the web application runs the CLI in

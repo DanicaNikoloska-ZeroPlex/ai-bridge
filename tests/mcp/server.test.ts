@@ -68,40 +68,6 @@ describe('BridgeMcpServer', () => {
     }
   });
 
-  it('runs the before-list hook first, so tools it registers are in this list (D10067)', async () => {
-    server.setBeforeListTools(async () => {
-      server.setTools([{ name: 'fresh', description: 'Registered by the hook', parameters: { type: 'object', properties: {} } }]);
-    });
-    const client = await buildClient(server.getBaseUrl(), server.issueToken('req-hook'));
-    try {
-      expect((await client.listTools()).tools.map((t) => t.name)).toEqual(['fresh']);
-    } finally {
-      await client.close();
-    }
-  });
-
-  it('does not run the before-list hook for a turn held to the server tools', async () => {
-    let ran = 0;
-    server.setBeforeListTools(async () => { ran++; });
-    const client = await buildClient(server.getBaseUrl(), server.issueToken('req-held', { serverToolsOnly: true }));
-    try {
-      await client.listTools();
-      expect(ran).toBe(0);
-    } finally {
-      await client.close();
-    }
-  });
-
-  it('still answers tools/list when the before-list hook fails', async () => {
-    server.setBeforeListTools(async () => { throw new Error('upstream down'); });
-    const client = await buildClient(server.getBaseUrl(), server.issueToken('req-hook2'));
-    try {
-      expect((await client.listTools()).tools.map((t) => t.name)).toEqual(['roll_dice']);
-    } finally {
-      await client.close();
-    }
-  });
-
   it('routes tools/call through handleCall with the request id from the bearer token', async () => {
     const token = server.issueToken('req-42');
     const client = await buildClient(server.getBaseUrl(), token);

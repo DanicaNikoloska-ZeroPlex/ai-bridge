@@ -235,80 +235,54 @@ describe('UpstreamHub over stdio', () => {
     expect(changes).toBeGreaterThan(before);
   });
 
-  describe('refreshing tool lists when a turn starts (D10067)', () => {
-    it('shows a tool the server added without tools/list_changed, once the list is older than tools_refresh_ms', async () => {
+  describe('background refresh of tool lists (D10067)', () => {
+    it('shows a tool the server added without tools/list_changed after the next background read', async () => {
       let changes = 0;
       hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 50 } as Partial<UpstreamConfig>) }, { onToolsChanged: () => { changes++; } });
       await hub.start();
-      await hub.callFromModel('fx__add_tool_silently', {});
-      expect(hub.owns('fx__silent')).toBe(false);
-      await new Promise((r) => setTimeout(r, 80));
       const before = changes;
-      await hub.refreshTools();
-      expect(hub.owns('fx__silent')).toBe(true);
-      expect(changes).toBe(before + 1);
-    });
-
-    it('does not ask the server again within tools_refresh_ms', async () => {
-      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 60_000 } as Partial<UpstreamConfig>) });
-      await hub.start();
       await hub.callFromModel('fx__add_tool_silently', {});
-      await hub.refreshTools();
       expect(hub.owns('fx__silent')).toBe(false);
+      await until(() => hub!.owns('fx__silent'), 'the background refresh');
+      expect(changes).toBe(before + 1);
     });
 
     it('never refreshes with tools_refresh_ms 0', async () => {
       hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 0 } as Partial<UpstreamConfig>) });
       await hub.start();
       await hub.callFromModel('fx__add_tool_silently', {});
-      await new Promise((r) => setTimeout(r, 30));
-      await hub.refreshTools();
+      await new Promise((r) => setTimeout(r, 200));
       expect(hub.owns('fx__silent')).toBe(false);
     });
 
     it('does not report a change when the list is the same', async () => {
       let changes = 0;
-      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 20 } as Partial<UpstreamConfig>) }, { onToolsChanged: () => { changes++; } });
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 30 } as Partial<UpstreamConfig>) }, { onToolsChanged: () => { changes++; } });
       await hub.start();
       const before = changes;
-      await new Promise((r) => setTimeout(r, 40));
-      await hub.refreshTools();
+      await new Promise((r) => setTimeout(r, 200));
       expect(changes).toBe(before);
     });
 
-    it('answers within the budget when the server lists slowly, keeps the old list, and catches up in the background', async () => {
-      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 20 } as Partial<UpstreamConfig>) });
+    it('keeps the list and the connection while reads are slow or fail, and catches up afterwards', async () => {
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 30, timeout_ms: 100 } as Partial<UpstreamConfig>) });
       await hub.start();
-      await hub.callFromModel('fx__slow_lists', { ms: 600 });
+      await hub.callFromModel('fx__slow_lists', { ms: 400 });
       await hub.callFromModel('fx__add_tool_silently', {});
-      await new Promise((r) => setTimeout(r, 40));
-      const t0 = Date.now();
-      await hub.refreshTools(100);
-      expect(Date.now() - t0).toBeLessThan(400);
-      expect(hub.owns('fx__silent')).toBe(false);
+      await new Promise((r) => setTimeout(r, 300));
       expect(hub.owns('fx__plain')).toBe(true);
-      await until(() => hub!.owns('fx__silent'), 'the background refresh');
+      expect(hub.owns('fx__silent')).toBe(false);
+      await hub.callFromModel('fx__slow_lists', { ms: 0 });
+      await until(() => hub!.owns('fx__silent'), 'the refresh after reads are fast again');
     });
 
-    it('does not make a second turn wait for a re-read that is already in flight', async () => {
+    it('stops refreshing when closed', async () => {
       hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 20 } as Partial<UpstreamConfig>) });
       await hub.start();
-      await hub.callFromModel('fx__slow_lists', { ms: 800 });
-      await new Promise((r) => setTimeout(r, 40));
-      const first = hub.refreshTools(200);
-      const t0 = Date.now();
-      await hub.refreshTools(200);
-      expect(Date.now() - t0).toBeLessThan(100);
-      await first;
-    });
-
-    it('keeps the list when the refresh fails', async () => {
-      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 20, timeout_ms: 100 } as Partial<UpstreamConfig>) });
-      await hub.start();
-      await hub.callFromModel('fx__slow_lists', { ms: 1000 });
-      await new Promise((r) => setTimeout(r, 40));
-      await hub.refreshTools(500);
-      expect(hub.owns('fx__plain')).toBe(true);
+      await hub.close();
+      await new Promise((r) => setTimeout(r, 100));
+      expect(hub.status()['fx']?.connected).toBe(false);
+      hub = null;
     });
   });
 
