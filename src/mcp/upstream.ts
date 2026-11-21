@@ -64,7 +64,7 @@ export const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
 /**
  * While connected, a server's tool list is re-read in the background this often.
  * Many servers decide per user which tools they offer and never send
- * tools/list_changed (Alex: a permission granted mid-day), so a list read at
+ * tools/list_changed (a permission granted mid-day, say), so a list read at
  * connect would otherwise stay as it was until the bridge reconnects. A turn
  * never waits for it: tools/list always answers from the stored list.
  */
@@ -588,7 +588,7 @@ export class UpstreamHub {
 
   /**
    * Re-read this connection's tool list in the background every
-   * `tools_refresh_ms` (D10067), so tools a server added or withdrew since
+   * `tools_refresh_ms`, so tools a server added or withdrew since
    * (often a permission change) show in the next turn without a reconnect and
    * without any turn waiting for it. One re-read at a time; a failed one keeps
    * the old list and the connection and is simply tried again next tick.

@@ -19,7 +19,7 @@
  * Whoever started it: the main assistant, or a helper (`owned_by_subagent`). A
  * helper's command holds the turn open exactly like the main assistant's, so
  * its progress has to count the same way; leaving it out let a helper's long
- * build be stopped as silent while it was printing all along (D09379).
+ * build be stopped as silent while it was printing all along.
  *
  * Which commands run in the background is read from the same reply, not from
  * `is_backgrounded`: a command the model ran in the foreground is moved to the

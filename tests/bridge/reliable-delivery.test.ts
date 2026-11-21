@@ -643,7 +643,7 @@ describe('review follow-up: a gap on a live connection, and a re-issue numbered 
   });
 });
 
-describe('CodeRabbit remarks (D09710)', () => {
+describe('CodeRabbit remarks', () => {
   const internals = () => bridge as unknown as { outbox: StreamOutbox; lostTurns: Set<string> };
   const reissue = (id: string, firstSeq?: number): void => socket.send(JSON.stringify({
     type: 'ai_request', request_id: id, conversation_id: 'conv-1', provider: 'fake',

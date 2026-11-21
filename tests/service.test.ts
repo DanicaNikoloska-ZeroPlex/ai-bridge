@@ -191,10 +191,10 @@ describe('a pinned service', () => {
   test('the systemd unit starts the version in the env file, with the flags asked for, and restarts', async () => {
     const { systemdUnit } = await import('../src/service/platform.js');
     const { pathsFor } = await import('../src/service/naming.js');
-    const unit = systemdUnit(pathsFor('studio'), { server: 'wss://x', token: 't', allowDir: '/srv/app' }, ['--allow-native'], '/usr/bin/npx');
+    const unit = systemdUnit(pathsFor('acme'), { server: 'wss://x', token: 't', allowDir: '/srv/app' }, ['--allow-native'], '/usr/bin/npx');
     expect(unit).toContain('ExecStart=/usr/bin/npx -y --ignore-scripts @tetrixdev/ai-bridge@${AI_BRIDGE_VERSION} --allow-dir "/srv/app" --allow-native\n');
     expect(unit).toContain('Restart=always');
-    expect(unit).toMatch(/EnvironmentFile=.*studio\.env/);
+    expect(unit).toMatch(/EnvironmentFile=.*acme\.env/);
   });
 
   test('install refuses a flag outside its short list', async () => {

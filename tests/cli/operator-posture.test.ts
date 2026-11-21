@@ -18,7 +18,7 @@ import { resolveOperatorPosture, type OperatorOptions } from '../../src/cli.js';
 let root: string;
 let repo: string;
 
-const SERVER = 'wss://studio.example.com/api/ai-bridge/ws';
+const SERVER = 'wss://app.example.com/api/ai-bridge/ws';
 
 function options(overrides: Partial<OperatorOptions> = {}): OperatorOptions {
   return {
@@ -33,7 +33,7 @@ function options(overrides: Partial<OperatorOptions> = {}): OperatorOptions {
 
 beforeAll(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), 'posture-cli-')));
-  repo = join(root, 'studio');
+  repo = join(root, 'acme-app');
   mkdirSync(repo, { recursive: true });
 });
 
@@ -82,8 +82,8 @@ describe('--allow-web-search', () => {
 
 describe('--allow-dir', () => {
   it('reaches the bridge as resolved roots', () => {
-    const posture = resolveOperatorPosture(options({ allowDir: [`${repo}=Studio`] }), SERVER, {});
-    expect(posture.allowedRoots).toEqual([{ path: repo, label: 'Studio' }]);
+    const posture = resolveOperatorPosture(options({ allowDir: [`${repo}=Acme`] }), SERVER, {});
+    expect(posture.allowedRoots).toEqual([{ path: repo, label: 'Acme' }]);
   });
 
   it('reads the environment variable too', () => {
@@ -106,7 +106,7 @@ describe('--allow-dir', () => {
 describe('the attachment origin', () => {
   it('defaults to the https origin of the server URL', () => {
     expect(resolveOperatorPosture(options(), SERVER, {}).apiOrigin)
-      .toBe('https://studio.example.com');
+      .toBe('https://app.example.com');
   });
 
   it('takes an explicit --api for split deployments', () => {

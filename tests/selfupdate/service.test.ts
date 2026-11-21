@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detect, parseShow, pinVersion, type DetectDeps } from '../../src/selfupdate/service.js';
 
-const CGROUP = '0::/user.slice/user-1000.slice/user@1000.service/app.slice/ai-bridge-studio.service\n';
-const ENV = '/home/u/.config/ai-bridge-studio.env';
-// What `systemctl show` really prints for a Studio-style unit.
+const CGROUP = '0::/user.slice/user-1000.slice/user@1000.service/app.slice/ai-bridge-acme.service\n';
+const ENV = '/home/u/.config/ai-bridge-acme.env';
+// What `systemctl show` really prints for a bridge installed as a user unit.
 const SHOW = [
   'Restart=always',
   'ExecStart={ path=/usr/bin/env ; argv[]=/usr/bin/env npx --yes @tetrixdev/ai-bridge@${AI_BRIDGE_VERSION} --allow-dir /srv/x --allow-native ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }',
@@ -31,7 +31,7 @@ function deps(over: Partial<DetectDeps> = {}, files: Record<string, string> = { 
 
 describe('is this bridge a service that can update itself', () => {
   it('yes, for a user unit that restarts it, starts the pinned version, and has one env file setting it', () => {
-    expect(detect(deps())).toEqual({ managed: { kind: 'systemd', scope: 'user', unit: 'ai-bridge-studio.service', envFile: ENV } });
+    expect(detect(deps())).toEqual({ managed: { kind: 'systemd', scope: 'user', unit: 'ai-bridge-acme.service', envFile: ENV } });
   });
 
   it('a system unit is recognised as one, and on-failure restarts count', () => {
@@ -86,10 +86,10 @@ describe('pinning the version in the env file', () => {
   it('changes that line only, records the previous version, and keeps the file mode', () => {
     dir = mkdtempSync(join(tmpdir(), 'pin-'));
     const file = join(dir, 'b.env');
-    writeFileSync(file, '# Studio\nAI_BRIDGE_SERVER=wss://x\nAI_BRIDGE_TOKEN=secret\nAI_BRIDGE_VERSION=0.24.0\nOTHER=1\n');
+    writeFileSync(file, '# Acme\nAI_BRIDGE_SERVER=wss://x\nAI_BRIDGE_TOKEN=secret\nAI_BRIDGE_VERSION=0.24.0\nOTHER=1\n');
     chmodSync(file, 0o600);
     pinVersion(file, '0.25.1', '0.24.0');
-    expect(readFileSync(file, 'utf8')).toBe('# Studio\nAI_BRIDGE_SERVER=wss://x\nAI_BRIDGE_TOKEN=secret\nAI_BRIDGE_VERSION=0.25.1\nOTHER=1\nAI_BRIDGE_PREVIOUS_VERSION=0.24.0\n');
+    expect(readFileSync(file, 'utf8')).toBe('# Acme\nAI_BRIDGE_SERVER=wss://x\nAI_BRIDGE_TOKEN=secret\nAI_BRIDGE_VERSION=0.25.1\nOTHER=1\nAI_BRIDGE_PREVIOUS_VERSION=0.24.0\n');
     expect(statSync(file).mode & 0o777).toBe(0o600);
     pinVersion(file, '0.24.0', '0.25.1');
     expect(readFileSync(file, 'utf8')).toContain('AI_BRIDGE_VERSION=0.24.0\nOTHER=1\nAI_BRIDGE_PREVIOUS_VERSION=0.25.1\n');

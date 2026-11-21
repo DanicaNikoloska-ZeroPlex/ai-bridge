@@ -121,7 +121,7 @@ describe('createTaskOutputWatch()', () => {
 
   it('watches a helper\'s command, and one moved to the background after it started, the same way', async () => {
     // A helper's command holds the turn open like the main assistant's, so its
-    // progress counts the same (D09379). And a command the model ran in the
+    // progress counts the same. And a command the model ran in the
     // foreground is moved to the background when it outlives its tool timeout:
     // its task_started still says is_backgrounded false, and only the reply
     // naming an output file says it now runs in the background.
@@ -237,7 +237,7 @@ describe('an input turn waiting on a background command', () => {
     }
   }, 15_000);
 
-  it('is not stopped while a helper\'s command keeps writing output either (D09379)', async () => {
+  it('is not stopped while a helper\'s command keeps writing output either', async () => {
     const path = join(scratch(), 'b1.output');
     const stop = grow(path, 10_000);
     try {

@@ -75,15 +75,15 @@ describe('remembering', () => {
 
 describe('surviving a restart', () => {
   it('reads back what a previous run recorded', () => {
-    new SessionWorkingDirs(500, store).remember('sess-1', '/repos/studio');
+    new SessionWorkingDirs(500, store).remember('sess-1', '/repos/acme-app');
 
     // A fresh process.
-    expect(new SessionWorkingDirs(500, store).get('sess-1')).toBe('/repos/studio');
+    expect(new SessionWorkingDirs(500, store).get('sess-1')).toBe('/repos/acme-app');
   });
 
   it('reads back a forget too', () => {
     const first = new SessionWorkingDirs(500, store);
-    first.remember('sess-1', '/repos/studio');
+    first.remember('sess-1', '/repos/acme-app');
     first.forget('sess-1');
 
     expect(new SessionWorkingDirs(500, store).get('sess-1')).toBeUndefined();

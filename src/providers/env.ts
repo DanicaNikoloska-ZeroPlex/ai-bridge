@@ -245,7 +245,8 @@ export const BRIDGE_ENV_KEYS: Record<string, { default?: string }> = {
    * `disabled_by_env_var` from `disabled_by_setting` (`autoMemoryEnabled`), so
    * setting it does take effect. What is still NOT established is the write
    * path — the memory directory is configurable
-   * (CLAUDE_CODE_REMOTE_MEMORY_DIR, CLAUDE_COWORK_MEMORY_PATH_OVERRIDE) and
+   * (CLAUDE_CODE_REMOTE_MEMORY_DIR, CLAUDE_COWORK_MEMORY_PATH_OVERRIDE: both
+   * are Claude Code's own variables, read by the CLI itself) and
    * none existed to inspect on the machine this was built on. That gap bounds
    * what can be claimed about WHERE notes would otherwise land; it does not
    * change the decision to keep them off.
