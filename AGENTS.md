@@ -32,9 +32,11 @@ Node 22 or newer (CI runs 22 and 24).
   through the space that sealed them (`src/local/`), and are redacted from
   everything sent out: tool text, `ui.result`, `mcp_result`, error messages and
   frames. Upstream OAuth tokens and the PKCE verifier never reach the server.
-  Never log full request or response payloads by default. Decisions 0004, 0010.
+  A machine secret's value (`src/secrets/`) only travels in: no frame, log
+  line, error or `aib secret` command prints one. Never log full request or
+  response payloads by default. Decisions 0004, 0010, 0020.
 - **The server cannot widen what the operator allowed.** `--allow-dir`,
-  `--allow-native`, `--allow-web-search`, `--local-tools` and `--mcp-upstreams`
+  `--allow-native`, `--allow-web-search`, `--local-tools`, `--machine-secrets` and `--mcp-upstreams`
   are operator choices; no frame or field turns one on. A request outside them is refused, or falls
   back to `isolated` with a log line. Decisions 0004, 0006.
 - **Refuse, do not silently correct or fall back.** A path, value or call the
@@ -65,7 +67,7 @@ Node 22 or newer (CI runs 22 and 24).
 
 | Path | What |
 |---|---|
-| `src/cli.ts` | Entry point: options, env vars, `install` / `list` / `uninstall` / `claude-token` / `claude-login` |
+| `src/cli.ts` | Entry point: options, env vars, `install` / `list` / `uninstall` / `claude-token` / `claude-login` (and `secret`, from `src/secrets/cli.ts`) |
 | `src/bridge.ts` | The WebSocket client: handshake, routing every frame, turn lifecycle |
 | `src/protocol/` | Frame types and `PROTOCOL_VERSION` |
 | `src/providers/` | One adapter per CLI (`claude.ts`, `codex.ts`, `gemini.ts`), spawn env, timeouts, usage |
@@ -76,6 +78,7 @@ Node 22 or newer (CI runs 22 and 24).
 | `src/local/` | Local tools: Engram device client, vault decryption, sandbox, scrubbing |
 | `src/apps/` | Engram app backends: supervisor, network and code fence, egress relay |
 | `src/spacefiles/` | Space files kept on this machine |
+| `src/secrets/` | Machine secrets: the store in `~/.ai-bridge/secrets`, the `secret_*` frames, `aib secret` |
 | `src/selfupdate/` | Following `desired_bridge_version` under systemd |
 | `src/service/` | Installing bridges as systemd user services / launch agents |
 | `tests/` | Vitest suites mirroring `src/`; `tests/manual/` and `tests/live/` are opt-in |
@@ -103,6 +106,7 @@ Node 22 or newer (CI runs 22 and 24).
 - 0017 The Claude token file may hold several named tokens and is read for every run.
 - 0018 Claude sign-in profiles, saved back before every switch.
 - 0019 The repository names no downstream project (CI: `scripts/check-names.py`); history is kept, `.mailmap` maps it.
+- 0020 Machine secrets: a built-in store, managed by a server only with `--machine-secrets`.
 
 Full records and status: [docs/decisions/README.md](docs/decisions/README.md).
 Before changing what one covers, read it; if your change contradicts an

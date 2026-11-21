@@ -21,6 +21,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Tool Calls](#tool-calls)
 - [MCP Apps](#mcp-apps)
 - [Upstream sign-in (OAuth)](#upstream-sign-in-oauth)
+- [Secrets on the machine](#secrets-on-the-machine)
 - [Heartbeat](#heartbeat)
 - [Error Handling](#error-handling)
 - [Provider Reference](#provider-reference)
@@ -328,6 +329,22 @@ This bridge implements [upstream sign-in (OAuth)](#upstream-sign-in-oauth). Abse
 ```
 
 This bridge keeps a server's [space files](#space-files) (`files_write`, `files_read`, `files_move`, `files_purge`); the number is the revision of those frames. Advertised whatever the allow-list says; a bridge with no allowed folder refuses each with `files_no_folder`. Absent from a bridge that predates it: a server tells the person to update it and sends none of the frames.
+
+#### Additive field: `machine_secrets`
+
+```json
+{ "type": "hello", "...": "...", "machine_secrets": { "revision": 2 } }
+```
+
+The operator started this bridge with `--machine-secrets`, so it answers the [secret frames](#secrets-on-the-machine) (`secret_list`, `secret_put`, `secret_describe`, `secret_remove`) from its own store; `revision` versions their shape. Absent when the operator did not, and from a bridge that predates it: a server must not send the `secret_*` frames (it tells the person machine secrets are not on for this machine), and a bridge that receives one anyway answers `machine_secrets_unsupported`.
+
+#### Additive field: `bridge_prompt_max_bytes`
+
+```json
+{ "type": "hello", "...": "...", "bridge_prompt_max_bytes": 16384 }
+```
+
+The longest [`bridge_prompt.text`](#bridge-prompt) this bridge accepts, in UTF-8 bytes. Absent from a bridge that predates it, which accepts 8192: a server keeps the text within 8 KB unless it sees this field.
 
 #### Additive field: `app_network`
 
@@ -1189,7 +1206,7 @@ Validation is strict, and a contradictory spec is refused with `bridge_prompt_in
 | `append` | absent or empty | **Refused.** Says it is adding something and adds nothing. |
 | `replace` | absent or empty | **Refused.** Would silently mean `off`. |
 
-Server-supplied text is capped at 8 KB. A cap with a clear refusal beats a `spawn E2BIG` at launch, which surfaces as a turn that failed for no visible reason.
+Server-supplied text is capped at 16 KB, announced in `hello.bridge_prompt_max_bytes` (bridges before that field: 8 KB). A cap with a clear refusal beats a `spawn E2BIG` at launch, which surfaces as a turn that failed for no visible reason.
 
 **The addendum is generated from the resolved environment, not shipped as a fixed string.** If a project uses `bridge_env` to turn background work back on, an addendum still saying the capability is disabled would be lying to the model about something it can observe directly in its own tool schema. The lifecycle bullets change with the configuration; "one process per turn, nothing survives it" is stated either way, because it is true either way.
 
@@ -2622,6 +2639,77 @@ answer.
 
 ---
 
+## Secrets on the machine
+
+Off unless the bridge's operator turns it on. With `--machine-secrets` (or
+`AI_BRIDGE_MACHINE_SECRETS=1`; `ai-bridge install --machine-secrets` records it)
+a server can manage the bridge's own secret store on this machine for the
+person: list it, add or replace a secret, change a description, remove one. It
+can never read a value back. The bridge announces it in `hello` as
+`"machine_secrets": {"revision": 2}`. Without the flag there is no
+`machine_secrets` in `hello`, the startup log says
+`Machine secrets: off (no --machine-secrets)`, and every `secret_*` frame is
+answered `machine_secrets_unsupported`.
+
+The store is `~/.ai-bridge/secrets/` (`src/secrets/store.ts`): one file per
+secret, named like the secret, and `index.json` with descriptions and dates.
+The person on the machine uses the same store with `aib secret ...` (README,
+"Machine secrets"); that works with or without the flag.
+
+### Frames
+
+| Server → Bridge | The bridge |
+|---|---|
+| `secret_list {id}` | lists the store: names, descriptions, dates |
+| `secret_put {id, name, value, description?, replace?}` | refuses an existing name with `exists` unless `replace` is `true`; then writes the value (a new file, mode 0600, renamed into place). A replace without `description` keeps the old one |
+| `secret_describe {id, name, description}` | sets the description; `""` clears it |
+| `secret_remove {id, name}` | deletes the secret and its description |
+
+Each is answered exactly once with
+`secret_result {id, ok, secrets?, replaced?, code?, error?}`:
+
+- `secrets` (list only): `[{name, description, updated_at}]`, `description` a
+  string or `null`, `updated_at` when the value was last written (ISO 8601).
+  Never a value.
+- `replaced` (a successful put): whether an existing secret was overwritten.
+- `code` and `error` when `ok` is false; `error` is a sentence for the person
+  and never holds a value.
+
+| Code | Meaning |
+|---|---|
+| `machine_secrets_unsupported` | The bridge was not started with `--machine-secrets`. |
+| `store_unavailable` | The store folder is unsafe or unreadable: a symlink, not owned by the bridge's user, open to the group or others, or a secret that is not a regular file. The error says which; the bridge never repairs it. |
+| `not_found` | No secret by that name. |
+| `exists` | The name is taken and `replace` was not `true`. |
+| `invalid_name` | The name broke the rules below. |
+| `invalid_request` | A missing or empty value, a value over 64 KiB, a description over 1000 characters or holding a NUL. |
+| `timeout` | The store did not answer within 15 s. It may still finish: **the result is unknown, list again before retrying.** |
+| `failed` | Anything else (a full disk, the folder busy for more than 5 s). |
+
+**Revision 2: a replace is always deliberate.** A revision-1 bridge replaced
+silently and never answered `replaced`; a server must not send `replace` to
+it.
+
+### Rules the bridge holds
+
+- **Names:** 1 to 64 characters `[A-Za-z0-9._-]`, starting with a letter or
+  digit, never `..`, never `index.json`, no path separator, no trailing
+  newline.
+- **Descriptions:** at most 1000 characters, counted in code points (as the
+  server counts them); no NUL.
+- **The value only travels in.** It is written to its file with mode 0600 from
+  creation (a temp file opened `O_EXCL` with mode 0600 in the store folder,
+  fsynced, renamed). It is never logged (only the operation, the name and the
+  outcome are), never in an answer, and scrubbed from any error text.
+- **The folder is checked on every operation:** a directory, not a symlink,
+  owned by the bridge's user, mode 0700 (created so when missing).
+
+The value travels from the server's web application to the server's own
+bridge-facing process before it reaches the bridge, so on the server side that
+hop should be local or https and kept out of request recorders.
+
+---
+
 ## Heartbeat
 
 Keeps the WebSocket alive and detects dead connections.
@@ -2670,7 +2758,7 @@ The server also tracks heartbeats. If no `ping` is received for 2x the heartbeat
 | `working_dir_not_allowed` | The `working_dir` is not inside a root the operator permitted with `--allow-dir` (or none were permitted). Also emitted on a turn that named NOTHING, when the directory its CLI session is remembered in has since been revoked | Operator restarts the bridge with `--allow-dir`, or the server offers only the `workspaces` from `hello`. Terminal: `done` follows |
 | `working_dir_not_found` | The named `working_dir` is inside an allowed root but does not exist, or is not a directory. The bridge never creates it | Check the path. Terminal: `done` follows |
 | `working_dir_changed` | A resume named a different directory from the one its CLI session was started in | Server starts a fresh session deliberately. Terminal: `done` follows |
-| `bridge_prompt_invalid` | The `bridge_prompt` contradicts itself — text with a mode that discards it, `append`/`replace` with nothing to add, an unknown mode, or text over the 8 KB cap | Server fixes the field. Terminal: `done` follows |
+| `bridge_prompt_invalid` | The `bridge_prompt` contradicts itself — text with a mode that discards it, `append`/`replace` with nothing to add, an unknown mode, or text over the cap (`hello.bridge_prompt_max_bytes`, else 8 KB) | Server fixes the field. Terminal: `done` follows |
 | `attachment_refused` | An attachment URL is not on the connected server's origin, or is not HTTPS | Server fixes the URL (or the operator sets `--api`). Terminal: `done` follows |
 | `attachment_too_large` | An attachment exceeds the per-file, per-request or count cap (all three are reported in `hello` as `attachment_limits`) | Server sends a smaller file, or the operator raises `--attachment-max-mb` / `--attachment-total-mb` / `--attachment-max-count`. Terminal: `done` follows |
 | `attachment_failed` | An attachment could not be downloaded — including one that stalled or ran past the per-file ceiling — or failed its size/checksum verification | Retry; for a stall or ceiling on a slow link, the operator raises `--attachment-stall-seconds` / `--attachment-timeout-minutes`. Terminal: `done` follows |
@@ -2839,6 +2927,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `upstream_status` | After `welcome`, and whenever an upstream's state, auth or tool count changes |
 | `upstream_auth_required` | An OAuth upstream needs the person to sign in: a link to open |
 | `upstream_auth_result` | Answering an `upstream_auth_code` (or a failed `upstream_auth_start`) |
+| `secret_result` | Answering a `secret_*` frame (never carries a value) |
 | `cancelled` | A turn stopped because the server asked |
 | `local_result` | Answering a `local_call`, run or refused |
 | `error` | Request-level error (non-streaming) |
@@ -2865,6 +2954,7 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `upstream_auth_start` | The person asked to (re)connect an OAuth upstream |
 | `upstream_auth_code` | The sign-in redirect's parameters, passed on |
 | `upstream_auth_forget` | Forget an OAuth upstream's tokens on this bridge |
+| `secret_list` / `secret_put` / `secret_describe` / `secret_remove` | Manage the bridge's secret store on the machine (`hello.machine_secrets`) |
 
 ---
 
@@ -2932,6 +3022,10 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Web search does not bump the version.** `hello.web_search` and `options.web_search` are additive: an older bridge ignores the option (the turn runs without web search, as before), and an older server ignores the field. A server must not send the option to a bridge without `hello.web_search`.
 
 **Per-turn isolation does not bump the version.** `hello.turn_isolation` and `ai_request.cli_isolation` are additive; a server must not send the field to a bridge that did not advertise `turn_isolation`, since an older one ignores it and runs the turn with the connection's posture.
+
+**Machine secrets do not bump the version.** `hello.machine_secrets`, the four `secret_*` frames and `secret_result` are additive; their shape is versioned by `hello.machine_secrets.revision`, and a server must not send a `secret_*` frame to a bridge without it.
+
+**The larger prompt cap does not bump the version.** `hello.bridge_prompt_max_bytes` is additive; a server keeps `bridge_prompt.text` within 8 KB for a bridge without it.
 
 **The network and code fences do not bump the version.** `hello.app_network` and `hello.app_code` only say what a bridge holds; nothing is sent differently, and an older server ignores them.
 

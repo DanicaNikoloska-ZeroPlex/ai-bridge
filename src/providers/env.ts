@@ -322,8 +322,11 @@ function backgroundTasksEnabled(values: Record<string, string | null>): boolean 
   return raw === '0' || raw.toLowerCase() === 'false';
 }
 
-/** Longest server-supplied addendum the bridge will carry. */
-export const MAX_BRIDGE_PROMPT_BYTES = 8 * 1024;
+/**
+ * Longest server-supplied addendum the bridge will carry, announced in hello as
+ * `bridge_prompt_max_bytes`. Bridges before that field took 8 KB.
+ */
+export const MAX_BRIDGE_PROMPT_BYTES = 16 * 1024;
 
 /** Stream-event error code for a `bridge_prompt` the bridge will not act on. */
 export const BRIDGE_PROMPT_INVALID = 'bridge_prompt_invalid';

@@ -305,6 +305,17 @@ export interface HelloMessage {
    */
   mcp_upstream_auth?: { revision: number };
   /**
+   * The operator started this bridge with `--machine-secrets`: it answers the
+   * `secret_*` frames from its own store (src/secrets/store.ts).
+   * Absent otherwise; a server must not send those frames to a bridge without it.
+   */
+  machine_secrets?: { revision: number };
+  /**
+   * The largest `bridge_prompt.text` this bridge accepts, in UTF-8 bytes
+   * (16384). Absent from older bridges, which accept 8192.
+   */
+  bridge_prompt_max_bytes?: number;
+  /**
    * This bridge keeps an Engram space's files (`files_write`, `files_read`,
    * `files_move`, `files_purge`, answered with `files_result`) under
    * `<first allowed folder>/files/<space>/`. The number is the revision of
@@ -675,7 +686,8 @@ export type BridgeToServerMessage =
   | UploadDoneMessage
   | FileReadResultMessage
   | AppResultMessage
-  | FilesResultMessage;
+  | FilesResultMessage
+  | SecretResultMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Bridge Messages
@@ -1377,7 +1389,56 @@ export type ServerToBridgeMessage =
   | FilesWriteMessage
   | FilesReadMessage
   | FilesMoveMessage
-  | FilesPurgeMessage;
+  | FilesPurgeMessage
+  | SecretListMessage
+  | SecretPutMessage
+  | SecretDescribeMessage
+  | SecretRemoveMessage;
+
+// ---------------------------------------------------------------------------
+// Machine secrets (PROTOCOL.md, "Secrets on the machine"; src/secrets/store.ts)
+// ---------------------------------------------------------------------------
+
+export interface SecretListMessage {
+  type: 'secret_list';
+  id: string;
+}
+
+/** Add a secret; `replace: true` to overwrite one. `value` is written to the store, never logged. */
+export interface SecretPutMessage {
+  type: 'secret_put';
+  id: string;
+  name: string;
+  value: string;
+  description?: string;
+  replace?: boolean;
+}
+
+export interface SecretDescribeMessage {
+  type: 'secret_describe';
+  id: string;
+  name: string;
+  description: string;
+}
+
+export interface SecretRemoveMessage {
+  type: 'secret_remove';
+  id: string;
+  name: string;
+}
+
+/** The one answer to each `secret_*` frame. Never carries a value. */
+export interface SecretResultMessage {
+  type: 'secret_result';
+  id: string;
+  ok: boolean;
+  /** `secret_list` only. */
+  secrets?: Array<{ name: string; description: string | null; updated_at: string | null }>;
+  /** A successful `secret_put`: whether an existing secret was overwritten. */
+  replaced?: boolean;
+  code?: string;
+  error?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Space files (PROTOCOL.md, "Space files"; src/spacefiles/store.ts)

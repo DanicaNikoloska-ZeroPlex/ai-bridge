@@ -206,3 +206,13 @@ describe('the attachment store', () => {
     expect(a).not.toBe(b);
   });
 });
+
+describe('machine secrets (--machine-secrets, decision 0020)', () => {
+  it('are off without the flag', () => {
+    expect(resolveOperatorPosture(options(), SERVER, {}).machineSecrets).toBe(false);
+  });
+
+  it('are on with it', () => {
+    expect(resolveOperatorPosture(options({ machineSecrets: true }), SERVER, {}).machineSecrets).toBe(true);
+  });
+});
