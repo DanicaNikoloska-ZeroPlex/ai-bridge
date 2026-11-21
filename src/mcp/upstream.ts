@@ -608,9 +608,11 @@ export class UpstreamHub {
   private async refreshOne(c: Conn, client: Client): Promise<void> {
     if (c.refreshing || c.client !== client || this.closed) return;
     c.refreshing = true;
+    // A list installed meanwhile (tools/list_changed, a reconnect) is newer than this read.
+    const startedWith = c.tools;
     try {
       const tools = await this.listAllTools(client, c);
-      if (c.client !== client || this.closed) return;
+      if (c.client !== client || this.closed || c.tools !== startedWith) return;
       const key = (list: UpstreamTool[]) => JSON.stringify(list.map((t) => [t.name, t.description ?? '', t.inputSchema, t._meta ?? null]));
       if (key(tools) === key(c.tools)) return;
       const before = new Set(c.tools.map((t) => t.name));
@@ -624,7 +626,11 @@ export class UpstreamHub {
       this.options.onToolsChanged?.();
       this.statusMaybeChanged();
     } catch (err) {
-      log.warn('upstream tools refresh failed; keeping the previous list', { name: c.name, error: err instanceof Error ? err.message : String(err) });
+      if (err instanceof NeedsAuthError) {
+        if (c.client === client && !this.closed) this.enterNeedsAuth(c, err.reason);
+        return;
+      }
+      log.warn('upstream tools refresh failed; keeping the previous list', { name: c.name, error: scrub(err instanceof Error ? err.message : String(err), this.secretsOf(c)) });
     } finally {
       c.refreshing = false;
     }

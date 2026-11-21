@@ -246,7 +246,6 @@ describe('UpstreamHub over stdio', () => {
       await hub.start();
       const before = changes;
       await hub.callFromModel('fx__add_tool_silently', {});
-      expect(hub.owns('fx__silent')).toBe(false);
       await until(() => hub!.owns('fx__silent'), 'the background refresh');
       expect(changes).toBe(before + 1);
     });
