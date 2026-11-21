@@ -1,0 +1,9 @@
+# Maps earlier commit identities to the ones in use now, for git log,
+# git shortlog and git blame (see gitmailmap(5)). History itself is unchanged.
+
+jfbauer <jasper@tetrix.dev> <jasper@zeroplex.nl>
+Contributor <contributor@noreply.tetrix.dev> <danica.nikoloska@zeroplex.nl>
+Contributor <contributor@noreply.tetrix.dev> <dragan.jovanov@zeroplex.nl>
+Contributor <contributor@noreply.tetrix.dev> <bart.luttels@zeroplex.nl>
+Contributor <contributor@noreply.tetrix.dev> <47848930+DraganJovanov-ZeroPlex@users.noreply.github.com>
+Contributor <contributor@noreply.tetrix.dev> <306558457+zeroplex-studio-internal[bot]@users.noreply.github.com>

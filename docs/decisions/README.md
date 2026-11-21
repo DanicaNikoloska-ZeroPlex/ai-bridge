@@ -26,3 +26,4 @@ history. Format: Engram documentation standard v1, section 3.
 | [0016](0016-with-the-operators-opt-in-a-request-may-add-web-search.md) | With --allow-web-search, a request may add Claude's built-in WebSearch, and only it, to an isolated turn | accepted | 2026-11-14 |
 | [0017](0017-claude-token-file-read-per-run.md) | The Claude token file may hold several named tokens and is read for every run | accepted | 2026-11-15 |
 | [0018](0018-claude-sign-in-profiles-saved-back-before-a-switch.md) | Claude sign-in profiles, saved back before every switch | accepted | 2026-11-15 |
+| [0019](0019-the-repository-names-no-downstream-project.md) | The repository names no downstream project; history is kept and mapped | accepted | 2026-11-21 |
