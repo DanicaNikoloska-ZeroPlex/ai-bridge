@@ -820,7 +820,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     // stale first (D10067), so a server's new tools show without a reconnect.
     if (this.upstream) {
       const upstream = this.upstream;
-      this.mcpServer.setBeforeListTools(() => upstream.refreshTools());
+      // An isolated connection offers no upstream tools (registerBridgeTools), so it never waits for them.
+      this.mcpServer.setBeforeListTools(async () => {
+        if (this.cliIsolation !== 'isolated') await upstream.refreshTools();
+      });
     }
 
   }

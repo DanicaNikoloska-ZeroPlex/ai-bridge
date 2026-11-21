@@ -133,7 +133,8 @@ export class BridgeMcpServer {
     );
 
     server.setRequestHandler(ListToolsRequestSchema, async (): Promise<ListToolsResult> => {
-      if (this.beforeListTools) {
+      // A turn held to the server's tools never sees upstream tools: nothing to refresh for it.
+      if (this.beforeListTools && !this.callContext.getStore()?.serverToolsOnly) {
         await this.beforeListTools().catch((err) => log.warn('refresh before tools/list failed', { error: err instanceof Error ? err.message : String(err) }));
       }
       const ctx = this.callContext.getStore();

@@ -290,6 +290,18 @@ describe('UpstreamHub over stdio', () => {
       await until(() => hub!.owns('fx__silent'), 'the background refresh');
     });
 
+    it('does not make a second turn wait for a re-read that is already in flight', async () => {
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 20 } as Partial<UpstreamConfig>) });
+      await hub.start();
+      await hub.callFromModel('fx__slow_lists', { ms: 800 });
+      await new Promise((r) => setTimeout(r, 40));
+      const first = hub.refreshTools(200);
+      const t0 = Date.now();
+      await hub.refreshTools(200);
+      expect(Date.now() - t0).toBeLessThan(100);
+      await first;
+    });
+
     it('keeps the list when the refresh fails', async () => {
       hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 20, timeout_ms: 100 } as Partial<UpstreamConfig>) });
       await hub.start();

@@ -584,8 +584,11 @@ export class UpstreamHub {
    * Called when a turn asks for the tool list: re-read every connected server's
    * list that is older than its `tools_refresh_ms`, so tools a server added or
    * withdrew since (often a permission change) show in this turn. Waits at most
-   * `budgetMs`; a slower re-read finishes in the background and the next turn
-   * sees it. A failed re-read keeps the old list and the connection. Never throws.
+   * `budgetMs`, and only for re-reads THIS call started: a turn that finds one
+   * already in flight (a slow upstream) answers at once with the stored list
+   * instead of waiting again. A slower re-read finishes in the background and a
+   * later turn sees it. A failed re-read keeps the old list and the connection.
+   * Never throws.
    */
   async refreshTools(budgetMs = TOOLS_REFRESH_BUDGET_MS): Promise<void> {
     const now = Date.now();
@@ -593,8 +596,9 @@ export class UpstreamHub {
       const every = c.cfg.tools_refresh_ms ?? DEFAULT_TOOLS_REFRESH_MS;
       return c.client !== null && every > 0 && now - c.listedAt >= every;
     });
-    if (due.length === 0) return;
-    const all = Promise.all(due.map((c) => (c.refreshing ??= this.refreshOne(c).finally(() => { c.refreshing = null; }))));
+    const started = due.filter((c) => c.refreshing === null);
+    if (started.length === 0) return;
+    const all = Promise.all(started.map((c) => (c.refreshing = this.refreshOne(c).finally(() => { c.refreshing = null; }))));
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([all, new Promise<void>((r) => { timer = setTimeout(r, budgetMs); timer.unref?.(); })]);
     if (timer) clearTimeout(timer);

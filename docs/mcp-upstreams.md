@@ -168,7 +168,7 @@ A view may only read `ui://` resources of its own server.
   **stay listed**, and the next use reconnects at once rather than waiting for
   the backoff. An error the server itself answered keeps the connection.
 - A slow request times out after `timeout_ms` (`timeout`); the connection is kept.
-- `notifications/tools/list_changed` refreshes that server's tools. Without one, a turn that starts re-reads a list older than `tools_refresh_ms` (default one minute), so tools a server added or withdrew later (for example after a permission change) show in that turn.
+- `notifications/tools/list_changed` refreshes that server's tools. Without one, a turn that starts re-reads a list older than `tools_refresh_ms` (default one minute), so tools a server added or withdrew later (for example after a permission change) show in that turn. Only the turn that starts a re-read waits for it, at most 3 seconds; when the server is slower, that turn and any turn starting meanwhile get the stored list, and the new tools show in the first turn after the read finishes. A failed re-read keeps the stored list and is tried again one interval later, so a new tool can then take up to `tools_refresh_ms` longer to appear. Turns held to the server's own tools, and an isolated connection, never wait for this.
 - Stopping the bridge stops every stdio server it started.
 
 Upstream tools are offered only when the web application runs the CLI in
