@@ -47,6 +47,16 @@ describe('parseUpstreamConfig', () => {
     expect(parseUpstreamConfig({ a: { url: 'https://h/mcp' } })).toEqual({ a: { url: 'https://h/mcp' } });
   });
 
+  it('reads tools_refresh_ms and refuses a bad one', () => {
+    expect(parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: 0 } })['a']).toMatchObject({ tools_refresh_ms: 0 });
+    expect(() => parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: -1 } })).toThrow(/tools_refresh_ms/);
+    expect(() => parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: '60' } })).toThrow(/tools_refresh_ms/);
+    expect(() => parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: 60 } })).toThrow(/milliseconds/);
+    expect(() => parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: 86_400_001 } })).toThrow(/1 day/);
+    expect(parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: 5000 } })['a']).toMatchObject({ tools_refresh_ms: 5000 });
+    expect(parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: 86_400_000 } })['a']).toMatchObject({ tools_refresh_ms: 86_400_000 });
+  });
+
   it('keeps env/vault references and literal non-secrets', () => {
     const cfg = parseUpstreamConfig({ mcpServers: {
       gh: { url: 'https://h/mcp', headers: { Authorization: { env: 'GH_TOKEN', prefix: 'Bearer ' }, 'X-Org': 'acme' } },
@@ -227,6 +237,56 @@ describe('UpstreamHub over stdio', () => {
     await hub.callFromModel('fx__add_tool', {});
     await until(() => hub!.owns('fx__added'), 'the added tool');
     expect(changes).toBeGreaterThan(before);
+  });
+
+  describe('background refresh of tool lists (D10067)', () => {
+    it('shows a tool the server added without tools/list_changed after the next background read', async () => {
+      let changes = 0;
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 50 } as Partial<UpstreamConfig>) }, { onToolsChanged: () => { changes++; } });
+      await hub.start();
+      const before = changes;
+      await hub.callFromModel('fx__add_tool_silently', {});
+      await until(() => hub!.owns('fx__silent'), 'the background refresh');
+      expect(changes).toBe(before + 1);
+    });
+
+    it('never refreshes with tools_refresh_ms 0', async () => {
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 0 } as Partial<UpstreamConfig>) });
+      await hub.start();
+      await hub.callFromModel('fx__add_tool_silently', {});
+      await new Promise((r) => setTimeout(r, 200));
+      expect(hub.owns('fx__silent')).toBe(false);
+    });
+
+    it('does not report a change when the list is the same', async () => {
+      let changes = 0;
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 30 } as Partial<UpstreamConfig>) }, { onToolsChanged: () => { changes++; } });
+      await hub.start();
+      const before = changes;
+      await new Promise((r) => setTimeout(r, 200));
+      expect(changes).toBe(before);
+    });
+
+    it('keeps the list and the connection while reads are slow or fail, and catches up afterwards', async () => {
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 30, timeout_ms: 100 } as Partial<UpstreamConfig>) });
+      await hub.start();
+      await hub.callFromModel('fx__slow_lists', { ms: 400 });
+      await hub.callFromModel('fx__add_tool_silently', {});
+      await new Promise((r) => setTimeout(r, 300));
+      expect(hub.owns('fx__plain')).toBe(true);
+      expect(hub.owns('fx__silent')).toBe(false);
+      await hub.callFromModel('fx__slow_lists', { ms: 0 });
+      await until(() => hub!.owns('fx__silent'), 'the refresh after reads are fast again');
+    });
+
+    it('stops refreshing when closed', async () => {
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 20 } as Partial<UpstreamConfig>) });
+      await hub.start();
+      await hub.close();
+      await new Promise((r) => setTimeout(r, 100));
+      expect(hub.status()['fx']?.connected).toBe(false);
+      hub = null;
+    });
   });
 
   it('starts a stdio server with only the safe environment plus what the config names, and redacts secrets', async () => {
