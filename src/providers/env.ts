@@ -246,7 +246,7 @@ export const BRIDGE_ENV_KEYS: Record<string, { default?: string }> = {
    * setting it does take effect. What is still NOT established is the write
    * path — the memory directory is configurable
    * (CLAUDE_CODE_REMOTE_MEMORY_DIR, CLAUDE_COWORK_MEMORY_PATH_OVERRIDE: both
-   * are Claude Code's own variables, read by the CLI itself) and
+   * Claude Code's own, found in its CLI binary, 2.1.325) and
    * none existed to inspect on the machine this was built on. That gap bounds
    * what can be claimed about WHERE notes would otherwise land; it does not
    * change the decision to keep them off.

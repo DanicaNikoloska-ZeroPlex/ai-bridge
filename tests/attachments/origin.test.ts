@@ -94,7 +94,7 @@ describe('assertAllowedAttachmentUrl', () => {
   });
 
   it('refuses userinfo used to fake the host', () => {
-    // https://app.example.com@evil.com/ has host evil.com, not app.
+    // https://app.example.com@evil.com/ has host evil.com, not app.example.com.
     expect(() => assertAllowedAttachmentUrl('https://app.example.com@evil.com/x', origin))
       .toThrow(/not the server this bridge is connected to/);
   });
