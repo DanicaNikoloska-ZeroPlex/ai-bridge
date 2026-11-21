@@ -113,7 +113,6 @@ export class BridgeMcpServer {
     this.handleCall = handleCall;
   }
 
-
   /**
    * Build a fresh per-request server + transport. The Streamable HTTP SDK is
    * designed to be instantiated per HTTP request in stateless mode — a single

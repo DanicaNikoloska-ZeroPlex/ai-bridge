@@ -69,6 +69,9 @@ export const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
  * never waits for it: tools/list always answers from the stored list.
  */
 export const DEFAULT_TOOLS_REFRESH_MS = 60_000;
+/** Bounds for tools_refresh_ms (milliseconds), 0 aside: at least 5 s, at most 1 day. */
+export const MIN_TOOLS_REFRESH_MS = 5_000;
+export const MAX_TOOLS_REFRESH_MS = 86_400_000;
 /** Reconnect backoff: first wait, doubled each failure, capped. */
 export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_MAX_MS = 60_000;
@@ -90,7 +93,8 @@ interface UpstreamCommon {
   connect_timeout_ms?: number;
   /**
    * Re-read the server's tool list in the background this often while connected,
-   * in ms. Default 60000; 0 = only on connect and on tools/list_changed.
+   * in MILLISECONDS (60000 = one minute). Default 60000; 0 = only on connect and on
+   * tools/list_changed; otherwise 5000 to 86400000.
    */
   tools_refresh_ms?: number;
 }
@@ -219,7 +223,11 @@ export function parseUpstreamConfig(doc: unknown): Record<string, UpstreamConfig
     if (ct !== undefined) common.connect_timeout_ms = ct;
     const tr = c['tools_refresh_ms'];
     if (tr !== undefined) {
-      if (typeof tr !== 'number' || !Number.isInteger(tr) || tr < 0) throw new Error(`${where}: tools_refresh_ms must be a whole number of milliseconds, 0 or more`);
+      // Milliseconds. Bounded so a unit slip (60 meant as seconds) or a value past
+      // setInterval's 2^31-1 limit (which Node turns into 1 ms) cannot hammer the server.
+      if (typeof tr !== 'number' || !Number.isInteger(tr) || (tr !== 0 && (tr < MIN_TOOLS_REFRESH_MS || tr > MAX_TOOLS_REFRESH_MS))) {
+        throw new Error(`${where}: tools_refresh_ms is in milliseconds: 0 (off) or a whole number from ${MIN_TOOLS_REFRESH_MS} (5 seconds) to ${MAX_TOOLS_REFRESH_MS} (1 day), e.g. 60000 for one minute`);
+      }
       common.tools_refresh_ms = tr;
     }
 

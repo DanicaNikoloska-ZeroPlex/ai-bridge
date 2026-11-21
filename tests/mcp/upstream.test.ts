@@ -51,6 +51,10 @@ describe('parseUpstreamConfig', () => {
     expect(parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: 0 } })['a']).toMatchObject({ tools_refresh_ms: 0 });
     expect(() => parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: -1 } })).toThrow(/tools_refresh_ms/);
     expect(() => parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: '60' } })).toThrow(/tools_refresh_ms/);
+    expect(() => parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: 60 } })).toThrow(/milliseconds/);
+    expect(() => parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: 86_400_001 } })).toThrow(/1 day/);
+    expect(parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: 5000 } })['a']).toMatchObject({ tools_refresh_ms: 5000 });
+    expect(parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: 86_400_000 } })['a']).toMatchObject({ tools_refresh_ms: 86_400_000 });
   });
 
   it('keeps env/vault references and literal non-secrets', () => {

@@ -56,7 +56,7 @@ servers is accepted too):
 | `oauth` | HTTP | With `"auth": "oauth"`, optional: `scope` (space-separated) and `client_name` (default `AI Bridge`). No other keys. |
 | `timeout_ms` | both | Per request (a tool call, a resource read). Default `60000`. |
 | `connect_timeout_ms` | both | Starting and initializing. Default `30000`. |
-| `tools_refresh_ms` | both | While connected, the server's tool list is re-read in the background this often, so tools it added or withdrew (for example after a permission change) show in the next turn without a reconnect. No turn waits for it; a failed read keeps the stored list and is tried again next time. For servers that decide per user which tools they offer and never send `tools/list_changed`. Default `60000`; `0` = only on connect and on `tools/list_changed`. |
+| `tools_refresh_ms` | both | **Milliseconds** (`60000` = one minute). While connected, the server's tool list is re-read in the background this often, so tools it added or withdrew (for example after a permission change) show without a reconnect: in the first turn after the next read, so up to one interval later. No turn waits for it; a failed read keeps the stored list and is tried again next time. For servers that decide per user which tools they offer and never send `tools/list_changed`. Default `60000`; `0` = only on connect and on `tools/list_changed`; otherwise `5000` (5 seconds) to `86400000` (1 day), anything else is refused at start. |
 
 ## Secrets
 
@@ -168,7 +168,7 @@ A view may only read `ui://` resources of its own server.
   **stay listed**, and the next use reconnects at once rather than waiting for
   the backoff. An error the server itself answered keeps the connection.
 - A slow request times out after `timeout_ms` (`timeout`); the connection is kept.
-- `notifications/tools/list_changed` refreshes that server's tools. Without one, the list is re-read in the background every `tools_refresh_ms` (default one minute) while connected, so tools a server added or withdrew later (for example after a permission change) show in the first turn after that read. A turn never waits for it.
+- `notifications/tools/list_changed` refreshes that server's tools. Without one, the list is re-read in the background every `tools_refresh_ms` milliseconds (default `60000`, one minute) while connected, so a tool a server added or withdrew later (for example after a permission change) shows in the first turn after that read: up to one interval after the change. A turn never waits for it.
 - Stopping the bridge stops every stdio server it started.
 
 Upstream tools are offered only when the web application runs the CLI in
