@@ -2682,21 +2682,24 @@ Each is answered exactly once with
 | `not_found` | No secret by that name. |
 | `exists` | The name is taken and `replace` was not `true`. |
 | `invalid_name` | The name broke the rules below. |
-| `invalid_request` | A missing or empty value, a value over 64 KiB, a description over 1000 characters or holding a NUL. |
+| `invalid_request` | A missing or empty value, a value over 64 KiB, a description over 1000 characters or holding a control character other than tab and newline. |
 | `timeout` | The store did not answer within 15 s. It may still finish: **the result is unknown, list again before retrying.** |
 | `failed` | Anything else (a full disk, the folder busy for more than 5 s). |
 
-**Revision 2: a replace is always deliberate.** A revision-1 bridge replaced
-silently and never answered `replaced`; a server must not send `replace` to
-it.
+**Revision 2: a replace is always deliberate.** Revision 1 was an unreleased
+draft that replaced silently and never answered `replaced`; no published
+bridge announces it, and a server should send no `secret_*` frame to a bridge
+below revision 2.
 
 ### Rules the bridge holds
 
 - **Names:** 1 to 64 characters `[A-Za-z0-9._-]`, starting with a letter or
-  digit, never `..`, never `index.json`, no path separator, no trailing
-  newline.
+  digit, never `..`, never `index.json` in any case, no path separator, no
+  trailing newline. A name that differs from an existing one only in case is
+  refused with `exists` (one file on a case-insensitive disk).
 - **Descriptions:** at most 1000 characters, counted in code points (as the
-  server counts them); no NUL.
+  server counts them); no control characters but tab and newline (`aib secret
+  list` prints them to a terminal).
 - **The value only travels in.** It is written to its file with mode 0600 from
   creation (a temp file opened `O_EXCL` with mode 0600 in the store folder,
   fsynced, renamed). It is never logged (only the operation, the name and the

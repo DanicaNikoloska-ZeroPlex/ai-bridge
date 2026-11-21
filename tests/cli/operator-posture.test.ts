@@ -13,7 +13,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
-import { resolveOperatorPosture, type OperatorOptions } from '../../src/cli.js';
+import { resolveOperatorPosture, secretsReachableByTurns, type OperatorOptions } from '../../src/cli.js';
 
 let root: string;
 let repo: string;
@@ -214,5 +214,13 @@ describe('machine secrets (--machine-secrets, decision 0020)', () => {
 
   it('are on with it', () => {
     expect(resolveOperatorPosture(options({ machineSecrets: true }), SERVER, {}).machineSecrets).toBe(true);
+  });
+
+  it('warn when a turn could read the store: an allowed folder above it, or native', () => {
+    const store = '/home/u/.ai-bridge/secrets';
+    expect(secretsReachableByTurns(store, ['/home/u'], false)).toMatch(/--allow-dir \/home\/u/);
+    expect(secretsReachableByTurns(store, ['/home/u/work'], false)).toBeNull();
+    expect(secretsReachableByTurns(store, ['/home/user'], false)).toBeNull();
+    expect(secretsReachableByTurns(store, [], true)).toMatch(/native/);
   });
 });

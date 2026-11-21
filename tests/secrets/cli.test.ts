@@ -82,6 +82,29 @@ describe('aib secret', () => {
     expect(aib(['run', 'k', '--', 'no-such-command-xyz']).code).toBe(127);
   });
 
+  it('run --no-mask lets the output through untouched', () => {
+    aib(['add', 'k'], VALUE);
+    expect(aib(['run', 'k', '--no-mask', '--', 'sh', '-c', 'cat "$SECRET_FILE"']).out).toBe(VALUE);
+  });
+
+  it('run into a closed pipe ends quietly, as the command would', () => {
+    aib(['add', 'k'], VALUE);
+    const r = spawnSync('sh', ['-c', `"${process.execPath}" "${CLI}" secret run k -- yes | head -2`], {
+      env: { PATH: process.env['PATH'], HOME: home }, encoding: 'utf8', timeout: 15_000,
+    });
+    expect(r.stdout).toBe('y\ny\n');
+    expect(r.stderr).not.toMatch(/EPIPE|Unhandled/);
+  });
+
+  it('list shows a description with control characters escaped', () => {
+    const dir = join(home, '.ai-bridge', 'secrets');
+    aib(['add', 'k'], VALUE);
+    writeFileSync(join(dir, 'index.json'), JSON.stringify({ version: 1, secrets: { k: { description: 'x\u001b[2Jy' } } }));
+    const out = aib(['list']).out;
+    expect(out).not.toContain('\u001b');
+    expect(out).toContain('x\\u{1b}[2Jy');
+  });
+
   it('import copies a folder with .desc and reports what it skipped', () => {
     const src = join(home, 'old');
     mkdirSync(join(src, '.desc'), { recursive: true });

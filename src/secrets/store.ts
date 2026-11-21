@@ -18,7 +18,7 @@
  */
 
 import { constants, type Stats } from 'node:fs';
-import { lstat, mkdir, open, readdir, readFile, rename, rmdir, stat, unlink, type FileHandle } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, stat, unlink, type FileHandle } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -80,9 +80,20 @@ export function defaultSecretsDir(home: string = homedir()): string {
   return join(home, '.ai-bridge', 'secrets');
 }
 
-/** Whether `name` may be a secret's name. */
+/**
+ * Whether `name` may be a secret's name. `index.json` in any case is refused:
+ * on a case-insensitive disk (macOS, Windows) `INDEX.json` is the index.
+ */
 export function isValidName(name: unknown): name is string {
-  return typeof name === 'string' && NAME.test(name) && !name.includes('..') && name !== INDEX_FILE;
+  return typeof name === 'string' && NAME.test(name) && !name.includes('..') && name.toLowerCase() !== INDEX_FILE;
+}
+
+/** Control characters a description may not hold: C0 other than tab and newline, DEL, C1. */
+const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/u;
+
+/** `text` with every control character but tab and newline shown as \u{..}, for a terminal. */
+export function printable(text: string): string {
+  return text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/gu, (c) => `\\u{${c.codePointAt(0)!.toString(16)}}`);
 }
 
 /** A name the store may use, or the refusal. */
@@ -102,7 +113,11 @@ export function checkDescription(description: unknown): string {
   if ([...description].length > MAX_DESCRIPTION) {
     throw new SecretRefusal('invalid_request', `A description is at most ${MAX_DESCRIPTION} characters.`);
   }
-  if (description.includes('\0')) throw new SecretRefusal('invalid_request', 'A description may not contain a NUL character.');
+  if (CONTROL.test(description)) {
+    // A description is printed by `aib secret list`: an escape sequence in it
+    // would reach the terminal.
+    throw new SecretRefusal('invalid_request', 'A description may not contain control characters (tab and newline are fine).');
+  }
   return description;
 }
 
@@ -183,6 +198,11 @@ export class MachineSecretStore {
       const existed = await this.existingFile(target);
       if (existed && options.replace !== true) {
         throw new SecretRefusal('exists', `A secret called "${checkedName}" already exists; replace it deliberately.`);
+      }
+      if (!existed) {
+        // `Foo` beside `foo` is one file on a case-insensitive disk.
+        const twin = (await readdir(this.dir)).find((n) => n !== checkedName && n.toLowerCase() === checkedName.toLowerCase());
+        if (twin) throw new SecretRefusal('exists', `"${checkedName}" differs from the existing "${twin}" only in case; pick another name.`);
       }
       await this.writeAtomic(target, bytes);
       const index = await this.readIndex();
@@ -334,7 +354,8 @@ export class MachineSecretStore {
     } catch {
       return {};
     }
-    const out: Record<string, IndexEntry> = {};
+    // No prototype: a secret may be called "constructor".
+    const out = Object.create(null) as Record<string, IndexEntry>;
     try {
       const secrets = (JSON.parse(text) as { secrets?: unknown })?.secrets;
       if (typeof secrets !== 'object' || secrets === null || Array.isArray(secrets)) return out;
@@ -348,14 +369,17 @@ export class MachineSecretStore {
   }
 
   private async writeIndex(index: Record<string, IndexEntry>): Promise<void> {
-    const sorted: Record<string, IndexEntry> = {};
+    const sorted = Object.create(null) as Record<string, IndexEntry>;
     for (const name of Object.keys(index).sort()) sorted[name] = index[name]!;
     await this.writeAtomic(join(this.dir, INDEX_FILE), Buffer.from(`${JSON.stringify({ version: 1, secrets: sorted }, null, 2)}\n`));
   }
 
   /**
    * One writer at a time across processes (the bridge and `aib secret`): a
-   * lock directory, taken over when it is older than STALE_LOCK_MS.
+   * lock directory, taken over when it is older than STALE_LOCK_MS. A takeover
+   * renames the stale lock away first, so of two processes that both found it
+   * stale only one removes it. Holding a lock takes milliseconds; the stale
+   * case is a process that died holding it.
    */
   private async locked<T>(fn: () => Promise<T>): Promise<T> {
     const lock = join(this.dir, LOCK_DIR);
@@ -367,7 +391,12 @@ export class MachineSecretStore {
       } catch (err) {
         if (errno(err) !== 'EEXIST') throw new SecretRefusal('failed', `Could not lock the secret folder ${this.dir}.`);
         try {
-          if (Date.now() - (await stat(lock)).mtimeMs > STALE_LOCK_MS) { await rmdir(lock); continue; }
+          if (Date.now() - (await stat(lock)).mtimeMs > STALE_LOCK_MS) {
+            const away = `${lock}-stale-${randomBytes(6).toString('hex')}`;
+            await rename(lock, away);
+            await rm(away, { recursive: true, force: true });
+            continue;
+          }
         } catch { continue; }
         if (Date.now() > deadline) {
           throw new SecretRefusal('failed', `The secret folder ${this.dir} is busy (${lock} is held); try again.`);

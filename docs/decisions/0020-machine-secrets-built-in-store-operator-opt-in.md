@@ -1,6 +1,6 @@
 ---
 status: accepted
-date: 2026-11-22
+date: 2026-11-21
 supersedes:
 superseded_by:
 revisit_when: a value has to be readable by the server, secrets need encryption at rest or a separate OS user, a turn's output has to be scrubbed of stored values, or the 16 KB prompt cap is too small
@@ -49,7 +49,11 @@ person still had to install and trust that helper. Separately, the 8 KB cap on
 - A folder of one-file-per-secret moves in with `aib secret import`; an old
   helper script can forward to `aib secret`.
 - The secrets are as safe as the user account: no encryption at rest, no
-  versions, no separate user. A value is not scrubbed from turn output yet.
+  versions, no separate user. A value is not scrubbed from turn output yet,
+  and a turn that may read the folder (`--allow-dir` above it,
+  `--allow-native`) can read a value: the bridge warns at startup.
+- A server that may write secrets may write one the person later runs with;
+  `run --dotenv` refuses variables that make a program load code.
 - The protocol stays on 0.1; all of it is additive (0005).
 
 ## Options considered

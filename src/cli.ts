@@ -13,7 +13,7 @@
 import { readUpstreamConfig } from './mcp/upstream.js';
 import { realpathSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { Bridge, FatalBridgeError } from './bridge.js';
@@ -34,6 +34,7 @@ import { CLAUDE_TOKEN_KEY, listClaudeTokens, loadClaudeToken, useClaudeToken, us
 import { registerSecretCommands } from './secrets/cli.js';
 import { defaultSecretsDir } from './secrets/store.js';
 import { installBridge, listBridges, pathsFor, readEnvFile, uninstallBridge } from './service/index.js';
+import { envSwitch } from './service/config.js';
 import { SelfUpdater } from './selfupdate/updater.js';
 import { detect as detectService, locateTokenFile, pinVersion, prefetch, tokenSaver, type TokenFile } from './selfupdate/service.js';
 import {
@@ -110,11 +111,6 @@ export function resolveOperatorPosture(
     webSearch: opts.allowWebSearch === true,
     machineSecrets: opts.machineSecrets === true,
   };
-}
-
-/** Whether an environment value turns a switch on: 1, true or yes. */
-function envSwitch(value: string | undefined): boolean {
-  return value !== undefined && ['1', 'true', 'yes'].includes(value.trim().toLowerCase());
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +518,8 @@ program
     }
     if (operatorPosture.machineSecrets) {
       log.warn(`Machine secrets: ON (${defaultSecretsDir()}): this server may list, add, replace, describe and remove secrets on this machine (never read one back).`);
+      const exposed = secretsReachableByTurns(defaultSecretsDir(), allowedRoots.map((r) => r.path), operatorPosture.allowNative);
+      if (exposed) log.warn(`Machine secrets: ${exposed}`);
     } else {
       log.info('Machine secrets: off (no --machine-secrets)');
     }
@@ -1010,6 +1008,22 @@ program
   });
 
 registerSecretCommands(program);
+
+/**
+ * Why a turn could read the secret files after all, or null: "never read one
+ * back" holds only while no turn can open ~/.ai-bridge/secrets. An allowed
+ * folder that contains it, or native isolation, lets a turn's tools read it.
+ */
+export function secretsReachableByTurns(secretsDir: string, roots: string[], allowNative: boolean): string | null {
+  let dir = secretsDir;
+  try { dir = realpathSync(secretsDir); } catch { /* not created yet */ }
+  const inside = roots.filter((root) => dir === root || dir.startsWith(root.endsWith(sep) ? root : root + sep));
+  if (inside.length) {
+    return `the store is inside --allow-dir ${inside.join(', ')}: a workspace turn there can read the secret files. Allow a narrower folder to keep values off the server.`;
+  }
+  if (allowNative) return 'with --allow-native a native turn can read the secret files.';
+  return null;
+}
 
 function hostOnly(url: string): string {
   try { return new URL(url).host; } catch { return url; }

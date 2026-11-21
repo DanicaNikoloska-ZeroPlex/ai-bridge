@@ -1491,8 +1491,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     try {
       message = JSON.parse(data.toString()) as ServerToBridgeMessage;
     } catch (err) {
+      // Not the parser's message: V8 quotes the start of the text, and a
+      // frame may carry a secret's value (secret_put).
       log.error('Failed to parse server message', {
-        error: err instanceof Error ? err.message : String(err),
+        error: err instanceof Error ? err.name : 'Error',
+        bytes: Buffer.isBuffer(data) ? data.length : data.toString().length,
       });
       return;
     }

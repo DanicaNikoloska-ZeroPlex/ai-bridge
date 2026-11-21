@@ -113,6 +113,27 @@ describe('the store', () => {
     await store.put('k', VALUE, { description: 'é'.repeat(1000) });
   });
 
+  it('refuses control characters in a description (an escape sequence would reach the terminal), keeps tab and newline', async () => {
+    expect((await refusal(store.put('k', VALUE, { description: '\u001b[2Jclear' }))).code).toBe('invalid_request');
+    expect((await refusal(store.put('k', VALUE, { description: 'bell\u0007' }))).code).toBe('invalid_request');
+    expect((await refusal(store.put('k', VALUE, { description: 'c1\u009b' }))).code).toBe('invalid_request');
+    await store.put('k', VALUE, { description: 'two\tparts\nand a line' });
+  });
+
+  it('refuses index.json in any case, and a name that differs from an existing one only in case', async () => {
+    expect((await refusal(store.put('INDEX.json', VALUE))).code).toBe('invalid_name');
+    await store.put('Token', VALUE);
+    const twin = await refusal(store.put('token', VALUE));
+    expect(twin.code).toBe('exists');
+    expect(twin.message).toMatch(/only in case/);
+  });
+
+  it('keeps a secret called constructor', async () => {
+    await store.put('constructor', VALUE, { description: 'odd name' });
+    expect(await store.list()).toMatchObject([{ name: 'constructor', description: 'odd name' }]);
+    await store.remove('constructor');
+  });
+
   it('refuses a folder that is a symlink, or open to others', async () => {
     const real = join(home, 'elsewhere');
     mkdirSync(real, { mode: 0o700 });

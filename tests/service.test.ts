@@ -201,6 +201,9 @@ describe('machine secrets, recorded for the service', () => {
     writeConfig(off, { server: 'wss://h/bridge', token: 't' });
     expect(readFileSync(off, 'utf8')).not.toContain('AI_BRIDGE_MACHINE_SECRETS');
     expect(readConfig(off)?.machineSecrets).toBeUndefined();
+    const edited = join(dir, 'edited.env');
+    writeFileSync(edited, 'AI_BRIDGE_SERVER=wss://h/bridge\nAI_BRIDGE_TOKEN=t\nAI_BRIDGE_MACHINE_SECRETS=true\n');
+    expect(readConfig(edited)?.machineSecrets).toBe(true);
   });
 
   test('a reinstall without --machine-secrets turns machine secrets off', () => {

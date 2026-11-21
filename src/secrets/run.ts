@@ -10,6 +10,8 @@
  */
 
 import { spawn } from 'node:child_process';
+import { constants as osConstants } from 'node:os';
+import type { Readable } from 'node:stream';
 import { stripCredentials } from '../providers/env.js';
 
 export const MASK = '***SECRET***';
@@ -19,6 +21,22 @@ export const MIN_MASK_LENGTH = 8;
 const JSON_SECRET_KEY = /key|secret|token|pass|pwd|credential|auth/i;
 /** An environment variable's name. */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * Variables `--dotenv` never sets: each makes a program load or run code of
+ * the secret's choosing, and a server with --machine-secrets may write a
+ * secret. A secret that sets one is refused, never silently thinned out.
+ */
+const LOADER_VARIABLE = /^(LD_\w*|DYLD_\w*|NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|PATH|PYTHON\w*|PERL5\w*|PERLLIB|RUBYOPT|RUBYLIB|GIT_\w*|SHELLOPTS|PS4|PROMPT_COMMAND|IFS)$/i;
+
+/** The KEY=VALUE pairs `--dotenv` sets, or why it refuses the secret. */
+export function dotenvVariables(text: string): Array<[string, string]> {
+  const pairs = parseDotenv(text);
+  const refused = pairs.map(([key]) => key).filter((key) => LOADER_VARIABLE.test(key));
+  if (refused.length) {
+    throw new Error(`--dotenv will not set ${[...new Set(refused)].join(', ')}: these make a program load code. Remove them from the secret, or use SECRET_FILE.`);
+  }
+  return pairs;
+}
 
 /**
  * KEY=VALUE lines: `export ` stripped, matching quotes around the value
@@ -57,20 +75,25 @@ function jsonSecretValues(node: unknown, underSecretKey: boolean, out: string[])
 
 /**
  * Every value the output filter hides for this secret: the whole content and
- * its trimmed form, each dotenv value, and, for a JSON object, the string
- * values under secret-looking keys. Only those of MIN_MASK_LENGTH or more,
- * longest first so a longer value is masked whole before a part of it.
+ * its trimmed form, each line of a multi-line secret, each KEY=VALUE value,
+ * and, for JSON, the string values under secret-looking keys; each also in
+ * its JSON-escaped form (what `jq -c` prints). Only those of MIN_MASK_LENGTH
+ * or more, longest first so a longer value is masked whole before a part of
+ * it. Only these literal forms are matched: an encoded value (base64, URL
+ * encoding) gets through.
  */
-export function maskValues(content: string, options: { dotenv?: boolean } = {}): string[] {
-  const values = [content, content.trim()];
-  if (options.dotenv) for (const [, value] of parseDotenv(content)) values.push(value);
+export function maskValues(content: string): string[] {
   const trimmed = content.trim();
+  const values = [content, trimmed];
+  if (trimmed.includes('\n')) for (const line of trimmed.split(/\r?\n/)) values.push(line.trim());
+  for (const [, value] of parseDotenv(content)) values.push(value);
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
     try {
       jsonSecretValues(JSON.parse(trimmed), false, values);
     } catch { /* not JSON */ }
   }
-  return [...new Set(values.filter((v) => v.length >= MIN_MASK_LENGTH))].sort((a, b) => b.length - a.length);
+  const escaped = values.map((v) => JSON.stringify(v).slice(1, -1));
+  return [...new Set([...values, ...escaped].filter((v) => v.length >= MIN_MASK_LENGTH))].sort((a, b) => b.length - a.length);
 }
 
 /**
@@ -82,10 +105,13 @@ export function maskValues(content: string, options: { dotenv?: boolean } = {}):
  */
 export class MaskingFilter {
   private readonly needles: string[];
+  /** Per needle, the KMP failure function, for the hold-back in linear time. */
+  private readonly failures: Int32Array[];
   private held = '';
 
   constructor(values: string[]) {
     this.needles = values.map((v) => Buffer.from(v, 'utf8').toString('latin1')).filter((v) => v.length > 0);
+    this.failures = this.needles.map(failureFunction);
   }
 
   push(chunk: Buffer): Buffer {
@@ -108,17 +134,39 @@ export class MaskingFilter {
     return out;
   }
 
-  /** The longest end of `text` that is a proper start of some value. */
+  /**
+   * The longest end of `text` that is a proper start of some value: the KMP
+   * automaton run over the last needle.length - 1 characters, O(length) per
+   * needle. A program that stops printing in the middle of such a start (a
+   * prompt ending in a value's first letter) shows it with its next output.
+   */
   private heldBackLength(text: string): number {
     let best = 0;
-    for (const needle of this.needles) {
-      const max = Math.min(needle.length - 1, text.length);
-      for (let n = max; n > best; n--) {
-        if (text.endsWith(needle.slice(0, n))) { best = n; break; }
+    this.needles.forEach((needle, i) => {
+      const fail = this.failures[i]!;
+      const from = Math.max(0, text.length - (needle.length - 1));
+      let k = 0;
+      for (let j = from; j < text.length; j++) {
+        while (k > 0 && (k === needle.length || text[j] !== needle[k])) k = fail[k - 1]!;
+        if (text[j] === needle[k]) k++;
       }
-    }
+      if (k === needle.length) k = fail[k - 1]!;
+      if (k > best) best = k;
+    });
     return best;
   }
+}
+
+/** fail[i]: the length of the longest proper prefix of needle[0..i] that is also its suffix. */
+function failureFunction(needle: string): Int32Array {
+  const fail = new Int32Array(needle.length);
+  let k = 0;
+  for (let i = 1; i < needle.length; i++) {
+    while (k > 0 && needle[i] !== needle[k]) k = fail[k - 1]!;
+    if (needle[i] === needle[k]) k++;
+    fail[i] = k;
+  }
+  return fail;
 }
 
 export interface RunOptions {
@@ -152,7 +200,13 @@ export function runWithSecret(options: RunOptions): Promise<number> {
   const env: NodeJS.ProcessEnv = stripCredentials({ ...(options.env ?? process.env) });
   env['SECRET_FILE'] = options.path;
   env['SECRET_NAME'] = options.name;
-  if (options.dotenv) for (const [key, value] of parseDotenv(text)) env[key] = value;
+  if (options.dotenv) {
+    try {
+      for (const [key, value] of dotenvVariables(text)) env[key] = value;
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
   if (options.envVar) env[checkEnvName(options.envVar)] = text.trim();
   const [file, ...rest] = options.command.map((arg) => arg.split('{SECRET_FILE}').join(options.path));
   if (!file) return Promise.reject(new Error('Name the command to run after --'));
@@ -162,7 +216,15 @@ export function runWithSecret(options: RunOptions): Promise<number> {
 
   return new Promise<number>((resolve) => {
     const child = spawn(file, rest, { env, stdio: mask ? ['inherit', 'pipe', 'pipe'] : 'inherit' });
-    const forward = (signal: NodeJS.Signals): void => { child.kill(signal); };
+    // On a terminal, Ctrl-C and a hangup already reach the whole process
+    // group, the command included: sending them again could read as "force
+    // quit". The listener still keeps this process alive to pass the exit
+    // code on. SIGTERM, sent to this process alone, is passed on.
+    const terminal = !!process.stdin.isTTY;
+    const forward = (signal: NodeJS.Signals): void => {
+      if (terminal && signal !== 'SIGTERM') return;
+      child.kill(signal);
+    };
     const signals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP'];
     for (const s of signals) process.on(s, forward);
     const done = (code: number): void => {
@@ -174,12 +236,23 @@ export function runWithSecret(options: RunOptions): Promise<number> {
     let exitCode: number | null = null;
     const maybeDone = (): void => { if (pending === 0 && exitCode !== null) done(exitCode); };
     if (mask) {
-      const values = maskValues(text, { dotenv: !!options.dotenv });
-      for (const [from, to] of [[child.stdout!, stdout], [child.stderr!, stderr]] as const) {
+      const values = maskValues(text);
+      for (const [from, to] of [[child.stdout!, stdout], [child.stderr!, stderr]] as Array<[Readable, NodeJS.WritableStream]>) {
         const filter = new MaskingFilter(values);
         pending++;
-        from.on('data', (chunk: Buffer) => { to.write(filter.push(chunk)); });
-        from.on('end', () => {
+        // A reader that went away (`| head`) ends the command as a closed
+        // pipe would: SIGPIPE, exit 141. Never an unhandled error.
+        to.on('error', () => {
+          if (exitCode === null) child.kill('SIGPIPE');
+          from.destroy();
+        });
+        from.on('data', (chunk: Buffer) => {
+          if (!to.write(filter.push(chunk))) {
+            from.pause();
+            to.once('drain', () => from.resume());
+          }
+        });
+        from.on('close', () => {
           const rest = filter.end();
           if (rest.length) to.write(rest);
           pending--;
@@ -206,6 +279,5 @@ export function runWithSecret(options: RunOptions): Promise<number> {
 }
 
 function signalNumber(signal: NodeJS.Signals): number {
-  const table: Partial<Record<NodeJS.Signals, number>> = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGKILL: 9, SIGTERM: 15, SIGPIPE: 13 };
-  return table[signal] ?? 0;
+  return osConstants.signals[signal] ?? 0;
 }

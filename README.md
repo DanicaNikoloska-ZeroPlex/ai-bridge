@@ -538,7 +538,8 @@ logged, cached and stored elsewhere.
 
 The bridge keeps a small secret store on this machine, `~/.ai-bridge/secrets/`:
 one file per secret, named like the secret, readable only by you (folder 0700,
-each file 0600 from the moment it exists), and an `index.json` with each
+each file 0600 from the moment it exists; on Windows the modes and the owner
+check do not apply, and the folder is as private as your profile), and an `index.json` with each
 secret's description and when it was written. Your own scripts use it with
 `aib secret`; a server may manage it **only if you start the bridge with
 `--machine-secrets`** (or `AI_BRIDGE_MACHINE_SECRETS=1`; `install
@@ -572,27 +573,43 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   command with `SECRET_FILE` (the secret's path) and `SECRET_NAME` set.
   `--env VAR` also puts the content, trimmed, in `VAR`; `--dotenv` sets every
   `KEY=VALUE` line of the secret (`export ` and matching quotes stripped,
-  comments and blank lines skipped); `{SECRET_FILE}` in any argument becomes
-  the path. The command's output passes through a filter that prints
-  `***SECRET***` for every value of 8 characters or more: the whole content,
-  each `--dotenv` value, and in a JSON secret the string values under keys
-  matching `key|secret|token|pass|pwd|credential|auth`. `--no-mask` lets the
-  output through untouched (and keeps the terminal, for an interactive
-  program). The exit code is the command's; 127 when it is not found. The
-  filter is a guard against an accidental print, not a sandbox: a program that
-  encodes the value prints it.
+  comments and blank lines skipped), and refuses a secret that would set a
+  variable that makes programs load code (`LD_*`, `DYLD_*`, `NODE_OPTIONS`,
+  `PATH`, `BASH_ENV`, `PYTHON*`, `GIT_*` and the like); `{SECRET_FILE}` in any
+  argument becomes the path. The command's output passes through a filter that
+  prints `***SECRET***` for every value of 8 characters or more: the whole
+  content, each line of a multi-line secret, each `KEY=VALUE` value, in a JSON
+  secret the string values under keys matching
+  `key|secret|token|pass|pwd|credential|auth`, and each of those as it looks
+  JSON-escaped. `--no-mask` lets the output through untouched (and keeps the
+  terminal, for an interactive program). The exit code is the command's; 127
+  when it is not found, 128 + the signal when it was killed. The filter is a
+  guard against an accidental print, not a sandbox: a program that encodes
+  the value (base64, URL encoding) prints it, and values under 8 characters
+  are never masked.
 - **`import <folder>`** copies every regular file whose name is a valid secret
   name, with a description from `<folder>/.desc/<name>` when there is one.
   Dot files are skipped, so is anything that is not a regular file; an
   existing name is skipped unless `--replace`. It prints which names it
   imported and skipped, never a value, and leaves the folder as it was.
 - **Names:** letters and digits first, then letters, digits, `.`, `_`, `-`; at
-  most 64 characters; not `index.json`.
+  most 64 characters; not `index.json`; not differing from an existing name
+  only in case.
+- **Descriptions:** at most 1000 characters, no control characters but tab and
+  newline.
 - The store refuses to work in a folder that is a symlink, owned by someone
   else or open to others, and says why; it never fixes the folder for you.
 - Not in it: encryption at rest (the files are as safe as your account),
   versions or backups, a separate user. A secret's value is not scrubbed from
   a turn's output.
+- **"Never read back" holds only while no turn can open the folder.** With
+  `--allow-dir` on a folder that contains `~/.ai-bridge/secrets` (your home,
+  say), a `workspace` turn can read the files, and so can a `native` turn with
+  `--allow-native`; the bridge warns at startup when that is so. Allow
+  narrower folders on a machine with secrets.
+- A server that may write secrets may write one you later `run`: `--dotenv`
+  refuses the variables above, but a secret used as a config file (a
+  kubeconfig, an SSH config) is the program's to trust.
 
 The protocol side is [Secrets on the machine](PROTOCOL.md#secrets-on-the-machine);
 why it works this way is [decision 0020](docs/decisions/0020-machine-secrets-built-in-store-operator-opt-in.md).

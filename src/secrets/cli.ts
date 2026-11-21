@@ -8,7 +8,7 @@
 import { lstat, readdir, readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { Command } from 'commander';
-import { MAX_LOCAL_VALUE_BYTES, SecretRefusal, MachineSecretStore, checkValue, isValidName } from './store.js';
+import { MAX_LOCAL_VALUE_BYTES, SecretRefusal, MachineSecretStore, checkValue, isValidName, printable } from './store.js';
 import { checkEnvName, runWithSecret } from './run.js';
 import { listBridges } from '../service/index.js';
 
@@ -50,6 +50,23 @@ async function readValueFromStdin(): Promise<Buffer> {
   return value;
 }
 
+/**
+ * A value from a file: a regular file (not a device or a FIFO, which could
+ * be read without end), size checked before it is read.
+ */
+async function readValueFile(path: string): Promise<Buffer> {
+  const st = await lstat(path).catch(() => null);
+  if (!st) throw new Error(`${path} does not exist`);
+  if (!st.isFile()) throw new Error(`${path} is not a regular file`);
+  if (st.size > MAX_LOCAL_VALUE_BYTES) throw new SecretRefusal('invalid_request', `A secret value is at most ${MAX_LOCAL_VALUE_BYTES / 1024} KiB.`);
+  return readFile(path);
+}
+
+/** One line for a terminal: control characters shown escaped, newlines as spaces. */
+function oneLine(text: string): string {
+  return printable(text).replace(/[\r\n\t]+/g, ' ');
+}
+
 function readHiddenLine(): Promise<Buffer> {
   return new Promise((resolvePromise, reject) => {
     const stdin = process.stdin;
@@ -69,7 +86,12 @@ function readHiddenLine(): Promise<Buffer> {
       for (const byte of chunk) {
         if (byte === 0x0d || byte === 0x0a) return finish();
         if (byte === 0x03 || byte === 0x04) return finish(new Error('Cancelled; nothing was saved.'));
-        if (byte === 0x7f || byte === 0x08) { bytes.pop(); continue; }
+        if (byte === 0x7f || byte === 0x08) {
+          // One character, which in UTF-8 may be several bytes: its continuation bytes, then its lead.
+          while (bytes.length && (bytes[bytes.length - 1]! & 0xc0) === 0x80) bytes.pop();
+          bytes.pop();
+          continue;
+        }
         bytes.push(byte);
       }
     };
@@ -105,11 +127,13 @@ export async function importFolder(store: MachineSecretStore, folder: string, op
       continue;
     }
     let description: string | undefined;
+    const descPath = join(root, '.desc', name);
+    const desc = await lstat(descPath).catch(() => null);
+    if (desc?.isFile() && desc.size <= 64 * 1024) {
+      description = (await readFile(descPath, 'utf8')).trim() || undefined;
+    }
     try {
-      description = (await readFile(join(root, '.desc', name), 'utf8')).trim() || undefined;
-    } catch { /* no description */ }
-    try {
-      const value = checkValue(await readFile(path), MAX_LOCAL_VALUE_BYTES);
+      const value = checkValue(await readValueFile(path), MAX_LOCAL_VALUE_BYTES);
       await store.put(name, value, { replace: !!options.replace, description, maxBytes: MAX_LOCAL_VALUE_BYTES });
       report.imported.push(name);
     } catch (err) {
@@ -140,7 +164,7 @@ export function registerSecretCommands(program: Command, storeFor: () => Machine
         } else {
           const width = Math.max(...rows.map((r) => r.name.length), 4);
           for (const r of rows) {
-            console.log(`${r.name.padEnd(width)}  ${(r.updated_at ?? '').slice(0, 19).replace('T', ' ')}  ${r.description ?? ''}`.trimEnd());
+            console.log(`${r.name.padEnd(width)}  ${(r.updated_at ?? '').slice(0, 19).replace('T', ' ')}  ${oneLine(r.description ?? '')}`.trimEnd());
           }
         }
         console.error(serverAccessLine());
@@ -161,7 +185,7 @@ export function registerSecretCommands(program: Command, storeFor: () => Machine
         if (!opts.replace && await store.has(name)) {
           throw new SecretRefusal('exists', `A secret called "${name}" already exists; add --replace to overwrite it.`);
         }
-        const value = opts.fromFile !== undefined ? await readFile(resolve(opts.fromFile)) : await readValueFromStdin();
+        const value = opts.fromFile !== undefined ? await readValueFile(resolve(opts.fromFile)) : await readValueFromStdin();
         const { replaced } = await store.put(name, value, {
           replace: !!opts.replace, description: opts.description, maxBytes: MAX_LOCAL_VALUE_BYTES,
         });
@@ -219,16 +243,16 @@ export function registerSecretCommands(program: Command, storeFor: () => Machine
     .option('--dotenv', 'Also set every KEY=VALUE line of the secret as a variable')
     .option('--no-mask', 'Let the output through unfiltered (and keep the terminal)')
     .action(async (name: string, command: string[], opts: { env?: string; dotenv?: boolean; mask: boolean }) => {
-      let code: number;
       try {
         if (opts.env !== undefined) checkEnvName(opts.env);
         const store = storeFor();
         const path = await store.path(name);
-        code = await runWithSecret({
+        // Not process.exit(): on macOS a write to a pipe is asynchronous, and
+        // exiting at once could cut off the end of the command's output.
+        process.exitCode = await runWithSecret({
           name, path, content: await store.read(name), envVar: opts.env, dotenv: !!opts.dotenv, mask: opts.mask, command,
         });
       } catch (err) { fail(err); }
-      process.exit(code);
     });
 
   secret
@@ -241,7 +265,7 @@ export function registerSecretCommands(program: Command, storeFor: () => Machine
         const store = storeFor();
         const report = await importFolder(store, folder, { replace: !!opts.replace });
         console.log(`Imported ${report.imported.length} into ${store.dir}${report.imported.length ? `: ${report.imported.join(', ')}` : ''}.`);
-        for (const s of report.skipped) console.log(`Skipped ${s.name}: ${s.reason}`);
+        for (const s of report.skipped) console.log(`Skipped ${oneLine(s.name)}: ${s.reason}`);
       } catch (err) { fail(err); }
     });
 }

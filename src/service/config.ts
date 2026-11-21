@@ -58,6 +58,11 @@ export interface BridgeConfig {
   machineSecrets?: boolean | undefined;
 }
 
+/** Whether an environment value turns a switch on: 1, true or yes (any case). */
+export function envSwitch(value: string | undefined): boolean {
+  return value !== undefined && ['1', 'true', 'yes'].includes(value.trim().toLowerCase());
+}
+
 /** Keys this module writes. Anything else in the file belongs to somebody else. */
 const OWN_KEYS = new Set([
   'AI_BRIDGE_SERVER', 'AI_BRIDGE_TOKEN', 'AI_BRIDGE_ALLOW_DIR', 'AI_BRIDGE_NAME', 'AI_BRIDGE_VERSION',
@@ -102,7 +107,7 @@ export function readConfig(path: string): BridgeConfig | null {
     version: out['AI_BRIDGE_VERSION'] || undefined,
     ...(out['ENGRAM_URL'] ? { engram: out['ENGRAM_URL'] } : {}),
     ...(out['AI_BRIDGE_CLAUDE_ENV'] ? { claudeEnv: out['AI_BRIDGE_CLAUDE_ENV'] } : {}),
-    ...(out['AI_BRIDGE_MACHINE_SECRETS'] === '1' ? { machineSecrets: true } : {}),
+    ...(envSwitch(out['AI_BRIDGE_MACHINE_SECRETS']) ? { machineSecrets: true } : {}),
     ...(Object.keys(settings).length > 0 ? { settings } : {}),
   };
 }

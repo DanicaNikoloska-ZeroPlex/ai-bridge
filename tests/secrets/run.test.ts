@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { Writable } from 'node:stream';
-import { MASK, MaskingFilter, maskValues, parseDotenv, runWithSecret } from '../../src/secrets/run.js';
+import { MASK, MaskingFilter, dotenvVariables, maskValues, parseDotenv, runWithSecret } from '../../src/secrets/run.js';
 
 const VALUE = 'sk-test-0123456789-very-secret';
 
@@ -33,17 +33,34 @@ describe('parseDotenv', () => {
   });
 });
 
+describe('dotenvVariables', () => {
+  it('refuses a secret that would set a variable that makes programs load code', () => {
+    expect(dotenvVariables('A=1\nB=2')).toEqual([['A', '1'], ['B', '2']]);
+    for (const key of ['LD_PRELOAD', 'DYLD_INSERT_LIBRARIES', 'NODE_OPTIONS', 'PATH', 'BASH_ENV', 'PYTHONSTARTUP', 'GIT_SSH_COMMAND', 'PERL5OPT']) {
+      expect(() => dotenvVariables(`A=1\n${key}=x`)).toThrow(key);
+    }
+  });
+});
+
 describe('maskValues', () => {
   it('masks the content, each dotenv value and JSON secret-key values of 8+ characters, never short ones', () => {
     expect(maskValues('short')).toEqual([]);
-    expect(maskValues(`${VALUE}\n`)).toEqual([`${VALUE}\n`, VALUE]);
-    const env = maskValues('A=abcdefghij\nB=short\n', { dotenv: true });
+    expect(maskValues(`${VALUE}\n`)).toContain(VALUE);
+    expect(maskValues(`${VALUE}\n`)).toContain(`${VALUE}\\n`);
+    const env = maskValues('A=abcdefghij\nB=short\n');
     expect(env).toContain('abcdefghij');
     expect(env).not.toContain('short');
     const json = maskValues(JSON.stringify({ client_id: 'public-identifier', client_secret: 'secret-value-123', nested: { apiKey: 'nested-key-4567' } }));
     expect(json).toContain('secret-value-123');
     expect(json).toContain('nested-key-4567');
     expect(json).not.toContain('public-identifier');
+  });
+
+  it('masks each line of a multi-line secret and the JSON-escaped form', () => {
+    const pem = '-----BEGIN KEY-----\nAAAABBBBCCCCDDDD\nEEEEFFFFGGGGHHHH\n-----END KEY-----\n';
+    const values = maskValues(pem);
+    expect(values).toContain('AAAABBBBCCCCDDDD');
+    expect(values).toContain('-----BEGIN KEY-----\\nAAAABBBBCCCCDDDD\\nEEEEFFFFGGGGHHHH\\n-----END KEY-----');
   });
 });
 
@@ -55,6 +72,23 @@ describe('MaskingFilter', () => {
     for (const p of parts) out += filter.push(Buffer.from(p)).toString('latin1');
     out += filter.end().toString('latin1');
     expect(out).toBe(`before ${MASK} after sk-`);
+  });
+
+  it('holds back in linear time: a 200 KB value and a 64 KB chunk take well under a second', () => {
+    const big = 'x'.repeat(200_000);
+    const filter = new MaskingFilter([big]);
+    const started = Date.now();
+    const out = filter.push(Buffer.from(`${'x'.repeat(65_535)}y`));
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(out.length).toBe(65_536);
+  });
+
+  it('holds back a start that repeats inside the value', () => {
+    const filter = new MaskingFilter(['aabaabaaab']);
+    let out = filter.push(Buffer.from('xx aabaabaa')).toString('latin1');
+    out += filter.push(Buffer.from('ab yy')).toString('latin1');
+    out += filter.end().toString('latin1');
+    expect(out).toBe(`xx ${MASK} yy`);
   });
 });
 
@@ -76,15 +110,21 @@ describe('runWithSecret', () => {
     expect(r.out).toBe(`${MASK} eu\n`);
   });
 
+  it('--dotenv refuses a secret that sets LD_PRELOAD, and runs nothing', async () => {
+    await expect(run('LD_PRELOAD=/tmp/x.so\n', ['sh', '-c', 'echo ran'], { dotenv: true })).rejects.toThrow(/LD_PRELOAD/);
+  });
+
+  it('masks a KEY=VALUE value without --dotenv too (a .env read through SECRET_FILE)', async () => {
+    const r = await run('FOO=abcdefghijk\n', ['sh', '-c', 'echo abcdefghijk']);
+    expect(r.out).toBe(`${MASK}\n`);
+  });
+
   it('masks JSON secret values', async () => {
     const r = await run(JSON.stringify({ token: 'json-token-98765' }), ['sh', '-c', 'echo json-token-98765']);
     expect(r.out).toBe(`${MASK}\n`);
   });
 
-  it('--no-mask passes output through untouched', async () => {
-    const r = await run(VALUE, ['true'], { mask: false });
-    expect(r.code).toBe(0);
-  });
+
 
   it('passes the exit code through, 127 for a command not found', async () => {
     expect((await run(VALUE, ['sh', '-c', 'exit 7'])).code).toBe(7);
@@ -92,5 +132,6 @@ describe('runWithSecret', () => {
     expect(missing.code).toBe(127);
     expect(missing.err).toMatch(/command not found/);
     expect((await run(VALUE, ['sh', '-c', 'kill -TERM $$'])).code).toBe(143);
+    expect((await run(VALUE, ['sh', '-c', 'kill -SEGV $$'])).code).toBe(139);
   });
 });

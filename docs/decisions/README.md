@@ -27,4 +27,4 @@ history. Format: Engram documentation standard v1, section 3.
 | [0017](0017-claude-token-file-read-per-run.md) | The Claude token file may hold several named tokens and is read for every run | accepted | 2026-11-15 |
 | [0018](0018-claude-sign-in-profiles-saved-back-before-a-switch.md) | Claude sign-in profiles, saved back before every switch | accepted | 2026-11-15 |
 | [0019](0019-the-repository-names-no-downstream-project.md) | The repository names no downstream project; history is kept and mapped | accepted | 2026-11-21 |
-| [0020](0020-machine-secrets-built-in-store-operator-opt-in.md) | Machine secrets: a built-in store, managed by a server only with the operator's opt-in | accepted | 2026-11-22 |
+| [0020](0020-machine-secrets-built-in-store-operator-opt-in.md) | Machine secrets: a built-in store, managed by a server only with the operator's opt-in | accepted | 2026-11-21 |
