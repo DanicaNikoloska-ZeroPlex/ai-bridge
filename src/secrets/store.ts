@@ -18,7 +18,7 @@
  */
 
 import { constants, type Stats } from 'node:fs';
-import { lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, stat, unlink, type FileHandle } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, readFile, rename, rm, rmdir, unlink, type FileHandle } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -199,9 +199,11 @@ export class MachineSecretStore {
       if (existed && options.replace !== true) {
         throw new SecretRefusal('exists', `A secret called "${checkedName}" already exists; replace it deliberately.`);
       }
-      if (!existed) {
-        // `Foo` beside `foo` is one file on a case-insensitive disk.
-        const twin = (await readdir(this.dir)).find((n) => n !== checkedName && n.toLowerCase() === checkedName.toLowerCase());
+      // `Foo` beside `foo` is one file on a case-insensitive disk, where a
+      // replace of `Foo` would overwrite `foo`: refused either way.
+      const names = await readdir(this.dir);
+      if (!names.includes(checkedName)) {
+        const twin = names.find((n) => n.toLowerCase() === checkedName.toLowerCase());
         if (twin) throw new SecretRefusal('exists', `"${checkedName}" differs from the existing "${twin}" only in case; pick another name.`);
       }
       await this.writeAtomic(target, bytes);
@@ -377,24 +379,34 @@ export class MachineSecretStore {
   /**
    * One writer at a time across processes (the bridge and `aib secret`): a
    * lock directory, taken over when it is older than STALE_LOCK_MS. A takeover
-   * renames the stale lock away first, so of two processes that both found it
-   * stale only one removes it. Holding a lock takes milliseconds; the stale
-   * case is a process that died holding it.
+   * renames the stale lock away first and checks it moved the lock it found
+   * stale (by inode), putting back one that another process made in between.
+   * Release removes the lock only while it is still this process's own.
+   * Holding a lock takes milliseconds; the stale case is a process that died
+   * holding it.
    */
   private async locked<T>(fn: () => Promise<T>): Promise<T> {
     const lock = join(this.dir, LOCK_DIR);
     const deadline = Date.now() + LOCK_WAIT_MS;
+    let mine: number;
     for (;;) {
       try {
         await mkdir(lock, { mode: 0o700 });
+        mine = (await lstat(lock)).ino;
         break;
       } catch (err) {
         if (errno(err) !== 'EEXIST') throw new SecretRefusal('failed', `Could not lock the secret folder ${this.dir}.`);
         try {
-          if (Date.now() - (await stat(lock)).mtimeMs > STALE_LOCK_MS) {
+          const held = await lstat(lock);
+          if (Date.now() - held.mtimeMs > STALE_LOCK_MS) {
             const away = `${lock}-stale-${randomBytes(6).toString('hex')}`;
             await rename(lock, away);
-            await rm(away, { recursive: true, force: true });
+            if ((await lstat(away)).ino !== held.ino) {
+              // Another process took the stale lock over first: give its lock back.
+              await rename(away, lock).catch(() => undefined);
+            } else {
+              await rm(away, { recursive: true, force: true });
+            }
             continue;
           }
         } catch { continue; }
@@ -407,7 +419,9 @@ export class MachineSecretStore {
     try {
       return await fn();
     } finally {
-      try { await rmdir(lock); } catch { /* taken over as stale */ }
+      try {
+        if ((await lstat(lock)).ino === mine) await rmdir(lock);
+      } catch { /* taken over as stale */ }
     }
   }
 }

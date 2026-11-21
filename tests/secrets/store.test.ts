@@ -4,7 +4,7 @@
  * checks, and an import from a one-file-per-secret folder.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MachineSecretStore, SecretRefusal, checkName, defaultSecretsDir } from '../../src/secrets/store.js';
@@ -126,6 +126,21 @@ describe('the store', () => {
     const twin = await refusal(store.put('token', VALUE));
     expect(twin.code).toBe('exists');
     expect(twin.message).toMatch(/only in case/);
+  });
+
+  it('refuses a replace whose name matches an existing one only in case', async () => {
+    await store.put('Token', VALUE);
+    expect((await refusal(store.put('token', 'other-value-1', { replace: true }))).message).toMatch(/only in case/);
+    expect(readFileSync(join(dir, 'Token'), 'utf8')).toBe(VALUE);
+  });
+
+  it('takes over a lock left by a process that died, and leaves no lock behind', async () => {
+    await store.put('a1', VALUE);
+    mkdirSync(join(dir, '.lock'));
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, '.lock'), old, old);
+    await store.put('a2', VALUE);
+    expect(readdirSync(dir).sort()).toEqual(['a1', 'a2', 'index.json']);
   });
 
   it('keeps a secret called constructor', async () => {

@@ -36,7 +36,7 @@ describe('parseDotenv', () => {
 describe('dotenvVariables', () => {
   it('refuses a secret that would set a variable that makes programs load code', () => {
     expect(dotenvVariables('A=1\nB=2')).toEqual([['A', '1'], ['B', '2']]);
-    for (const key of ['LD_PRELOAD', 'DYLD_INSERT_LIBRARIES', 'NODE_OPTIONS', 'PATH', 'BASH_ENV', 'PYTHONSTARTUP', 'GIT_SSH_COMMAND', 'PERL5OPT']) {
+    for (const key of ['LD_PRELOAD', 'DYLD_INSERT_LIBRARIES', 'NODE_OPTIONS', 'PATH', 'BASH_ENV', 'PYTHONSTARTUP', 'GIT_SSH_COMMAND', 'PERL5OPT', 'JAVA_TOOL_OPTIONS', 'HOME', 'XDG_CONFIG_HOME', 'SECRET_FILE', 'npm_config_script_shell']) {
       expect(() => dotenvVariables(`A=1\n${key}=x`)).toThrow(key);
     }
   });

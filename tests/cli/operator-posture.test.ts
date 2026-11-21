@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { resolveOperatorPosture, secretsReachableByTurns, type OperatorOptions } from '../../src/cli.js';
@@ -222,5 +222,15 @@ describe('machine secrets (--machine-secrets, decision 0020)', () => {
     expect(secretsReachableByTurns(store, ['/home/u/work'], false)).toBeNull();
     expect(secretsReachableByTurns(store, ['/home/user'], false)).toBeNull();
     expect(secretsReachableByTurns(store, [], true)).toMatch(/native/);
+    // A store not made yet, under a home reached through a symlink.
+    const real = realpathSync(mkdtempSync(join(tmpdir(), 'home-real-')));
+    const link = `${real}-link`;
+    symlinkSync(real, link);
+    try {
+      expect(secretsReachableByTurns(join(link, '.ai-bridge', 'secrets'), [real], false)).toMatch(/--allow-dir/);
+    } finally {
+      rmSync(link);
+      rmSync(real, { recursive: true });
+    }
   });
 });

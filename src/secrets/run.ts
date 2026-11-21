@@ -23,10 +23,19 @@ const JSON_SECRET_KEY = /key|secret|token|pass|pwd|credential|auth/i;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /**
  * Variables `--dotenv` never sets: each makes a program load or run code of
- * the secret's choosing, and a server with --machine-secrets may write a
- * secret. A secret that sets one is refused, never silently thinned out.
+ * the secret's choosing (or points it at other files, as SECRET_FILE would),
+ * and a server with --machine-secrets may write a secret. A secret that sets
+ * one is refused, never silently thinned out. A list, so not complete: a
+ * program may have variables of its own that load code.
  */
-const LOADER_VARIABLE = /^(LD_\w*|DYLD_\w*|NODE_OPTIONS|NODE_PATH|BASH_ENV|ENV|PATH|PYTHON\w*|PERL5\w*|PERLLIB|RUBYOPT|RUBYLIB|GIT_\w*|SHELLOPTS|PS4|PROMPT_COMMAND|IFS)$/i;
+const LOADER_VARIABLE = new RegExp('^(' + [
+  'LD_\\w*', 'DYLD_\\w*', 'GCONV_PATH', 'PATH', 'HOME', 'SHELL', 'ZDOTDIR', 'XDG_\\w*', 'TMPDIR', 'IFS',
+  'BASH_ENV', 'ENV', 'SHELLOPTS', 'BASHOPTS', 'PS4', 'PROMPT_COMMAND',
+  'NODE_OPTIONS', 'NODE_PATH', 'NPM_CONFIG_\\w*', 'PYTHON\\w*', 'PERL5\\w*', 'PERLLIB', 'RUBYOPT', 'RUBYLIB', 'GEM_\\w*', 'BUNDLE_\\w*',
+  'JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'JDK_JAVA_OPTIONS', 'CLASSPATH', 'PHPRC', 'PHP_INI_SCAN_DIR', 'LUA_\\w*', 'TCLLIBPATH', 'R_PROFILE\\w*', 'R_ENVIRON\\w*',
+  'GIT_\\w*', 'SSH_\\w*', 'PAGER', 'MANPAGER', 'GIT_PAGER', 'LESSOPEN', 'LESSCLOSE', 'EDITOR', 'VISUAL', 'BROWSER',
+  'SECRET_FILE', 'SECRET_NAME',
+].join('|') + ')$', 'i');
 
 /** The KEY=VALUE pairs `--dotenv` sets, or why it refuses the secret. */
 export function dotenvVariables(text: string): Array<[string, string]> {
@@ -220,7 +229,7 @@ export function runWithSecret(options: RunOptions): Promise<number> {
     // group, the command included: sending them again could read as "force
     // quit". The listener still keeps this process alive to pass the exit
     // code on. SIGTERM, sent to this process alone, is passed on.
-    const terminal = !!process.stdin.isTTY;
+    const terminal = !!(process.stdin.isTTY || process.stdout.isTTY || process.stderr.isTTY);
     const forward = (signal: NodeJS.Signals): void => {
       if (terminal && signal !== 'SIGTERM') return;
       child.kill(signal);

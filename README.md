@@ -574,8 +574,10 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   `--env VAR` also puts the content, trimmed, in `VAR`; `--dotenv` sets every
   `KEY=VALUE` line of the secret (`export ` and matching quotes stripped,
   comments and blank lines skipped), and refuses a secret that would set a
-  variable that makes programs load code (`LD_*`, `DYLD_*`, `NODE_OPTIONS`,
-  `PATH`, `BASH_ENV`, `PYTHON*`, `GIT_*` and the like); `{SECRET_FILE}` in any
+  variable that makes programs load code or read other files (`LD_*`,
+  `DYLD_*`, `NODE_OPTIONS`, `PATH`, `HOME`, `BASH_ENV`, `PYTHON*`,
+  `JAVA_TOOL_OPTIONS`, `GIT_*`, `SSH_*`, `EDITOR`, `SECRET_FILE` and the like;
+  a list, so not complete); `{SECRET_FILE}` in any
   argument becomes the path. The command's output passes through a filter that
   prints `***SECRET***` for every value of 8 characters or more: the whole
   content, each line of a multi-line secret, each `KEY=VALUE` value, in a JSON
@@ -605,8 +607,11 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
 - **"Never read back" holds only while no turn can open the folder.** With
   `--allow-dir` on a folder that contains `~/.ai-bridge/secrets` (your home,
   say), a `workspace` turn can read the files, and so can a `native` turn with
-  `--allow-native`; the bridge warns at startup when that is so. Allow
-  narrower folders on a machine with secrets.
+  `--allow-native`; the bridge warns at startup when that is so. A
+  `workspace` turn runs the CLI's tools as you and is not a sandbox (see
+  [Working in a repository](#working-in-a-repository)), so even a narrower
+  folder does not make the store unreadable to it: on a machine with secrets,
+  trust the server with the turns it runs there.
 - A server that may write secrets may write one you later `run`: `--dotenv`
   refuses the variables above, but a secret used as a config file (a
   kubeconfig, an SSH config) is the program's to trust.

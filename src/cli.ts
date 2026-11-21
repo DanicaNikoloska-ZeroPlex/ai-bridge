@@ -13,7 +13,7 @@
 import { readUpstreamConfig } from './mcp/upstream.js';
 import { realpathSync } from 'node:fs';
 import { homedir, hostname } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import { Bridge, FatalBridgeError } from './bridge.js';
@@ -1015,11 +1015,20 @@ registerSecretCommands(program);
  * folder that contains it, or native isolation, lets a turn's tools read it.
  */
 export function secretsReachableByTurns(secretsDir: string, roots: string[], allowNative: boolean): string | null {
+  // The nearest folder that exists, resolved, with the rest put back: the
+  // roots are resolved, and a home reached through a symlink must still match.
   let dir = secretsDir;
-  try { dir = realpathSync(secretsDir); } catch { /* not created yet */ }
+  let rest = '';
+  for (;;) {
+    try { dir = join(realpathSync(dir), rest); break; } catch { /* not there yet */ }
+    const parent = dirname(dir);
+    if (parent === dir) { dir = secretsDir; break; }
+    rest = join(basename(dir), rest);
+    dir = parent;
+  }
   const inside = roots.filter((root) => dir === root || dir.startsWith(root.endsWith(sep) ? root : root + sep));
   if (inside.length) {
-    return `the store is inside --allow-dir ${inside.join(', ')}: a workspace turn there can read the secret files. Allow a narrower folder to keep values off the server.`;
+    return `the store is inside --allow-dir ${inside.join(', ')}: a workspace turn there can read the secret files with its tools.`;
   }
   if (allowNative) return 'with --allow-native a native turn can read the secret files.';
   return null;
