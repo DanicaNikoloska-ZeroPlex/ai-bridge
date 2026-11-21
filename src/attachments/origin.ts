@@ -29,7 +29,7 @@ export class AttachmentUrlError extends Error {
 /**
  * Derive the HTTP origin that matches a WebSocket server URL.
  *
- * `wss://studio.example.com/api/ai-bridge/ws` gives `https://studio.example.com`.
+ * `wss://app.example.com/api/ai-bridge/ws` gives `https://app.example.com`.
  * The port is preserved when one is explicit, because a different port is a
  * different origin.
  */

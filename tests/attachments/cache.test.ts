@@ -198,8 +198,8 @@ describe('sweeping', () => {
 });
 
 describe('whose store it is', () => {
-  const PROD = 'wss://studio.example.com/api/ai-bridge/ws';
-  const TEST = 'wss://test.studio.example.com/api/ai-bridge/ws';
+  const PROD = 'wss://app.example.com/api/ai-bridge/ws';
+  const TEST = 'wss://test.app.example.com/api/ai-bridge/ws';
 
   it('is one per server, so one server\'s files never reach another server\'s turns', () => {
     expect(attachmentCacheScope(PROD)).not.toBe(attachmentCacheScope(TEST));

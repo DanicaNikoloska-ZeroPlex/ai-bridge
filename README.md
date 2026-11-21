@@ -236,9 +236,9 @@ By default every CLI is spawned in a dedicated empty directory, so a chat can ta
 
 ```bash
 npx @tetrixdev/ai-bridge \
-  --server wss://studio.example.com/api/ai-bridge/ws \
+  --server wss://app.example.com/api/ai-bridge/ws \
   --token "$AI_BRIDGE_TOKEN" \
-  --allow-dir ~/zp-studio=Studio
+  --allow-dir ~/projects/acme-app=Acme
 ```
 
 ### The posture is server-sent; the capability is yours

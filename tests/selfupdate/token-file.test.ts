@@ -8,8 +8,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { locateTokenFile, replaceFile, saveToken, tokenIn, tokenSaver, type DetectDeps } from '../../src/selfupdate/service.js';
 
-const CGROUP = '0::/user.slice/user-1000.slice/user@1000.service/app.slice/ai-bridge-studio.service\n';
-const ENV = '/home/u/.config/ai-bridge-studio.env';
+const CGROUP = '0::/user.slice/user-1000.slice/user@1000.service/app.slice/ai-bridge-acme.service\n';
+const ENV = '/home/u/.config/ai-bridge-acme.env';
 const OTHER = '/home/u/.config/other.env';
 const showWith = (...files: string[]): string => [
   'Restart=always',

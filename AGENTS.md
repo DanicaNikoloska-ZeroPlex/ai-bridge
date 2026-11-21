@@ -19,6 +19,7 @@ Node 22 or newer (CI runs 22 and 24).
 | Typecheck, src and tests (CI runs both) | `npx tsc --noEmit && npx tsc --noEmit -p tsconfig.test.json` |
 | Full test suite (vitest) | `npm test` |
 | Smallest test: one file, one name | `npx vitest run tests/mcp/upstream-oauth.test.ts -t "forget"` |
+| No blocked names or ticket numbers (gates CI) | `python3 scripts/check-names.py` |
 | Dependency audit (gates CI) | `npm audit --omit=dev --audit-level=moderate` |
 | Live vault test (skipped without `ENGRAM_URL`) | see `tests/live/secrets.live.test.ts` |
 | End-to-end against a real server and CLI | see `tests/manual/README.md` (not part of `npm test`) |
@@ -101,6 +102,7 @@ Node 22 or newer (CI runs 22 and 24).
 - 0016 With `--allow-web-search`, a request may add Claude's built-in WebSearch, and only it, to an `isolated` turn.
 - 0017 The Claude token file may hold several named tokens and is read for every run.
 - 0018 Claude sign-in profiles, saved back before every switch.
+- 0019 The repository names no downstream project (CI: `scripts/check-names.py`); history is kept, `.mailmap` maps it.
 
 Full records and status: [docs/decisions/README.md](docs/decisions/README.md).
 Before changing what one covers, read it; if your change contradicts an

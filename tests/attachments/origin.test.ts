@@ -16,8 +16,8 @@ import {
 
 describe('originFromServerUrl', () => {
   it('maps wss:// to https://', () => {
-    expect(originFromServerUrl('wss://studio.example.com/api/ai-bridge/ws'))
-      .toBe('https://studio.example.com');
+    expect(originFromServerUrl('wss://app.example.com/api/ai-bridge/ws'))
+      .toBe('https://app.example.com');
   });
 
   it('maps ws:// to http://', () => {
@@ -25,14 +25,14 @@ describe('originFromServerUrl', () => {
   });
 
   it('keeps an explicit port, because a different port is a different origin', () => {
-    expect(originFromServerUrl('wss://studio.example.com:8443/ws'))
-      .toBe('https://studio.example.com:8443');
+    expect(originFromServerUrl('wss://app.example.com:8443/ws'))
+      .toBe('https://app.example.com:8443');
   });
 });
 
 describe('resolveApiOrigin', () => {
   it('derives the origin from the server URL by default', () => {
-    expect(resolveApiOrigin('wss://studio.example.com/ws')).toBe('https://studio.example.com');
+    expect(resolveApiOrigin('wss://app.example.com/ws')).toBe('https://app.example.com');
   });
 
   it('accepts an https --api override for split deployments', () => {
@@ -66,7 +66,7 @@ describe('isLoopbackHost', () => {
 });
 
 describe('assertAllowedAttachmentUrl', () => {
-  const origin = 'https://studio.example.com';
+  const origin = 'https://app.example.com';
 
   it('accepts a URL on the connected server origin', () => {
     const url = assertAllowedAttachmentUrl(`${origin}/ai-bridge/attachments/att_1`, origin);
@@ -79,23 +79,23 @@ describe('assertAllowedAttachmentUrl', () => {
   });
 
   it('refuses a different port on the same hostname', () => {
-    expect(() => assertAllowedAttachmentUrl('https://studio.example.com:8443/x', origin))
+    expect(() => assertAllowedAttachmentUrl('https://app.example.com:8443/x', origin))
       .toThrow(/not the server this bridge is connected to/);
   });
 
   it('refuses plaintext http for a non-loopback host', () => {
-    expect(() => assertAllowedAttachmentUrl('http://studio.example.com/x', origin))
+    expect(() => assertAllowedAttachmentUrl('http://app.example.com/x', origin))
       .toThrow(/https/);
   });
 
   it('refuses a non-http scheme outright', () => {
     expect(() => assertAllowedAttachmentUrl('file:///etc/passwd', origin)).toThrow();
-    expect(() => assertAllowedAttachmentUrl('ftp://studio.example.com/x', origin)).toThrow();
+    expect(() => assertAllowedAttachmentUrl('ftp://app.example.com/x', origin)).toThrow();
   });
 
   it('refuses userinfo used to fake the host', () => {
-    // https://studio.example.com@evil.com/ has host evil.com, not studio.
-    expect(() => assertAllowedAttachmentUrl('https://studio.example.com@evil.com/x', origin))
+    // https://app.example.com@evil.com/ has host evil.com, not app.example.com.
+    expect(() => assertAllowedAttachmentUrl('https://app.example.com@evil.com/x', origin))
       .toThrow(/not the server this bridge is connected to/);
   });
 

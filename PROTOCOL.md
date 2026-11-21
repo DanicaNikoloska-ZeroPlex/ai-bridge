@@ -223,7 +223,7 @@ A bridge started with `--allow-dir` also advertises the directories it will acce
   "bridge_version": "0.2.0",
   "providers": [ "..." ],
   "workspaces": [
-    { "path": "/Users/jasper/zp-studio/zeroplex-studio/ZeroPlex_Studio__D09042", "label": "Studio D09042" }
+    { "path": "/home/me/projects/acme-app", "label": "Acme app" }
   ]
 }
 ```
@@ -1083,7 +1083,7 @@ Where the CLI should be spawned. Optional; **absent means today's behaviour exac
 {
   "type": "ai_request",
   "request_id": "req_abc123",
-  "working_dir": "/Users/jasper/zp-studio/zeroplex-studio/ZeroPlex_Studio__D09042"
+  "working_dir": "/home/me/projects/acme-app"
 }
 ```
 
@@ -1127,7 +1127,7 @@ Files the assistant should be able to read this turn. References, never bytes:
     "mime_type": "application/pdf",
     "size": 482113,
     "sha256": "9f3c...",
-    "url": "https://studio.example.com/ai-bridge/attachments/att_9f3c"
+    "url": "https://app.example.com/ai-bridge/attachments/att_9f3c"
   }
 ]
 ```
@@ -1361,8 +1361,8 @@ browser ◀──JSON────────── server
 {
   "type": "upload_offer",
   "id": "5f1c…",
-  "url": "https://studio.example.com/ai-bridge/uploads/5f1c…",
-  "working_dir": "/Users/jasper/zp-studio/ZeroPlex_Studio__D09042",
+  "url": "https://app.example.com/ai-bridge/uploads/5f1c…",
+  "working_dir": "/home/me/projects/acme-app",
   "name": "contract.pdf",
   "mime_type": "application/pdf",
   "size": 482113
@@ -1408,7 +1408,7 @@ Exactly one per offer, on every path.
 
 ```json
 { "type": "upload_done", "id": "5f1c…", "ok": true,
-  "path": "/Users/jasper/zp-studio/ZeroPlex_Studio__D09042/file-uploads/contract.pdf",
+  "path": "/home/me/projects/acme-app/file-uploads/contract.pdf",
   "name": "contract.pdf", "size": 482113, "sha256": "9f3c…",
   "file_id": "b7e2…" }
 ```
@@ -1452,7 +1452,7 @@ browser ◀──body (piped)── server
 
 ```json
 { "type": "file_read", "id": "c41a…", "file_id": "b7e2…",
-  "url": "https://studio.example.com/ai-bridge/downloads/c41a…",
+  "url": "https://app.example.com/ai-bridge/downloads/c41a…",
   "range": "bytes=1048576-", "head": false }
 ```
 

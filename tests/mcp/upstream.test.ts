@@ -239,7 +239,7 @@ describe('UpstreamHub over stdio', () => {
     expect(changes).toBeGreaterThan(before);
   });
 
-  describe('background refresh of tool lists (D10067)', () => {
+  describe('background refresh of tool lists', () => {
     it('shows a tool the server added without tools/list_changed after the next background read', async () => {
       let changes = 0;
       hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 50 } as Partial<UpstreamConfig>) }, { onToolsChanged: () => { changes++; } });

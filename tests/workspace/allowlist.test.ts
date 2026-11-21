@@ -40,8 +40,8 @@ describe('buildAllowedRoots', () => {
   });
 
   it('takes an explicit label after =', () => {
-    const roots = buildAllowedRoots([`${repoA}=Studio D09042`]);
-    expect(roots).toEqual([{ path: repoA, label: 'Studio D09042' }]);
+    const roots = buildAllowedRoots([`${repoA}=Acme app`]);
+    expect(roots).toEqual([{ path: repoA, label: 'Acme app' }]);
   });
 
   it('splits on the LAST = so a directory containing one still parses', () => {
@@ -99,8 +99,8 @@ describe('buildAllowedRoots', () => {
   });
 
   it('renders workspace refs for the hello message', () => {
-    expect(toWorkspaceRefs(buildAllowedRoots([`${repoA}=Studio`]))).toEqual([
-      { path: repoA, label: 'Studio' },
+    expect(toWorkspaceRefs(buildAllowedRoots([`${repoA}=Acme`]))).toEqual([
+      { path: repoA, label: 'Acme' },
     ]);
   });
 });

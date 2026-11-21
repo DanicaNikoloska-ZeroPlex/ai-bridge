@@ -188,9 +188,9 @@ describe('a turn sent immediately after the welcome', () => {
 
 describe('hello', () => {
   it('advertises the operator allow-list so the server can show a picker', async () => {
-    await startBridge([{ path: checkout, label: 'Studio D09042' }], new RecordingAdapter());
+    await startBridge([{ path: checkout, label: 'Acme app' }], new RecordingAdapter());
     const hello = await waitFor((f) => f['type'] === 'hello', 'hello');
-    expect(hello['workspaces']).toEqual([{ path: checkout, label: 'Studio D09042' }]);
+    expect(hello['workspaces']).toEqual([{ path: checkout, label: 'Acme app' }]);
   });
 
   it('omits workspaces entirely when the operator allowed none', async () => {
