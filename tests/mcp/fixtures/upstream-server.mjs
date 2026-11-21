@@ -23,6 +23,7 @@ export const LISTED_UI = { csp: { frameDomains: ['https://player.example.com'] }
 
 export function makeServer({ onExit } = {}) {
   const extra = [];
+  let listDelayMs = 0;
   const tools = () => [
     { name: 'show', description: 'Show x', inputSchema: obj, _meta: { ui: { resourceUri: VIEW_URI } } },
     { name: 'app_only', description: 'For the view', inputSchema: obj, _meta: { ui: { resourceUri: VIEW_URI, visibility: ['app'] } } },
@@ -36,10 +37,15 @@ export function makeServer({ onExit } = {}) {
     { name: 'structured_only', description: 'No text', inputSchema: obj },
     { name: 'pid', description: 'process id', inputSchema: obj },
     { name: 'add_tool', description: 'Adds one and says so', inputSchema: obj },
+    { name: 'add_tool_silently', description: 'Adds one without tools/list_changed', inputSchema: obj },
+    { name: 'slow_lists', description: 'Makes tools/list wait args.ms', inputSchema: obj },
     ...extra,
   ];
   const server = new Server({ name: 'fx', version: '1.0.0' }, { capabilities: { tools: { listChanged: true }, resources: {} } });
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: tools() }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    if (listDelayMs) await new Promise((r) => setTimeout(r, listDelayMs));
+    return { tools: tools() };
+  });
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const a = req.params.arguments ?? {};
     switch (req.params.name) {
@@ -58,6 +64,12 @@ export function makeServer({ onExit } = {}) {
         extra.push({ name: 'added', description: 'Added later', inputSchema: obj });
         await server.sendToolListChanged();
         return { content: [{ type: 'text', text: 'added' }] };
+      case 'add_tool_silently':
+        extra.push({ name: 'silent', description: 'Added without notice', inputSchema: obj });
+        return { content: [{ type: 'text', text: 'added silently' }] };
+      case 'slow_lists':
+        listDelayMs = Number(a.ms ?? 1000);
+        return { content: [{ type: 'text', text: 'lists are slow now' }] };
       default: throw new Error(`no tool ${req.params.name}`);
     }
   });

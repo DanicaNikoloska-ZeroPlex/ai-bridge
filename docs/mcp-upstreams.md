@@ -56,6 +56,7 @@ servers is accepted too):
 | `oauth` | HTTP | With `"auth": "oauth"`, optional: `scope` (space-separated) and `client_name` (default `AI Bridge`). No other keys. |
 | `timeout_ms` | both | Per request (a tool call, a resource read). Default `60000`. |
 | `connect_timeout_ms` | both | Starting and initializing. Default `30000`. |
+| `tools_refresh_ms` | both | When a turn starts and the server's tool list is older than this, it is read again first (at most 3 seconds; a slower read finishes in the background, a failed one keeps the old list). For servers that decide per user which tools they offer and never send `tools/list_changed`. Default `60000`; `0` = only on connect and on `tools/list_changed`. |
 
 ## Secrets
 
@@ -167,7 +168,7 @@ A view may only read `ui://` resources of its own server.
   **stay listed**, and the next use reconnects at once rather than waiting for
   the backoff. An error the server itself answered keeps the connection.
 - A slow request times out after `timeout_ms` (`timeout`); the connection is kept.
-- `notifications/tools/list_changed` refreshes that server's tools.
+- `notifications/tools/list_changed` refreshes that server's tools. Without one, a turn that starts re-reads a list older than `tools_refresh_ms` (default one minute), so tools a server added or withdrew later (for example after a permission change) show in that turn.
 - Stopping the bridge stops every stdio server it started.
 
 Upstream tools are offered only when the web application runs the CLI in

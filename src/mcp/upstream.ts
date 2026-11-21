@@ -61,6 +61,15 @@ export const MCP_APPS_BRIDGE_REVISION = 1;
 
 export const DEFAULT_CALL_TIMEOUT_MS = 60_000;
 export const DEFAULT_CONNECT_TIMEOUT_MS = 30_000;
+/**
+ * A server's tool list is re-read when a turn starts and it is older than this.
+ * Many servers decide per user which tools they offer and never send
+ * tools/list_changed (Alex: a permission granted mid-day), so a list read at
+ * connect would otherwise stay as it was until the bridge reconnects.
+ */
+export const DEFAULT_TOOLS_REFRESH_MS = 60_000;
+/** How long a turn's tools/list waits for those re-reads; a slower one finishes in the background. */
+export const TOOLS_REFRESH_BUDGET_MS = 3_000;
 /** Reconnect backoff: first wait, doubled each failure, capped. */
 export const RECONNECT_BASE_MS = 1_000;
 export const RECONNECT_MAX_MS = 60_000;
@@ -80,6 +89,11 @@ interface UpstreamCommon {
   timeout_ms?: number;
   /** Connect and initialize, in ms. Default 30000. */
   connect_timeout_ms?: number;
+  /**
+   * Re-read the server's tool list when a turn starts and the list is older than
+   * this, in ms. Default 60000; 0 = only on connect and on tools/list_changed.
+   */
+  tools_refresh_ms?: number;
 }
 
 export type UpstreamConfig =
@@ -204,6 +218,11 @@ export function parseUpstreamConfig(doc: unknown): Record<string, UpstreamConfig
     if (t !== undefined) common.timeout_ms = t;
     const ct = checkTimeout(where, 'connect_timeout_ms', c['connect_timeout_ms']);
     if (ct !== undefined) common.connect_timeout_ms = ct;
+    const tr = c['tools_refresh_ms'];
+    if (tr !== undefined) {
+      if (typeof tr !== 'number' || !Number.isInteger(tr) || tr < 0) throw new Error(`${where}: tools_refresh_ms must be a whole number of milliseconds, 0 or more`);
+      common.tools_refresh_ms = tr;
+    }
 
     if (c['auth'] !== undefined && c['auth'] !== 'oauth') throw new Error(`${where}: auth must be "oauth" or absent`);
     if (c['oauth'] !== undefined && c['auth'] !== 'oauth') throw new Error(`${where}: "oauth" needs "auth": "oauth"`);
@@ -343,6 +362,10 @@ interface Conn {
   quiet: boolean;
   /** The server connection (session number) this upstream last sent upstream_auth_required on. */
   promptedIn: number;
+  /** When `tools` was last read from this connection (ms since epoch); 0 = never. */
+  listedAt: number;
+  /** A re-read of the tool list in flight, shared by concurrent turns. */
+  refreshing: Promise<void> | null;
 }
 
 /** One entry of `upstream_status`. */
@@ -407,6 +430,7 @@ export class UpstreamHub {
         secrets: [], failures: 0, retryTimer: null, lastError: null,
         auth: oauth ? 'oauth' : refs ? 'secrets' : 'none',
         oauth, needsAuth: null, quiet: false, promptedIn: 0,
+        listedAt: 0, refreshing: null,
       });
     }
   }
@@ -528,6 +552,7 @@ export class UpstreamHub {
     try {
       await withTimeout(client.connect(transport), c.cfg.connect_timeout_ms ?? DEFAULT_CONNECT_TIMEOUT_MS, `connecting to ${c.name}`);
       const tools = await this.listAllTools(client, c);
+      c.listedAt = Date.now();
       if (this.closed) throw new UpstreamError('unavailable', 'the bridge is shutting down');
       c.client = client;
       c.tools = tools;
@@ -543,6 +568,7 @@ export class UpstreamHub {
     client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
       try {
         c.tools = await this.listAllTools(client, c);
+        c.listedAt = Date.now();
         this.options.onToolsChanged?.();
         this.statusMaybeChanged();
       } catch (err) {
@@ -552,6 +578,52 @@ export class UpstreamHub {
     log.info('upstream MCP server connected', { name: c.name, tools: c.tools.map((t) => t.name) });
     this.options.onToolsChanged?.();
     return client;
+  }
+
+  /**
+   * Called when a turn asks for the tool list: re-read every connected server's
+   * list that is older than its `tools_refresh_ms`, so tools a server added or
+   * withdrew since (often a permission change) show in this turn. Waits at most
+   * `budgetMs`; a slower re-read finishes in the background and the next turn
+   * sees it. A failed re-read keeps the old list and the connection. Never throws.
+   */
+  async refreshTools(budgetMs = TOOLS_REFRESH_BUDGET_MS): Promise<void> {
+    const now = Date.now();
+    const due = [...this.conns.values()].filter((c) => {
+      const every = c.cfg.tools_refresh_ms ?? DEFAULT_TOOLS_REFRESH_MS;
+      return c.client !== null && every > 0 && now - c.listedAt >= every;
+    });
+    if (due.length === 0) return;
+    const all = Promise.all(due.map((c) => (c.refreshing ??= this.refreshOne(c).finally(() => { c.refreshing = null; }))));
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([all, new Promise<void>((r) => { timer = setTimeout(r, budgetMs); timer.unref?.(); })]);
+    if (timer) clearTimeout(timer);
+  }
+
+  private async refreshOne(c: Conn): Promise<void> {
+    const client = c.client;
+    if (!client) return;
+    try {
+      const tools = await this.listAllTools(client, c);
+      if (c.client !== client || this.closed) return;
+      c.listedAt = Date.now();
+      const key = (list: UpstreamTool[]) => JSON.stringify(list.map((t) => [t.name, t.description ?? '', t.inputSchema, t._meta ?? null]));
+      if (key(tools) === key(c.tools)) return;
+      const before = new Set(c.tools.map((t) => t.name));
+      const after = new Set(tools.map((t) => t.name));
+      c.tools = tools;
+      log.info('upstream tools changed on refresh', {
+        name: c.name,
+        added: [...after].filter((n) => !before.has(n)),
+        removed: [...before].filter((n) => !after.has(n)),
+      });
+      this.options.onToolsChanged?.();
+      this.statusMaybeChanged();
+    } catch (err) {
+      // Keep the list we had; try again after the next interval, not on every turn.
+      c.listedAt = Date.now();
+      log.warn('upstream tools refresh failed; keeping the previous list', { name: c.name, error: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   private async listAllTools(client: Client, c: Conn): Promise<UpstreamTool[]> {

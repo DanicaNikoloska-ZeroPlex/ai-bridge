@@ -47,6 +47,12 @@ describe('parseUpstreamConfig', () => {
     expect(parseUpstreamConfig({ a: { url: 'https://h/mcp' } })).toEqual({ a: { url: 'https://h/mcp' } });
   });
 
+  it('reads tools_refresh_ms and refuses a bad one', () => {
+    expect(parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: 0 } })['a']).toMatchObject({ tools_refresh_ms: 0 });
+    expect(() => parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: -1 } })).toThrow(/tools_refresh_ms/);
+    expect(() => parseUpstreamConfig({ a: { command: 'x', tools_refresh_ms: '60' } })).toThrow(/tools_refresh_ms/);
+  });
+
   it('keeps env/vault references and literal non-secrets', () => {
     const cfg = parseUpstreamConfig({ mcpServers: {
       gh: { url: 'https://h/mcp', headers: { Authorization: { env: 'GH_TOKEN', prefix: 'Bearer ' }, 'X-Org': 'acme' } },
@@ -227,6 +233,71 @@ describe('UpstreamHub over stdio', () => {
     await hub.callFromModel('fx__add_tool', {});
     await until(() => hub!.owns('fx__added'), 'the added tool');
     expect(changes).toBeGreaterThan(before);
+  });
+
+  describe('refreshing tool lists when a turn starts (D10067)', () => {
+    it('shows a tool the server added without tools/list_changed, once the list is older than tools_refresh_ms', async () => {
+      let changes = 0;
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 50 } as Partial<UpstreamConfig>) }, { onToolsChanged: () => { changes++; } });
+      await hub.start();
+      await hub.callFromModel('fx__add_tool_silently', {});
+      expect(hub.owns('fx__silent')).toBe(false);
+      await new Promise((r) => setTimeout(r, 80));
+      const before = changes;
+      await hub.refreshTools();
+      expect(hub.owns('fx__silent')).toBe(true);
+      expect(changes).toBe(before + 1);
+    });
+
+    it('does not ask the server again within tools_refresh_ms', async () => {
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 60_000 } as Partial<UpstreamConfig>) });
+      await hub.start();
+      await hub.callFromModel('fx__add_tool_silently', {});
+      await hub.refreshTools();
+      expect(hub.owns('fx__silent')).toBe(false);
+    });
+
+    it('never refreshes with tools_refresh_ms 0', async () => {
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 0 } as Partial<UpstreamConfig>) });
+      await hub.start();
+      await hub.callFromModel('fx__add_tool_silently', {});
+      await new Promise((r) => setTimeout(r, 30));
+      await hub.refreshTools();
+      expect(hub.owns('fx__silent')).toBe(false);
+    });
+
+    it('does not report a change when the list is the same', async () => {
+      let changes = 0;
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 20 } as Partial<UpstreamConfig>) }, { onToolsChanged: () => { changes++; } });
+      await hub.start();
+      const before = changes;
+      await new Promise((r) => setTimeout(r, 40));
+      await hub.refreshTools();
+      expect(changes).toBe(before);
+    });
+
+    it('answers within the budget when the server lists slowly, keeps the old list, and catches up in the background', async () => {
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 20 } as Partial<UpstreamConfig>) });
+      await hub.start();
+      await hub.callFromModel('fx__slow_lists', { ms: 600 });
+      await hub.callFromModel('fx__add_tool_silently', {});
+      await new Promise((r) => setTimeout(r, 40));
+      const t0 = Date.now();
+      await hub.refreshTools(100);
+      expect(Date.now() - t0).toBeLessThan(400);
+      expect(hub.owns('fx__silent')).toBe(false);
+      expect(hub.owns('fx__plain')).toBe(true);
+      await until(() => hub!.owns('fx__silent'), 'the background refresh');
+    });
+
+    it('keeps the list when the refresh fails', async () => {
+      hub = new UpstreamHub({ fx: stdio({ tools_refresh_ms: 20, timeout_ms: 100 } as Partial<UpstreamConfig>) });
+      await hub.start();
+      await hub.callFromModel('fx__slow_lists', { ms: 1000 });
+      await new Promise((r) => setTimeout(r, 40));
+      await hub.refreshTools(500);
+      expect(hub.owns('fx__plain')).toBe(true);
+    });
   });
 
   it('starts a stdio server with only the safe environment plus what the config names, and redacts secrets', async () => {

@@ -104,6 +104,8 @@ export class BridgeMcpServer {
    */
   private bridgeTools: ToolDefinition[] = [];
   private readonly handleCall: ToolCallHandler;
+  /** Run before every tools/list (a turn starting): lets upstream lists be re-read first. Never fails the list. */
+  private beforeListTools: (() => Promise<void>) | null = null;
   /** Per-spawn bearer tokens → AI request_id they map to. */
   private readonly tokens = new Map<string, TokenGrant>();
   /** Propagates the resolved requestId from the HTTP handler down to the tool handler. */
@@ -111,6 +113,11 @@ export class BridgeMcpServer {
 
   constructor(handleCall: ToolCallHandler) {
     this.handleCall = handleCall;
+  }
+
+  /** See `beforeListTools`. */
+  setBeforeListTools(fn: (() => Promise<void>) | null): void {
+    this.beforeListTools = fn;
   }
 
   /**
@@ -126,6 +133,9 @@ export class BridgeMcpServer {
     );
 
     server.setRequestHandler(ListToolsRequestSchema, async (): Promise<ListToolsResult> => {
+      if (this.beforeListTools) {
+        await this.beforeListTools().catch((err) => log.warn('refresh before tools/list failed', { error: err instanceof Error ? err.message : String(err) }));
+      }
       const ctx = this.callContext.getStore();
       const offered = this.offeredTo(ctx);
       log.info('MCP tools/list', {
