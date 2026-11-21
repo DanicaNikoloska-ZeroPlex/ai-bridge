@@ -45,6 +45,10 @@ import type {
   FilesReadMessage,
   FilesMoveMessage,
   FilesPurgeMessage,
+  SecretListMessage,
+  SecretPutMessage,
+  SecretDescribeMessage,
+  SecretRemoveMessage,
 } from './protocol/types.js';
 import { TurnInputPort } from './providers/turn-input.js';
 import { PROTOCOL_VERSION, BRIDGE_VERSION } from './protocol/version.js';
@@ -69,6 +73,7 @@ import {
   resolveBridgeAddendum,
   validateBridgePrompt,
   BRIDGE_PROMPT_INVALID,
+  MAX_BRIDGE_PROMPT_BYTES,
 } from './providers/env.js';
 import { SessionWorkingDirs, sessionStorePath } from './workspace/sessions.js';
 import {
@@ -93,6 +98,8 @@ import {
 import { assertAllowedAttachmentUrl, resolveApiOrigin } from './attachments/origin.js';
 import { FileReadRefusal, openRecorded, resolveRange, ServedFiles } from './attachments/served.js';
 import { FilesRefusal, SPACE_FILES_REVISION, SpaceFiles } from './spacefiles/store.js';
+import { MACHINE_SECRETS_REVISION, MachineSecrets, SecretRefusal } from './secrets/frames.js';
+import { MachineSecretStore } from './secrets/store.js';
 import { APP_NETWORK_REVISION } from './apps/egress.js';
 import { APP_CODE_REVISION } from './apps/guard.js';
 
@@ -231,6 +238,15 @@ export interface BridgeOptions {
    * only then.
    */
   webSearch?: boolean;
+  /**
+   * Machine secrets (decision 0020): the operator passed `--machine-secrets`,
+   * so the server may manage the store in `~/.ai-bridge/secrets`. Absent or
+   * false means off: hello has no `machine_secrets`, and every `secret_*`
+   * frame is refused with `machine_secrets_unsupported`.
+   */
+  machineSecrets?: boolean;
+  /** The store's folder; default `~/.ai-bridge/secrets`. For tests. */
+  secretsDir?: string;
 }
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
@@ -616,6 +632,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly allowNative: boolean;
   /** Whether the operator lets a request ask for web search (`--allow-web-search`). */
   private readonly webSearch: boolean;
+  /** The machine's secret store (`--machine-secrets`), or null when machine secrets are off. */
+  private readonly machineSecrets: MachineSecrets | null;
   /** MCP Apps: MCP servers this bridge connects to itself (src/mcp/upstream.ts). */
   private readonly upstream: UpstreamHub | null;
   private upstreamStarted = false;
@@ -735,6 +753,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.spaceFiles = new SpaceFiles(this.allowedRootPaths, this.servedFiles);
     this.allowNative = options.allowNative ?? false;
     this.webSearch = options.webSearch ?? false;
+    this.machineSecrets = options.machineSecrets
+      ? new MachineSecrets(options.secretsDir ? { store: new MachineSecretStore(options.secretsDir) } : {})
+      : null;
     this.upstream = options.mcpUpstreams && Object.keys(options.mcpUpstreams).length
       ? new UpstreamHub(options.mcpUpstreams, {
           resolveSecret: (ref) => this.resolveUpstreamSecret(ref),
@@ -1055,6 +1076,55 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       const text = error instanceof Error ? error.message : String(error);
       log.warn('Space file refused', { op: message.type, code, error: text });
       this.send({ type: 'files_result', id, ok: false, code, error: text });
+    }
+  }
+
+  /**
+   * One machine-secrets operation, answered with exactly one `secret_result`
+   * on every path. The value is never logged and never in the answer.
+   */
+  private async handleSecret(
+    message: SecretListMessage | SecretPutMessage | SecretDescribeMessage | SecretRemoveMessage,
+  ): Promise<void> {
+    const id = typeof message.id === 'string' ? message.id : '';
+    if (!id) return;
+    const name = 'name' in message && typeof message.name === 'string' ? message.name : undefined;
+    const secrets = this.machineSecrets;
+    if (!secrets) {
+      log.warn('Machine secret refused: off (no --machine-secrets)', { op: message.type });
+      this.send({
+        type: 'secret_result', id, ok: false, code: 'machine_secrets_unsupported',
+        error: 'This bridge was not started with --machine-secrets, so it does not manage secrets on this machine.',
+      });
+      return;
+    }
+    try {
+      if (message.type === 'secret_list') {
+        const rows = await secrets.list();
+        log.info('Machine secrets listed', { count: rows.length });
+        this.send({ type: 'secret_result', id, ok: true, secrets: rows });
+      } else if (message.type === 'secret_put') {
+        const { replaced } = await secrets.put(message.name, message.value, {
+          replace: message.replace, description: message.description,
+        });
+        log.info('Machine secret put', { name, replaced });
+        this.send({ type: 'secret_result', id, ok: true, replaced });
+      } else if (message.type === 'secret_describe') {
+        await secrets.describe(message.name, message.description);
+        log.info('Machine secret described', { name });
+        this.send({ type: 'secret_result', id, ok: true });
+      } else {
+        await secrets.remove(message.name);
+        log.info('Machine secret removed', { name });
+        this.send({ type: 'secret_result', id, ok: true });
+      }
+    } catch (error) {
+      const code = error instanceof SecretRefusal ? error.code : 'failed';
+      // Only a SecretRefusal's text is known to hold no value; anything else
+      // is reported without its message.
+      const text = error instanceof SecretRefusal ? error.message : 'The secret store could not do that.';
+      log.warn('Machine secret refused', { op: message.type, name, code });
+      this.send({ type: 'secret_result', id, ok: false, code, error: text });
     }
   }
 
@@ -1421,8 +1491,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     try {
       message = JSON.parse(data.toString()) as ServerToBridgeMessage;
     } catch (err) {
+      // Not the parser's message: V8 quotes the start of the text, and a
+      // frame may carry a secret's value (secret_put).
       log.error('Failed to parse server message', {
-        error: err instanceof Error ? err.message : String(err),
+        error: err instanceof Error ? err.name : 'Error',
+        bytes: Buffer.isBuffer(data) ? data.length : data.toString().length,
       });
       return;
     }
@@ -1525,6 +1598,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       case 'files_move':
       case 'files_purge':
         void this.handleSpaceFiles(message);
+        break;
+      case 'secret_list':
+      case 'secret_put':
+      case 'secret_describe':
+      case 'secret_remove':
+        void this.handleSecret(message);
         break;
       default:
         log.warn('Unknown message type received', { type: (message as { type: string }).type });
@@ -2071,6 +2150,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // `options.web_search` is honoured (Claude, isolated turns; decision 0016).
       // Only when the operator passed --allow-web-search, so the server knows.
       ...(this.webSearch ? { web_search: true } : {}),
+      // Machine secrets (decision 0020): only when the operator passed
+      // --machine-secrets; a server sends no secret_* frame without it.
+      ...(this.machineSecrets ? { machine_secrets: { revision: MACHINE_SECRETS_REVISION } } : {}),
+      // The longest bridge_prompt.text this bridge accepts; older bridges took 8 KB.
+      bridge_prompt_max_bytes: MAX_BRIDGE_PROMPT_BYTES,
       // Follows welcome.desired_bridge_version by itself (src/selfupdate/).
       self_update: this.selfUpdate?.enabled ?? false,
       // Advertise the operator's allow-list so the server can offer a picker

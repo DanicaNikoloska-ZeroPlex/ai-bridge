@@ -10,10 +10,10 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
-import { resolveOperatorPosture, type OperatorOptions } from '../../src/cli.js';
+import { resolveOperatorPosture, secretsReachableByTurns, type OperatorOptions } from '../../src/cli.js';
 
 let root: string;
 let repo: string;
@@ -204,5 +204,33 @@ describe('the attachment store', () => {
     const a = resolveOperatorPosture(options({ installName: 'repo-a' }), SERVER, {}).attachmentCache.dir;
     const b = resolveOperatorPosture(options({ installName: 'repo-b' }), SERVER, {}).attachmentCache.dir;
     expect(a).not.toBe(b);
+  });
+});
+
+describe('machine secrets (--machine-secrets, decision 0020)', () => {
+  it('are off without the flag', () => {
+    expect(resolveOperatorPosture(options(), SERVER, {}).machineSecrets).toBe(false);
+  });
+
+  it('are on with it', () => {
+    expect(resolveOperatorPosture(options({ machineSecrets: true }), SERVER, {}).machineSecrets).toBe(true);
+  });
+
+  it('warn when a turn could read the store: an allowed folder above it, or native', () => {
+    const store = '/home/u/.ai-bridge/secrets';
+    expect(secretsReachableByTurns(store, ['/home/u'], false)).toMatch(/--allow-dir \/home\/u/);
+    expect(secretsReachableByTurns(store, ['/home/u/work'], false)).toBeNull();
+    expect(secretsReachableByTurns(store, ['/home/user'], false)).toBeNull();
+    expect(secretsReachableByTurns(store, [], true)).toMatch(/native/);
+    // A store not made yet, under a home reached through a symlink.
+    const real = realpathSync(mkdtempSync(join(tmpdir(), 'home-real-')));
+    const link = `${real}-link`;
+    symlinkSync(real, link);
+    try {
+      expect(secretsReachableByTurns(join(link, '.ai-bridge', 'secrets'), [real], false)).toMatch(/--allow-dir/);
+    } finally {
+      rmSync(link);
+      rmSync(real, { recursive: true });
+    }
   });
 });

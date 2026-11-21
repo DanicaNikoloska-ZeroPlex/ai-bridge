@@ -187,6 +187,32 @@ describe('vault and Claude token, recorded for the service', () => {
   });
 });
 
+describe('machine secrets, recorded for the service', () => {
+  let dir: string;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'bridge-test-')); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  test('--machine-secrets round trips as AI_BRIDGE_MACHINE_SECRETS=1, and is absent when off', () => {
+    const on = join(dir, 'on.env');
+    writeConfig(on, { server: 'wss://h/bridge', token: 't', machineSecrets: true });
+    expect(readFileSync(on, 'utf8')).toContain('AI_BRIDGE_MACHINE_SECRETS=1\n');
+    expect(readConfig(on)).toMatchObject({ machineSecrets: true });
+    const off = join(dir, 'off.env');
+    writeConfig(off, { server: 'wss://h/bridge', token: 't' });
+    expect(readFileSync(off, 'utf8')).not.toContain('AI_BRIDGE_MACHINE_SECRETS');
+    expect(readConfig(off)?.machineSecrets).toBeUndefined();
+    const edited = join(dir, 'edited.env');
+    writeFileSync(edited, 'AI_BRIDGE_SERVER=wss://h/bridge\nAI_BRIDGE_TOKEN=t\nAI_BRIDGE_MACHINE_SECRETS=true\n');
+    expect(readConfig(edited)?.machineSecrets).toBe(true);
+  });
+
+  test('a reinstall without --machine-secrets turns machine secrets off', () => {
+    const existing = { server: 'wss://h/bridge', token: 'old', machineSecrets: true };
+    expect(configForInstall({ server: 'wss://h/bridge', token: 'new' }, 'h', existing).machineSecrets).toBe(false);
+    expect(configForInstall({ server: 'wss://h/bridge', token: 'new', machineSecrets: true }, 'h', existing).machineSecrets).toBe(true);
+  });
+});
+
 describe('a pinned service', () => {
   test('the systemd unit starts the version in the env file, with the flags asked for, and restarts', async () => {
     const { systemdUnit } = await import('../src/service/platform.js');

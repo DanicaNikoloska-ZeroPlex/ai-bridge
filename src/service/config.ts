@@ -51,12 +51,22 @@ export interface BridgeConfig {
    * edit, and this file never holds a second copy.
    */
   claudeEnv?: string | undefined;
+  /**
+   * Machine secrets are on for this install (decision 0020), recorded as
+   * AI_BRIDGE_MACHINE_SECRETS=1. Absent or false means off.
+   */
+  machineSecrets?: boolean | undefined;
+}
+
+/** Whether an environment value turns a switch on: 1, true or yes (any case). */
+export function envSwitch(value: string | undefined): boolean {
+  return value !== undefined && ['1', 'true', 'yes'].includes(value.trim().toLowerCase());
 }
 
 /** Keys this module writes. Anything else in the file belongs to somebody else. */
 const OWN_KEYS = new Set([
   'AI_BRIDGE_SERVER', 'AI_BRIDGE_TOKEN', 'AI_BRIDGE_ALLOW_DIR', 'AI_BRIDGE_NAME', 'AI_BRIDGE_VERSION',
-  'ENGRAM_URL', 'AI_BRIDGE_CLAUDE_ENV',
+  'ENGRAM_URL', 'AI_BRIDGE_CLAUDE_ENV', 'AI_BRIDGE_MACHINE_SECRETS',
   ...ATTACHMENT_ENV_KEYS,
 ]);
 
@@ -97,6 +107,7 @@ export function readConfig(path: string): BridgeConfig | null {
     version: out['AI_BRIDGE_VERSION'] || undefined,
     ...(out['ENGRAM_URL'] ? { engram: out['ENGRAM_URL'] } : {}),
     ...(out['AI_BRIDGE_CLAUDE_ENV'] ? { claudeEnv: out['AI_BRIDGE_CLAUDE_ENV'] } : {}),
+    ...(envSwitch(out['AI_BRIDGE_MACHINE_SECRETS']) ? { machineSecrets: true } : {}),
     ...(Object.keys(settings).length > 0 ? { settings } : {}),
   };
 }
@@ -131,6 +142,7 @@ export function writeConfig(path: string, config: BridgeConfig): void {
     ...(config.version ? [`AI_BRIDGE_VERSION=${config.version}`] : []),
     ...(config.engram ? [`ENGRAM_URL=${config.engram}`] : []),
     ...(config.claudeEnv ? [`AI_BRIDGE_CLAUDE_ENV=${config.claudeEnv}`] : []),
+    ...(config.machineSecrets ? ['AI_BRIDGE_MACHINE_SECRETS=1'] : []),
     ...settings,
     ...foreign,
     '',

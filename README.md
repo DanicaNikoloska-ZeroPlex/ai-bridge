@@ -227,6 +227,7 @@ are left where they are.
 | `--allow-native` | | Permit the server to select `native` isolation — the CLI's full local environment, including your own MCP servers, hooks, plugins and a shell. **Off unless you pass it.** Only for a bridge you run against your own machine |
 | `--no-self-update` | `AI_BRIDGE_SELF_UPDATE=0` | Do not follow the version the server asks for; pin `AI_BRIDGE_VERSION` by hand. See [Following the server's version](#following-the-servers-version) |
 | `--allow-web-search` | | Permit the server to give an isolated Claude turn Claude Code's built-in `WebSearch` tool, and no other built-in (`options.web_search`). **Off unless you pass it.** See [Web search](#web-search) |
+| `--machine-secrets` | `AI_BRIDGE_MACHINE_SECRETS=1` | Permit the server to manage the secret store on this machine (`~/.ai-bridge/secrets`): list, add or replace, describe, remove; never read a value. **Off unless you pass it.** See [Machine secrets](#machine-secrets-off-unless---machine-secrets) |
 | `--keep-attachments` | | Keep downloaded attachments after a turn instead of deleting them. Debugging aid |
 | `--mcp-upstreams <file>` | `AI_BRIDGE_MCP_UPSTREAMS` | MCP servers this bridge connects to itself and offers to the CLI, with their MCP Apps views passed to the web application. See [MCP servers of your own](#mcp-servers-of-your-own-mcp-apps) |
 
@@ -532,6 +533,91 @@ It is hygiene, not containment. `| base64` defeats it in one word, as does
 writing the value to a file. A tool you approved can always use a secret it was
 given; what redaction buys is that the value stays out of a transcript that gets
 logged, cached and stored elsewhere.
+
+## Machine secrets (off unless --machine-secrets)
+
+The bridge keeps a small secret store on this machine, `~/.ai-bridge/secrets/`:
+one file per secret, named like the secret, readable only by you (folder 0700,
+each file 0600 from the moment it exists; on Windows the modes and the owner
+check do not apply, and the folder is as private as your profile), and an `index.json` with each
+secret's description and when it was written. Your own scripts use it with
+`aib secret`; a server may manage it **only if you start the bridge with
+`--machine-secrets`** (or `AI_BRIDGE_MACHINE_SECRETS=1`; `install
+--machine-secrets` records it, and a reinstall without the flag turns it off).
+
+| Without `--machine-secrets` | With it |
+|---|---|
+| The log says `Machine secrets: off (no --machine-secrets)`; `ai-bridge list` shows `machine secrets: off`; the server is told nothing and every request is refused (`machine_secrets_unsupported`) | The server may list the store (names, descriptions, dates), add or replace a secret, change a description and remove one. It can never read a value back |
+
+`aib secret` works on the store either way:
+
+```bash
+aib secret list                                   # names, dates, descriptions; never a value
+printf %s "$TOKEN" | aib secret add github_token --description "GitHub, read-only"
+aib secret add tls_key --from-file ./server.key   # the file as it is
+aib secret add github_token --replace < new.txt   # an existing name needs --replace
+aib secret describe github_token "GitHub, repo scope"
+aib secret path github_token                      # the file, for a program that reads one
+aib secret remove github_token --yes
+aib secret import ~/old-secrets                   # a folder of one file per secret (+ .desc/<name>)
+aib secret run github_token --env GH_TOKEN -- gh repo list
+```
+
+- **The value comes from stdin or `--from-file`, never an argument** (an
+  argument ends up in your shell history and in `ps`). From a pipe, one
+  trailing newline is dropped, so `echo "$X" | aib secret add` stores what
+  `printf %s` would; on a terminal it asks for one line without echoing it.
+  `--from-file` keeps the file byte for byte.
+- **No command prints a value.**
+- **`run <name> [--env VAR] [--dotenv] [--no-mask] -- <command...>`** starts the
+  command with `SECRET_FILE` (the secret's path) and `SECRET_NAME` set.
+  `--env VAR` also puts the content, trimmed, in `VAR`; `--dotenv` sets every
+  `KEY=VALUE` line of the secret (`export ` and matching quotes stripped,
+  comments and blank lines skipped), and refuses a secret that would set a
+  variable that makes programs load code or read other files (`LD_*`,
+  `DYLD_*`, `NODE_OPTIONS`, `PATH`, `HOME`, `BASH_ENV`, `PYTHON*`,
+  `JAVA_TOOL_OPTIONS`, `GIT_*`, `SSH_*`, `EDITOR`, `SECRET_FILE` and the like;
+  a list, so not complete); `{SECRET_FILE}` in any
+  argument becomes the path. The command's output passes through a filter that
+  prints `***SECRET***` for every value of 8 characters or more: the whole
+  content, each line of a multi-line secret, each `KEY=VALUE` value, in a JSON
+  secret the string values under keys matching
+  `key|secret|token|pass|pwd|credential|auth`, and each of those as it looks
+  JSON-escaped. `--no-mask` lets the output through untouched (and keeps the
+  terminal, for an interactive program). The exit code is the command's; 127
+  when it is not found, 128 + the signal when it was killed. The filter is a
+  guard against an accidental print, not a sandbox: a program that encodes
+  the value (base64, URL encoding) prints it, and values under 8 characters
+  are never masked.
+- **`import <folder>`** copies every regular file whose name is a valid secret
+  name, with a description from `<folder>/.desc/<name>` when there is one.
+  Dot files are skipped, so is anything that is not a regular file; an
+  existing name is skipped unless `--replace`. It prints which names it
+  imported and skipped, never a value, and leaves the folder as it was.
+- **Names:** letters and digits first, then letters, digits, `.`, `_`, `-`; at
+  most 64 characters; not `index.json`; not differing from an existing name
+  only in case.
+- **Descriptions:** at most 1000 characters, no control characters but tab and
+  newline.
+- The store refuses to work in a folder that is a symlink, owned by someone
+  else or open to others, and says why; it never fixes the folder for you.
+- Not in it: encryption at rest (the files are as safe as your account),
+  versions or backups, a separate user. A secret's value is not scrubbed from
+  a turn's output.
+- **"Never read back" holds only while no turn can open the folder.** With
+  `--allow-dir` on a folder that contains `~/.ai-bridge/secrets` (your home,
+  say), a `workspace` turn can read the files, and so can a `native` turn with
+  `--allow-native`; the bridge warns at startup when that is so. A
+  `workspace` turn runs the CLI's tools as you and is not a sandbox (see
+  [Working in a repository](#working-in-a-repository)), so even a narrower
+  folder does not make the store unreadable to it: on a machine with secrets,
+  trust the server with the turns it runs there.
+- A server that may write secrets may write one you later `run`: `--dotenv`
+  refuses the variables above, but a secret used as a config file (a
+  kubeconfig, an SSH config) is the program's to trust.
+
+The protocol side is [Secrets on the machine](PROTOCOL.md#secrets-on-the-machine);
+why it works this way is [decision 0020](docs/decisions/0020-machine-secrets-built-in-store-operator-opt-in.md).
 
 ## App backends
 
