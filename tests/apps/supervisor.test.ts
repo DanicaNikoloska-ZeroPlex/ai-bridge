@@ -191,6 +191,38 @@ describe('app backends', () => {
     expect(s.list()).toHaveLength(1);
   });
 
+  it('start again when a sealed value it holds is sealed anew under the same id, as a reconnect does', async () => {
+    const store = new SecretStore();
+    store.add({ id: 'sec-1', spaceId: 'space-1', itemId: 'item-1', field: 'password', value: 'old-sealed-value' });
+    const s = supervisor({}, store);
+    const v = version(10);
+    const fill = [{ role: 'mail', item_id: 'item-1', space_id: 'space-1', fields: { user: 'me@example.test' },
+      sealed: [{ field: 'password', secret_id: 'sec-1', space_id: 'space-1' }] }];
+    const first = json(await s.handle(call(v, '/items', { fill })));
+    // Unchanged: the same process answers.
+    expect(json(await s.handle(call(v, '/items', { fill }))).pid).toBe(first.pid);
+
+    // Re-sealed in place: same secret id, field and space, so the fill is identical.
+    store.add({ id: 'sec-1', spaceId: 'space-1', itemId: 'item-1', field: 'password', value: 'new-sealed-value' });
+    const after = json(await s.handle(call(v, '/items', { fill })));
+    expect(after.pid).not.toBe(first.pid);
+    expect(after.secret).toBe('[redacted: ENGRAM_MAIL_PASSWORD]');
+    expect(s.list()).toHaveLength(1);
+  });
+
+  it('keep the running process when its sealed values cannot be fetched to compare', async () => {
+    const store = new SecretStore();
+    store.add({ id: 'sec-1', spaceId: 'space-1', itemId: 'item-1', field: 'password', value: 'kept-sealed-value' });
+    let down = false;
+    const s = supervisor({ secrets: async () => { if (down) throw new Error('Engram unreachable'); return store; } });
+    const v = version(11);
+    const fill = [{ role: 'mail', item_id: 'item-1', space_id: 'space-1', fields: { user: 'me@example.test' },
+      sealed: [{ field: 'password', secret_id: 'sec-1', space_id: 'space-1' }] }];
+    const first = json(await s.handle(call(v, '/items', { fill })));
+    down = true;
+    expect(json(await s.handle(call(v, '/items', { fill }))).pid).toBe(first.pid);
+  });
+
   it('hand another linked item to one request beside it, never into the environment, on the same process', async () => {
     const store = new SecretStore();
     store.add({ id: 'sec-1', spaceId: 'space-1', itemId: 'item-1', field: 'password', value: 'default-secret-value' });
