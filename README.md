@@ -634,8 +634,8 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   tools read only the turn's own attachments; the server's declared tools,
   and with `--local-tools` the app backends, still run on this machine, and so
   do hooks in your own `~/.claude` settings. An `isolated` Codex turn keeps a
-  read-only shell that can read the store, and Gemini has no such lever at
-  all (see [docs/isolation.md](docs/isolation.md)).
+  read-only shell that can read the store, and Gemini cannot be held to the
+  server's tools at all (see [docs/isolation.md](docs/isolation.md)).
 - **Secrets a server wrote are not treated differently** from ones you added:
   no marker, no extra refusal in `run` (decision 0021). A server that can run
   turns on this machine with a shell can already run code here, so marking

@@ -164,17 +164,22 @@ told the model to; the bridge warns at startup when the store is inside an
 - **Claude:** no shell, and its file tools read only the turn's own
   attachments, so it cannot open the store with Claude's tools (measured: both
   the Read tool and `cat` in Bash were denied on a file outside the turn's
-  folder). Server-declared tools still run, and with `--local-tools` app
-  backends, and hooks in the operator's own `~/.claude` settings.
-- **Codex:** keeps a read-only shell (`sandbox_mode=read-only`), which can
-  read the store's files.
-- **Gemini:** has no lever that holds it to server tools (above), so nothing
-  keeps it from the store.
+  folder, Claude 2.1.325, 2026-11-22). Server-declared tools still run on
+  this machine, as do app backends with `--local-tools` and hooks in the
+  operator's own `~/.claude` settings.
+- **Codex:** keeps a read-only shell (`sandbox_mode=read-only`), and a
+  read-only shell can still read files, the store's included (reasoned, not
+  measured, like the rest of Codex's posture above).
+- **Gemini:** has no lever that holds it to server tools (above). Its shell
+  stalls on approval by default, but what it may read is up to Gemini's own
+  defaults and `~/.gemini/settings.json`, so the bridge cannot keep it from
+  the store.
 
 A machine with secrets that must stay out of turns' reach runs Claude turns
 `isolated`, or keeps the secrets under another account; a single `isolated`
 turn (`ai_request.cli_isolation`) is refused on Codex and Gemini, never run
-wider (decision 0012).
+wider (decision 0012); a connection-wide `isolated` posture on them still
+runs, with the gaps above.
 
 ## Checking it on your own machine
 
