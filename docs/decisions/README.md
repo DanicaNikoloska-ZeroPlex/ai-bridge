@@ -28,3 +28,5 @@ history. Format: Engram documentation standard v1, section 3.
 | [0018](0018-claude-sign-in-profiles-saved-back-before-a-switch.md) | Claude sign-in profiles, saved back before every switch | accepted | 2026-11-15 |
 | [0019](0019-the-repository-names-no-downstream-project.md) | The repository names no downstream project; history is kept and mapped | accepted | 2026-11-21 |
 | [0020](0020-machine-secrets-built-in-store-operator-opt-in.md) | Machine secrets: a built-in store, managed by a server only with the operator's opt-in | accepted | 2026-11-21 |
+| [0021](0021-secrets-a-server-wrote-are-not-marked.md) | Secrets a server wrote are treated like the ones the person added | accepted | 2026-11-22 |
+| [0022](0022-readable-store-warns-prompt-injection-out-of-scope.md) | A store a turn could read is a startup warning; prompt injection is outside the threat model | accepted | 2026-11-22 |

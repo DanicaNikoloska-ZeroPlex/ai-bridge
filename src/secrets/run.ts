@@ -6,7 +6,9 @@
  * `--env VAR` the content (trimmed) in VAR; with `--dotenv` every KEY=VALUE
  * line of the secret as a variable. "{SECRET_FILE}" in any argument becomes
  * the path. Unless `--no-mask`, its stdout and stderr pass through a filter
- * that prints ***SECRET*** for every value of 8 characters or more.
+ * that prints ***SECRET*** for every value it knows: the whole secret and the
+ * values under secret-looking keys from 4 characters, anything else in it from
+ * 8 (see maskPlan()).
  */
 
 import { spawn } from 'node:child_process';
@@ -15,9 +17,22 @@ import type { Readable } from 'node:stream';
 import { stripCredentials } from '../providers/env.js';
 
 export const MASK = '***SECRET***';
-/** Shorter values are not masked: they would mask ordinary words. */
+/**
+ * A part of a secret that is not known to be secret (a line of a multi-line
+ * secret, the value of `REGION=`) is masked only from this length: shorter
+ * ones are ordinary words and numbers.
+ */
 export const MIN_MASK_LENGTH = 8;
-/** Keys in a JSON secret whose string values are masked. */
+/**
+ * The whole secret, and a value under a secret-looking key (`DB_PASSWORD=`,
+ * `"token":`), is masked from this length: a 4-digit PIN or a 6-character
+ * password is still one. Shorter ones are not (masking every "ab" would wreck
+ * the output and hide nothing worth hiding); `run` says on stderr how many
+ * values that left unmasked. The price is false positives: a password "true"
+ * masks every "true" the command prints.
+ */
+export const MIN_SECRET_MASK_LENGTH = 4;
+/** Keys (in a JSON secret, or a KEY=VALUE line) whose values are known to be secret. */
 const JSON_SECRET_KEY = /key|secret|token|pass|pwd|credential|auth/i;
 /** An environment variable's name. */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -82,27 +97,49 @@ function jsonSecretValues(node: unknown, underSecretKey: boolean, out: string[])
   }
 }
 
+export interface MaskPlan {
+  /** What the filter replaces, longest first. */
+  values: string[];
+  /** How many known-secret values were too short to mask (under MIN_SECRET_MASK_LENGTH). */
+  unmasked: number;
+}
+
 /**
- * Every value the output filter hides for this secret: the whole content and
- * its trimmed form, each line of a multi-line secret, each KEY=VALUE value,
- * and, for JSON, the string values under secret-looking keys; each also in
- * its JSON-escaped form (what `jq -c` prints). Only those of MIN_MASK_LENGTH
- * or more, longest first so a longer value is masked whole before a part of
- * it. Only these literal forms are matched: an encoded value (base64, URL
+ * Every value the output filter hides for this secret, longest first so a
+ * longer value is masked whole before a part of it; each also in its
+ * JSON-escaped form (what `jq -c` prints).
+ * - Known to be secret, masked from MIN_SECRET_MASK_LENGTH: the whole content
+ *   (and its trimmed form), each KEY=VALUE value whose key looks secret, and
+ *   in JSON the string values under secret-looking keys.
+ * - Anything else, masked from MIN_MASK_LENGTH: each line of a multi-line
+ *   secret, each other KEY=VALUE value.
+ * Only these literal forms are matched: an encoded value (base64, URL
  * encoding) gets through.
  */
-export function maskValues(content: string): string[] {
+export function maskPlan(content: string): MaskPlan {
   const trimmed = content.trim();
-  const values = [content, trimmed];
-  if (trimmed.includes('\n')) for (const line of trimmed.split(/\r?\n/)) values.push(line.trim());
-  for (const [, value] of parseDotenv(content)) values.push(value);
+  const secret = [content, trimmed];
+  const other: string[] = [];
+  if (trimmed.includes('\n')) for (const line of trimmed.split(/\r?\n/)) other.push(line.trim());
+  for (const [key, value] of parseDotenv(content)) (JSON_SECRET_KEY.test(key) ? secret : other).push(value);
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
     try {
-      jsonSecretValues(JSON.parse(trimmed), false, values);
+      jsonSecretValues(JSON.parse(trimmed), false, secret);
     } catch { /* not JSON */ }
   }
-  const escaped = values.map((v) => JSON.stringify(v).slice(1, -1));
-  return [...new Set([...values, ...escaped].filter((v) => v.length >= MIN_MASK_LENGTH))].sort((a, b) => b.length - a.length);
+  const withEscaped = (list: string[]): string[] => [...list, ...list.map((v) => JSON.stringify(v).slice(1, -1))];
+  const values = new Set([
+    ...withEscaped(secret).filter((v) => v.length >= MIN_SECRET_MASK_LENGTH),
+    ...withEscaped(other).filter((v) => v.length >= MIN_MASK_LENGTH),
+  ]);
+  // Counted once per distinct value; an empty value is no secret.
+  const unmasked = new Set(secret.filter((v) => v.length > 0 && v.length < MIN_SECRET_MASK_LENGTH && !values.has(v))).size;
+  return { values: [...values].sort((a, b) => b.length - a.length), unmasked };
+}
+
+/** maskPlan()'s values. */
+export function maskValues(content: string): string[] {
+  return maskPlan(content).values;
 }
 
 /**
@@ -245,7 +282,10 @@ export function runWithSecret(options: RunOptions): Promise<number> {
     let exitCode: number | null = null;
     const maybeDone = (): void => { if (pending === 0 && exitCode !== null) done(exitCode); };
     if (mask) {
-      const values = maskValues(text);
+      const { values, unmasked } = maskPlan(text);
+      if (unmasked > 0) {
+        stderr.write(`aib secret run: ${unmasked} value${unmasked === 1 ? '' : 's'} of ${options.name} ${unmasked === 1 ? 'is' : 'are'} under ${MIN_SECRET_MASK_LENGTH} characters and ${unmasked === 1 ? 'is' : 'are'} not masked\n`);
+      }
       for (const [from, to] of [[child.stdout!, stdout], [child.stderr!, stderr]] as Array<[Readable, NodeJS.WritableStream]>) {
         const filter = new MaskingFilter(values);
         pending++;

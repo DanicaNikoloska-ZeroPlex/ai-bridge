@@ -579,16 +579,23 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   `JAVA_TOOL_OPTIONS`, `GIT_*`, `SSH_*`, `EDITOR`, `SECRET_FILE` and the like;
   a list, so not complete); `{SECRET_FILE}` in any
   argument becomes the path. The command's output passes through a filter that
-  prints `***SECRET***` for every value of 8 characters or more: the whole
-  content, each line of a multi-line secret, each `KEY=VALUE` value, in a JSON
-  secret the string values under keys matching
-  `key|secret|token|pass|pwd|credential|auth`, and each of those as it looks
-  JSON-escaped. `--no-mask` lets the output through untouched (and keeps the
-  terminal, for an interactive program). The exit code is the command's; 127
-  when it is not found, 128 + the signal when it was killed. The filter is a
-  guard against an accidental print, not a sandbox: a program that encodes
-  the value (base64, URL encoding) prints it, and values under 8 characters
-  are never masked.
+  prints `***SECRET***` for each value of the secret, and each as it looks
+  JSON-escaped:
+  - from 4 characters, what is known to be secret: the whole content, a
+    `KEY=VALUE` value whose key matches `key|secret|token|pass|pwd|credential|auth`
+    (`DB_PASSWORD=abc123`), and in a JSON secret the string values under such
+    keys;
+  - from 8 characters, the rest: each line of a multi-line secret, every other
+    `KEY=VALUE` value (`DB_HOST=db.internal`, but not `REGION=eu`).
+
+  A secret value under 4 characters is not masked, and `run` says on stderr how
+  many there were (never which). Short values give false positives: a
+  password `true` masks every `true` the command prints. `--no-mask` lets the
+  output through untouched (and keeps the terminal, for an interactive
+  program). The exit code is the command's; 127 when it is not found, 128 +
+  the signal when it was killed. The filter is a guard against an accidental
+  print, not a sandbox: a program that encodes the value (base64, URL
+  encoding) prints it.
 - **`import <folder>`** copies every regular file whose name is a valid secret
   name, with a description from `<folder>/.desc/<name>` when there is one.
   Dot files are skipped, so is anything that is not a regular file; an
@@ -611,7 +618,19 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   `workspace` turn runs the CLI's tools as you and is not a sandbox (see
   [Working in a repository](#working-in-a-repository)), so even a narrower
   folder does not make the store unreadable to it: on a machine with secrets,
-  trust the server with the turns it runs there.
+  trust the server with the turns it runs there. The startup warning is all
+  the bridge does about it; it does not refuse to start (decision 0022).
+- **The bridge does not defend against prompt injection.** It is not in its
+  threat model: a turn that can read files or run commands does what the
+  model decides, and text the model reads (a web page, a file, a tool result)
+  can steer that. What keeps a turn away from the store is the posture
+  (`isolated`, the default, has no shell and reads only the turn's own
+  attachments), not anything the bridge checks inside a turn: it adds no hook
+  or filter of its own to the CLI.
+- **Secrets a server wrote are not treated differently** from ones you added:
+  no marker, no extra refusal in `run` (decision 0021). A server that can run
+  turns on this machine with a shell can already run code here, so marking
+  them would add no protection.
 - A server that may write secrets may write one you later `run`: `--dotenv`
   refuses the variables above, but a secret used as a config file (a
   kubeconfig, an SSH config) is the program's to trust.

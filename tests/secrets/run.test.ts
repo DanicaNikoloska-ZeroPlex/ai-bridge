@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { Writable } from 'node:stream';
-import { MASK, MaskingFilter, dotenvVariables, maskValues, parseDotenv, runWithSecret } from '../../src/secrets/run.js';
+import { MASK, MaskingFilter, dotenvVariables, maskPlan, maskValues, parseDotenv, runWithSecret } from '../../src/secrets/run.js';
 
 const VALUE = 'sk-test-0123456789-very-secret';
 
@@ -43,8 +43,10 @@ describe('dotenvVariables', () => {
 });
 
 describe('maskValues', () => {
-  it('masks the content, each dotenv value and JSON secret-key values of 8+ characters, never short ones', () => {
-    expect(maskValues('short')).toEqual([]);
+  it('masks the whole content from 4 characters, other dotenv values from 8, and JSON secret-key values', () => {
+    expect(maskValues('short')).toEqual(['short']);
+    expect(maskPlan('abc')).toEqual({ values: [], unmasked: 1 });
+    expect(maskPlan('A=1\nPASS=xy\nTOKEN=')).toEqual({ values: ['A=1\\nPASS=xy\\nTOKEN=', 'A=1\nPASS=xy\nTOKEN='], unmasked: 1 });
     expect(maskValues(`${VALUE}\n`)).toContain(VALUE);
     expect(maskValues(`${VALUE}\n`)).toContain(`${VALUE}\\n`);
     const env = maskValues('A=abcdefghij\nB=short\n');
@@ -122,6 +124,23 @@ describe('runWithSecret', () => {
   it('masks JSON secret values', async () => {
     const r = await run(JSON.stringify({ token: 'json-token-98765' }), ['sh', '-c', 'echo json-token-98765']);
     expect(r.out).toBe(`${MASK}\n`);
+  });
+
+  it('masks a whole secret of 4 to 7 characters, and a short value under a secret-looking key', async () => {
+    const pin = await run('4821\n', ['sh', '-c', 'echo "pin 4821 in a7f-48210"']);
+    expect(pin.out).toBe(`pin ${MASK} in a7f-${MASK}0\n`);
+    expect(pin.err).toBe('');
+    const env = await run('DB_HOST=db.local\nDB_USER=admin\nDB_PASSWORD=abc123\n', ['sh', '-c', 'echo "$DB_USER:$DB_PASSWORD@$DB_HOST"'], { dotenv: true });
+    expect(env.out).toBe(`admin:${MASK}@${MASK}\n`);
+    const json = await run(JSON.stringify({ user: 'admin', password: 'pa55w' }), ['sh', '-c', 'echo admin pa55w']);
+    expect(json.out).toBe(`admin ${MASK}\n`);
+  });
+
+  it('says on stderr, without the value, when a value is too short to mask', async () => {
+    const r = await run('API_TOKEN=x9\nREGION=eu\n', ['sh', '-c', 'echo "$API_TOKEN $REGION"'], { dotenv: true });
+    expect(r.out).toBe('x9 eu\n');
+    expect(r.err).toBe('aib secret run: 1 value of demo is under 4 characters and is not masked\n');
+    expect((await run('abc', ['sh', '-c', 'true'], { mask: false })).err).toBe('');
   });
 
 
