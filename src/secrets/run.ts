@@ -118,7 +118,9 @@ export interface MaskPlan {
  */
 export function maskPlan(content: string): MaskPlan {
   const trimmed = content.trim();
-  const secret = [content, trimmed];
+  // The content as it is and trimmed, both judged by the trimmed length.
+  const whole = trimmed.length >= MIN_SECRET_MASK_LENGTH ? [content, trimmed] : [];
+  const secret: string[] = [];
   const other: string[] = [];
   if (trimmed.includes('\n')) for (const line of trimmed.split(/\r?\n/)) other.push(line.trim());
   for (const [key, value] of parseDotenv(content)) (JSON_SECRET_KEY.test(key) ? secret : other).push(value);
@@ -127,14 +129,16 @@ export function maskPlan(content: string): MaskPlan {
       jsonSecretValues(JSON.parse(trimmed), false, secret);
     } catch { /* not JSON */ }
   }
+  // Each judged by its own length, before its JSON-escaped form is added.
   const withEscaped = (list: string[]): string[] => [...list, ...list.map((v) => JSON.stringify(v).slice(1, -1))];
   const values = new Set([
-    ...withEscaped(secret).filter((v) => v.length >= MIN_SECRET_MASK_LENGTH),
-    ...withEscaped(other).filter((v) => v.length >= MIN_MASK_LENGTH),
+    ...withEscaped(whole),
+    ...withEscaped(secret.filter((v) => v.length >= MIN_SECRET_MASK_LENGTH)),
+    ...withEscaped(other.filter((v) => v.length >= MIN_MASK_LENGTH)),
   ]);
   // Counted once per distinct value; an empty value is no secret.
-  const unmasked = new Set(secret.filter((v) => v.length > 0 && v.length < MIN_SECRET_MASK_LENGTH && !values.has(v))).size;
-  return { values: [...values].sort((a, b) => b.length - a.length), unmasked };
+  const unmasked = new Set([trimmed, ...secret].filter((v) => v.length > 0 && v.length < MIN_SECRET_MASK_LENGTH)).size;
+  return { values: [...values].filter((v) => v.length > 0).sort((a, b) => b.length - a.length), unmasked };
 }
 
 /** maskPlan()'s values. */
@@ -143,11 +147,19 @@ export function maskValues(content: string): string[] {
 }
 
 /**
- * A streaming filter that replaces each value with MASK, also when a value is
- * split across chunks: the end of what it has seen is held back only while it
- * could still be the start of a value. Works on bytes (as latin1 text, one
- * character per byte), so a multi-byte character split across chunks is
- * never mangled.
+ * Stands in for a replaced value while the others are matched: above latin1,
+ * so no value (latin1 text, one character per byte) can match across it or
+ * inside it, and a value that is part of MASK is never matched in a mask.
+ */
+const PLACEHOLDER = '\u0100';
+
+/**
+ * A streaming filter that replaces each value with MASK, longest first, with
+ * the same result however the output is split into chunks: the end of what it
+ * has seen is held back while it could still be the start of a value, and
+ * further back to the start of any value that crosses that point. Works on
+ * bytes (as latin1 text, one character per byte), so a multi-byte character
+ * split across chunks is never mangled.
  */
 export class MaskingFilter {
   private readonly needles: string[];
@@ -162,22 +174,46 @@ export class MaskingFilter {
 
   push(chunk: Buffer): Buffer {
     const text = this.held + chunk.toString('latin1');
-    const masked = this.mask(text);
-    const keep = this.heldBackLength(masked);
-    this.held = masked.slice(masked.length - keep);
-    return Buffer.from(masked.slice(0, masked.length - keep), 'latin1');
+    const cut = this.safeCut(text, text.length - this.heldBackLength(text));
+    this.held = text.slice(cut);
+    return Buffer.from(this.mask(text.slice(0, cut)), 'latin1');
   }
 
   end(): Buffer {
     const rest = this.held;
     this.held = '';
-    return Buffer.from(rest, 'latin1');
+    return Buffer.from(this.mask(rest), 'latin1');
   }
 
+  /** Longest first, each replaced value out of reach of the others. */
   private mask(text: string): string {
     let out = text;
-    for (const needle of this.needles) out = out.split(needle).join(MASK);
-    return out;
+    for (const needle of this.needles) out = out.split(needle).join(PLACEHOLDER);
+    return out.split(PLACEHOLDER).join(MASK);
+  }
+
+  /**
+   * `cut` moved back to the start of any value that crosses it, until none
+   * does: then what comes before it masks the same alone as with what
+   * follows. A value that could still be completed starts at or after the
+   * first cut (heldBackLength()), so only complete ones are looked for.
+   */
+  private safeCut(text: string, cut: number): number {
+    for (let moved = true; moved && cut > 0;) {
+      moved = false;
+      for (const needle of this.needles) {
+        let at = text.indexOf(needle, Math.max(0, cut - needle.length + 1));
+        while (at !== -1 && at < cut) {
+          if (at + needle.length > cut) {
+            cut = at;
+            moved = true;
+            break;
+          }
+          at = text.indexOf(needle, at + 1);
+        }
+      }
+    }
+    return cut;
   }
 
   /**

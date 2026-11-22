@@ -94,6 +94,44 @@ describe('MaskingFilter', () => {
   });
 });
 
+describe('masking does not depend on the chunks', () => {
+  const through = (values: string[], parts: string[]): string => {
+    const filter = new MaskingFilter(values);
+    let out = '';
+    for (const p of parts) out += filter.push(Buffer.from(p)).toString('latin1');
+    return out + filter.end().toString('latin1');
+  };
+
+  it('masks a whole JSON secret split just before its last byte, though a short value inside it is a value too', () => {
+    const secret = JSON.stringify({ user: 'admin-user-x', password: 'pa55w' });
+    const { values } = maskPlan(secret);
+    const text = `got ${secret} done`;
+    for (let i = 1; i < text.length; i++) {
+      expect(through(values, [text.slice(0, i), text.slice(i)])).toBe(`got ${MASK} done`);
+    }
+  });
+
+  it('never matches a value inside a mask already written', () => {
+    const { values } = maskPlan('TOKEN=CRET\n');
+    expect(through(values, ['TOKEN=CRET and CRET'])).toBe(`${MASK} and ${MASK}`);
+    expect(through(['****', 'abcdefgh'], ['x abcdefgh ****'])).toBe(`x ${MASK} ${MASK}`);
+  });
+
+  it('gives a longer value precedence over a shorter one that overlaps it, in any split', () => {
+    const values = ['abcdefgh12', 'zzab'].sort((a, b) => b.length - a.length);
+    const text = 'zzabcdefgh12!';
+    for (let i = 1; i < text.length; i++) {
+      expect(through(values, [text.slice(0, i), text.slice(i)])).toBe(`zz${MASK}!`);
+    }
+  });
+
+  it('judges the whole secret by its trimmed length, and counts a short one once', () => {
+    expect(maskPlan('abc\n')).toEqual({ values: [], unmasked: 1 });
+    expect(maskPlan('ab ').unmasked).toBe(1);
+    expect(maskPlan('A=\t\t\nPASSWORD=\t\t').values).not.toContain('\\t\\t');
+  });
+});
+
 describe('runWithSecret', () => {
   it('sets SECRET_FILE and SECRET_NAME, replaces {SECRET_FILE}, strips the bridge token, masks the output', async () => {
     const r = await run(VALUE, ['sh', '-c', 'echo "$SECRET_NAME $SECRET_FILE $1 tok=${AI_BRIDGE_TOKEN:-none}"; echo "leak $V" >&2', 'sh', '{SECRET_FILE}'], { envVar: 'V' });

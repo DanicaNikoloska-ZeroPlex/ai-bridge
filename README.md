@@ -590,7 +590,12 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
 
   A secret value under 4 characters is not masked, and `run` says on stderr how
   many there were (never which). Short values give false positives: a
-  password `true` masks every `true` the command prints. `--no-mask` lets the
+  password `true` masks every `true` the command prints. The key test is a
+  plain substring match, so it errs both ways: `AUTH_TYPE=basic` counts as
+  secret (every `basic` is masked), `PIN=1234` does not (it is masked only as
+  the whole secret, when the secret is nothing but the PIN). The result does
+  not depend on how the command's output arrives: a value split across
+  writes is masked whole, a longer value before a shorter one inside it. `--no-mask` lets the
   output through untouched (and keeps the terminal, for an interactive
   program). The exit code is the command's; 127 when it is not found, 128 +
   the signal when it was killed. The filter is a guard against an accidental
@@ -623,10 +628,12 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
 - **The bridge does not defend against prompt injection.** It is not in its
   threat model: a turn that can read files or run commands does what the
   model decides, and text the model reads (a web page, a file, a tool result)
-  can steer that. What keeps a turn away from the store is the posture
-  (`isolated`, the default, has no shell and reads only the turn's own
-  attachments), not anything the bridge checks inside a turn: it adds no hook
-  or filter of its own to the CLI.
+  can steer that. What keeps a turn away from the store is the posture, not
+  anything the bridge checks inside a turn: it adds no hook or filter of its
+  own to the CLI. In `isolated`, the default, Claude has no shell and its file
+  tools read only the turn's own attachments; the server's declared tools,
+  and with `--local-tools` the app backends, still run on this machine, and so
+  do hooks in your own `~/.claude` settings.
 - **Secrets a server wrote are not treated differently** from ones you added:
   no marker, no extra refusal in `run` (decision 0021). A server that can run
   turns on this machine with a shell can already run code here, so marking
