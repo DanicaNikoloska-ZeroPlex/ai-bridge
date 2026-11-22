@@ -125,6 +125,17 @@ describe('masking does not depend on the chunks', () => {
     }
   });
 
+  it('holds back little on output that repeats a value, and keeps printing', () => {
+    for (const values of [['0000'], ['abcd', 'cdab']]) {
+      const filter = new MaskingFilter(values);
+      const chunk = Buffer.from(values[0]!.repeat(16 * 1024));
+      const first = filter.push(chunk).toString('latin1');
+      expect(first.length).toBeGreaterThan(chunk.length);
+      expect(first).not.toContain(values[0]);
+      expect(chunk.length - (first.length / MASK.length) * values[0]!.length).toBeLessThanOrEqual(2 * values[0]!.length);
+    }
+  });
+
   it('judges the whole secret by its trimmed length, and counts a short one once', () => {
     expect(maskPlan('abc\n')).toEqual({ values: [], unmasked: 1 });
     expect(maskPlan('ab ').unmasked).toBe(1);

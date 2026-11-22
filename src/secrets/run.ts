@@ -147,18 +147,14 @@ export function maskValues(content: string): string[] {
 }
 
 /**
- * Stands in for a replaced value while the others are matched: above latin1,
- * so no value (latin1 text, one character per byte) can match across it or
- * inside it, and a value that is part of MASK is never matched in a mask.
- */
-const PLACEHOLDER = '\u0100';
-
-/**
  * A streaming filter that replaces each value with MASK, longest first, with
- * the same result however the output is split into chunks: the end of what it
- * has seen is held back while it could still be the start of a value, and
- * further back to the start of any value that crosses that point. Works on
- * bytes (as latin1 text, one character per byte), so a multi-byte character
+ * the same result however the output is split into chunks. Per value, left to
+ * right, an occurrence that overlaps a value already replaced is skipped, so a
+ * value that is part of MASK or of a longer value is never matched inside it.
+ * The end of what it has seen is held back while it could still be the start
+ * of a value, and further back to the start of a replacement that crosses that
+ * point; held back is therefore at most about twice the longest value. Works
+ * on bytes (as latin1 text, one character per byte), so a multi-byte character
  * split across chunks is never mangled.
  */
 export class MaskingFilter {
@@ -174,46 +170,48 @@ export class MaskingFilter {
 
   push(chunk: Buffer): Buffer {
     const text = this.held + chunk.toString('latin1');
-    const cut = this.safeCut(text, text.length - this.heldBackLength(text));
+    const spans = this.replacements(text);
+    let cut = text.length - this.heldBackLength(text);
+    // Replacements do not overlap, so at most one crosses the cut. Every one
+    // that starts before it is final: a value that may still complete starts
+    // at or after the first cut, and so cannot change what lies before it.
+    for (const [start, end] of spans) {
+      if (start < cut && end > cut) { cut = start; break; }
+    }
     this.held = text.slice(cut);
-    return Buffer.from(this.mask(text.slice(0, cut)), 'latin1');
+    return Buffer.from(render(text, spans, cut), 'latin1');
   }
 
   end(): Buffer {
     const rest = this.held;
     this.held = '';
-    return Buffer.from(this.mask(rest), 'latin1');
-  }
-
-  /** Longest first, each replaced value out of reach of the others. */
-  private mask(text: string): string {
-    let out = text;
-    for (const needle of this.needles) out = out.split(needle).join(PLACEHOLDER);
-    return out.split(PLACEHOLDER).join(MASK);
+    return Buffer.from(render(rest, this.replacements(rest), rest.length), 'latin1');
   }
 
   /**
-   * `cut` moved back to the start of any value that crosses it, until none
-   * does: then what comes before it masks the same alone as with what
-   * follows. A value that could still be completed starts at or after the
-   * first cut (heldBackLength()), so only complete ones are looked for.
+   * Where `text` has a value replaced, as [start, end) sorted by start:
+   * longest value first, each left to right, skipping occurrences that
+   * overlap one already taken. O(length) per value, plus the bytes taken.
    */
-  private safeCut(text: string, cut: number): number {
-    for (let moved = true; moved && cut > 0;) {
-      moved = false;
-      for (const needle of this.needles) {
-        let at = text.indexOf(needle, Math.max(0, cut - needle.length + 1));
-        while (at !== -1 && at < cut) {
-          if (at + needle.length > cut) {
-            cut = at;
-            moved = true;
-            break;
-          }
+  private replacements(text: string): Array<[number, number]> {
+    const spans: Array<[number, number]> = [];
+    const taken = new Uint8Array(text.length);
+    for (const needle of this.needles) {
+      let at = text.indexOf(needle);
+      while (at !== -1) {
+        const end = at + needle.length;
+        let free = true;
+        for (let i = at; i < end; i++) if (taken[i]) { free = false; break; }
+        if (free) {
+          taken.fill(1, at, end);
+          spans.push([at, end]);
+          at = text.indexOf(needle, end);
+        } else {
           at = text.indexOf(needle, at + 1);
         }
       }
     }
-    return cut;
+    return spans.sort((a, b) => a[0] - b[0]);
   }
 
   /**
@@ -237,6 +235,18 @@ export class MaskingFilter {
     });
     return best;
   }
+}
+
+/** `text` up to `cut`, each replacement that ends by then shown as MASK. */
+function render(text: string, spans: Array<[number, number]>, cut: number): string {
+  let out = '';
+  let pos = 0;
+  for (const [start, end] of spans) {
+    if (end > cut) break;
+    out += text.slice(pos, start) + MASK;
+    pos = end;
+  }
+  return out + text.slice(pos, cut);
 }
 
 /** fail[i]: the length of the longest proper prefix of needle[0..i] that is also its suffix. */

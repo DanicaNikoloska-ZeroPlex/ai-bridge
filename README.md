@@ -589,7 +589,7 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
     `KEY=VALUE` value (`DB_HOST=db.internal`, but not `REGION=eu`).
 
   A secret value under 4 characters is not masked, and `run` says on stderr how
-  many there were (never which). Short values give false positives: a
+  many different ones there were (never which). Short values give false positives: a
   password `true` masks every `true` the command prints. The key test is a
   plain substring match, so it errs both ways: `AUTH_TYPE=basic` counts as
   secret (every `basic` is masked), `PIN=1234` does not (it is masked only as
