@@ -6,7 +6,9 @@
  * `--env VAR` the content (trimmed) in VAR; with `--dotenv` every KEY=VALUE
  * line of the secret as a variable. "{SECRET_FILE}" in any argument becomes
  * the path. Unless `--no-mask`, its stdout and stderr pass through a filter
- * that prints ***SECRET*** for every value of 8 characters or more.
+ * that prints ***SECRET*** for every value it knows: the whole secret and the
+ * values under secret-looking keys from 4 characters, anything else in it from
+ * 8 (see maskPlan()).
  */
 
 import { spawn } from 'node:child_process';
@@ -15,9 +17,22 @@ import type { Readable } from 'node:stream';
 import { stripCredentials } from '../providers/env.js';
 
 export const MASK = '***SECRET***';
-/** Shorter values are not masked: they would mask ordinary words. */
+/**
+ * A part of a secret that is not known to be secret (a line of a multi-line
+ * secret, the value of `REGION=`) is masked only from this length: shorter
+ * ones are ordinary words and numbers.
+ */
 export const MIN_MASK_LENGTH = 8;
-/** Keys in a JSON secret whose string values are masked. */
+/**
+ * The whole secret, and a value under a secret-looking key (`DB_PASSWORD=`,
+ * `"token":`), is masked from this length: a 4-digit PIN or a 6-character
+ * password is still one. Shorter ones are not (masking every "ab" would wreck
+ * the output and hide nothing worth hiding); `run` says on stderr how many
+ * values that left unmasked. The price is false positives: a password "true"
+ * masks every "true" the command prints.
+ */
+export const MIN_SECRET_MASK_LENGTH = 4;
+/** Keys (in a JSON secret, or a KEY=VALUE line) whose values are known to be secret. */
 const JSON_SECRET_KEY = /key|secret|token|pass|pwd|credential|auth/i;
 /** An environment variable's name. */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -82,35 +97,65 @@ function jsonSecretValues(node: unknown, underSecretKey: boolean, out: string[])
   }
 }
 
-/**
- * Every value the output filter hides for this secret: the whole content and
- * its trimmed form, each line of a multi-line secret, each KEY=VALUE value,
- * and, for JSON, the string values under secret-looking keys; each also in
- * its JSON-escaped form (what `jq -c` prints). Only those of MIN_MASK_LENGTH
- * or more, longest first so a longer value is masked whole before a part of
- * it. Only these literal forms are matched: an encoded value (base64, URL
- * encoding) gets through.
- */
-export function maskValues(content: string): string[] {
-  const trimmed = content.trim();
-  const values = [content, trimmed];
-  if (trimmed.includes('\n')) for (const line of trimmed.split(/\r?\n/)) values.push(line.trim());
-  for (const [, value] of parseDotenv(content)) values.push(value);
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    try {
-      jsonSecretValues(JSON.parse(trimmed), false, values);
-    } catch { /* not JSON */ }
-  }
-  const escaped = values.map((v) => JSON.stringify(v).slice(1, -1));
-  return [...new Set([...values, ...escaped].filter((v) => v.length >= MIN_MASK_LENGTH))].sort((a, b) => b.length - a.length);
+export interface MaskPlan {
+  /** What the filter replaces, longest first. */
+  values: string[];
+  /** How many known-secret values were too short to mask (under MIN_SECRET_MASK_LENGTH). */
+  unmasked: number;
 }
 
 /**
- * A streaming filter that replaces each value with MASK, also when a value is
- * split across chunks: the end of what it has seen is held back only while it
- * could still be the start of a value. Works on bytes (as latin1 text, one
- * character per byte), so a multi-byte character split across chunks is
- * never mangled.
+ * Every value the output filter hides for this secret, longest first so a
+ * longer value is masked whole before a part of it; each also in its
+ * JSON-escaped form (what `jq -c` prints).
+ * - Known to be secret, masked from MIN_SECRET_MASK_LENGTH: the whole content
+ *   (and its trimmed form), each KEY=VALUE value whose key looks secret, and
+ *   in JSON the string values under secret-looking keys.
+ * - Anything else, masked from MIN_MASK_LENGTH: each line of a multi-line
+ *   secret, each other KEY=VALUE value.
+ * Only these literal forms are matched: an encoded value (base64, URL
+ * encoding) gets through.
+ */
+export function maskPlan(content: string): MaskPlan {
+  const trimmed = content.trim();
+  // The content as it is and trimmed, both judged by the trimmed length.
+  const whole = trimmed.length >= MIN_SECRET_MASK_LENGTH ? [content, trimmed] : [];
+  const secret: string[] = [];
+  const other: string[] = [];
+  if (trimmed.includes('\n')) for (const line of trimmed.split(/\r?\n/)) other.push(line.trim());
+  for (const [key, value] of parseDotenv(content)) (JSON_SECRET_KEY.test(key) ? secret : other).push(value);
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      jsonSecretValues(JSON.parse(trimmed), false, secret);
+    } catch { /* not JSON */ }
+  }
+  // Each judged by its own length, before its JSON-escaped form is added.
+  const withEscaped = (list: string[]): string[] => [...list, ...list.map((v) => JSON.stringify(v).slice(1, -1))];
+  const values = new Set([
+    ...withEscaped(whole),
+    ...withEscaped(secret.filter((v) => v.length >= MIN_SECRET_MASK_LENGTH)),
+    ...withEscaped(other.filter((v) => v.length >= MIN_MASK_LENGTH)),
+  ]);
+  // Counted once per distinct value; an empty value is no secret.
+  const unmasked = new Set([trimmed, ...secret].filter((v) => v.length > 0 && v.length < MIN_SECRET_MASK_LENGTH)).size;
+  return { values: [...values].filter((v) => v.length > 0).sort((a, b) => b.length - a.length), unmasked };
+}
+
+/** maskPlan()'s values. */
+export function maskValues(content: string): string[] {
+  return maskPlan(content).values;
+}
+
+/**
+ * A streaming filter that replaces each value with MASK, longest first, with
+ * the same result however the output is split into chunks. Per value, left to
+ * right, an occurrence that overlaps a value already replaced is skipped, so a
+ * value that is part of MASK or of a longer value is never matched inside it.
+ * The end of what it has seen is held back while it could still be the start
+ * of a value, and further back to the start of a replacement that crosses that
+ * point; held back is therefore at most about twice the longest value. Works
+ * on bytes (as latin1 text, one character per byte), so a multi-byte character
+ * split across chunks is never mangled.
  */
 export class MaskingFilter {
   private readonly needles: string[];
@@ -125,22 +170,48 @@ export class MaskingFilter {
 
   push(chunk: Buffer): Buffer {
     const text = this.held + chunk.toString('latin1');
-    const masked = this.mask(text);
-    const keep = this.heldBackLength(masked);
-    this.held = masked.slice(masked.length - keep);
-    return Buffer.from(masked.slice(0, masked.length - keep), 'latin1');
+    const spans = this.replacements(text);
+    let cut = text.length - this.heldBackLength(text);
+    // Replacements do not overlap, so at most one crosses the cut. Every one
+    // that starts before it is final: a value that may still complete starts
+    // at or after the first cut, and so cannot change what lies before it.
+    for (const [start, end] of spans) {
+      if (start < cut && end > cut) { cut = start; break; }
+    }
+    this.held = text.slice(cut);
+    return Buffer.from(render(text, spans, cut), 'latin1');
   }
 
   end(): Buffer {
     const rest = this.held;
     this.held = '';
-    return Buffer.from(rest, 'latin1');
+    return Buffer.from(render(rest, this.replacements(rest), rest.length), 'latin1');
   }
 
-  private mask(text: string): string {
-    let out = text;
-    for (const needle of this.needles) out = out.split(needle).join(MASK);
-    return out;
+  /**
+   * Where `text` has a value replaced, as [start, end) sorted by start:
+   * longest value first, each left to right, skipping occurrences that
+   * overlap one already taken. O(length) per value, plus the bytes taken.
+   */
+  private replacements(text: string): Array<[number, number]> {
+    const spans: Array<[number, number]> = [];
+    const taken = new Uint8Array(text.length);
+    for (const needle of this.needles) {
+      let at = text.indexOf(needle);
+      while (at !== -1) {
+        const end = at + needle.length;
+        let free = true;
+        for (let i = at; i < end; i++) if (taken[i]) { free = false; break; }
+        if (free) {
+          taken.fill(1, at, end);
+          spans.push([at, end]);
+          at = text.indexOf(needle, end);
+        } else {
+          at = text.indexOf(needle, at + 1);
+        }
+      }
+    }
+    return spans.sort((a, b) => a[0] - b[0]);
   }
 
   /**
@@ -164,6 +235,18 @@ export class MaskingFilter {
     });
     return best;
   }
+}
+
+/** `text` up to `cut`, each replacement that ends by then shown as MASK. */
+function render(text: string, spans: Array<[number, number]>, cut: number): string {
+  let out = '';
+  let pos = 0;
+  for (const [start, end] of spans) {
+    if (end > cut) break;
+    out += text.slice(pos, start) + MASK;
+    pos = end;
+  }
+  return out + text.slice(pos, cut);
 }
 
 /** fail[i]: the length of the longest proper prefix of needle[0..i] that is also its suffix. */
@@ -245,7 +328,10 @@ export function runWithSecret(options: RunOptions): Promise<number> {
     let exitCode: number | null = null;
     const maybeDone = (): void => { if (pending === 0 && exitCode !== null) done(exitCode); };
     if (mask) {
-      const values = maskValues(text);
+      const { values, unmasked } = maskPlan(text);
+      if (unmasked > 0) {
+        stderr.write(`aib secret run: ${unmasked} value${unmasked === 1 ? '' : 's'} of ${options.name} ${unmasked === 1 ? 'is' : 'are'} under ${MIN_SECRET_MASK_LENGTH} characters and ${unmasked === 1 ? 'is' : 'are'} not masked\n`);
+      }
       for (const [from, to] of [[child.stdout!, stdout], [child.stderr!, stderr]] as Array<[Readable, NodeJS.WritableStream]>) {
         const filter = new MaskingFilter(values);
         pending++;

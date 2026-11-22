@@ -148,6 +148,20 @@ a bridge started without it cannot be pointed anywhere; that the connection
 token is per person and revocable; and that you should only connect a bridge to
 a server you would give a shell to.
 
+## Prompt injection is not in the threat model
+
+The bridge does not defend against prompt injection. A turn with file or shell
+tools does what the model decides, and anything the model reads (a web page,
+a file in the repository, a tool's result) can steer it. The bridge adds no
+hook, filter or check of its own inside a turn; the postures above are the
+whole of what it does, and they bound which tools a turn has, not what the
+model does with them. So a `workspace` or `native` turn on a machine that keeps
+secrets (`--machine-secrets`, `~/.ai-bridge/secrets`) can read them, whoever
+told the model to; the bridge warns at startup when the store is inside an
+`--allow-dir` folder or `--allow-native` is on, and does not refuse to start
+(decision 0022). An `isolated` turn has no shell and reads only its own
+attachments, so it cannot open the store with Claude's tools.
+
 ## Checking it on your own machine
 
 Flags are not behaviour. A unit test can assert what the bridge *sends*; only a

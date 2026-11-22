@@ -107,6 +107,8 @@ Node 22 or newer (CI runs 22 and 24).
 - 0018 Claude sign-in profiles, saved back before every switch.
 - 0019 The repository names no downstream project (CI: `scripts/check-names.py`); history is kept, `.mailmap` maps it.
 - 0020 Machine secrets: a built-in store, managed by a server only with `--machine-secrets`.
+- 0021 Secrets a server wrote are treated like the person's own: no marker, no extra refusal in `run`.
+- 0022 A secrets store a turn could read is a startup warning only; prompt injection is outside the bridge's threat model.
 
 Full records and status: [docs/decisions/README.md](docs/decisions/README.md).
 Before changing what one covers, read it; if your change contradicts an

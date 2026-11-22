@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { Writable } from 'node:stream';
-import { MASK, MaskingFilter, dotenvVariables, maskValues, parseDotenv, runWithSecret } from '../../src/secrets/run.js';
+import { MASK, MaskingFilter, dotenvVariables, maskPlan, maskValues, parseDotenv, runWithSecret } from '../../src/secrets/run.js';
 
 const VALUE = 'sk-test-0123456789-very-secret';
 
@@ -43,8 +43,10 @@ describe('dotenvVariables', () => {
 });
 
 describe('maskValues', () => {
-  it('masks the content, each dotenv value and JSON secret-key values of 8+ characters, never short ones', () => {
-    expect(maskValues('short')).toEqual([]);
+  it('masks the whole content from 4 characters, other dotenv values from 8, and JSON secret-key values', () => {
+    expect(maskValues('short')).toEqual(['short']);
+    expect(maskPlan('abc')).toEqual({ values: [], unmasked: 1 });
+    expect(maskPlan('A=1\nPASS=xy\nTOKEN=')).toEqual({ values: ['A=1\\nPASS=xy\\nTOKEN=', 'A=1\nPASS=xy\nTOKEN='], unmasked: 1 });
     expect(maskValues(`${VALUE}\n`)).toContain(VALUE);
     expect(maskValues(`${VALUE}\n`)).toContain(`${VALUE}\\n`);
     const env = maskValues('A=abcdefghij\nB=short\n');
@@ -92,6 +94,55 @@ describe('MaskingFilter', () => {
   });
 });
 
+describe('masking does not depend on the chunks', () => {
+  const through = (values: string[], parts: string[]): string => {
+    const filter = new MaskingFilter(values);
+    let out = '';
+    for (const p of parts) out += filter.push(Buffer.from(p)).toString('latin1');
+    return out + filter.end().toString('latin1');
+  };
+
+  it('masks a whole JSON secret split just before its last byte, though a short value inside it is a value too', () => {
+    const secret = JSON.stringify({ user: 'admin-user-x', password: 'pa55w' });
+    const { values } = maskPlan(secret);
+    const text = `got ${secret} done`;
+    for (let i = 1; i < text.length; i++) {
+      expect(through(values, [text.slice(0, i), text.slice(i)])).toBe(`got ${MASK} done`);
+    }
+  });
+
+  it('never matches a value inside a mask already written', () => {
+    const { values } = maskPlan('TOKEN=CRET\n');
+    expect(through(values, ['TOKEN=CRET and CRET'])).toBe(`${MASK} and ${MASK}`);
+    expect(through(['****', 'abcdefgh'], ['x abcdefgh ****'])).toBe(`x ${MASK} ${MASK}`);
+  });
+
+  it('gives a longer value precedence over a shorter one that overlaps it, in any split', () => {
+    const values = ['abcdefgh12', 'zzab'].sort((a, b) => b.length - a.length);
+    const text = 'zzabcdefgh12!';
+    for (let i = 1; i < text.length; i++) {
+      expect(through(values, [text.slice(0, i), text.slice(i)])).toBe(`zz${MASK}!`);
+    }
+  });
+
+  it('holds back little on output that repeats a value, and keeps printing', () => {
+    for (const values of [['0000'], ['abcd', 'cdab']]) {
+      const filter = new MaskingFilter(values);
+      const chunk = Buffer.from(values[0]!.repeat(16 * 1024));
+      const first = filter.push(chunk).toString('latin1');
+      expect(first.length).toBeGreaterThan(chunk.length);
+      expect(first).not.toContain(values[0]);
+      expect(chunk.length - (first.length / MASK.length) * values[0]!.length).toBeLessThanOrEqual(2 * values[0]!.length);
+    }
+  });
+
+  it('judges the whole secret by its trimmed length, and counts a short one once', () => {
+    expect(maskPlan('abc\n')).toEqual({ values: [], unmasked: 1 });
+    expect(maskPlan('ab ').unmasked).toBe(1);
+    expect(maskPlan('A=\t\t\nPASSWORD=\t\t').values).not.toContain('\\t\\t');
+  });
+});
+
 describe('runWithSecret', () => {
   it('sets SECRET_FILE and SECRET_NAME, replaces {SECRET_FILE}, strips the bridge token, masks the output', async () => {
     const r = await run(VALUE, ['sh', '-c', 'echo "$SECRET_NAME $SECRET_FILE $1 tok=${AI_BRIDGE_TOKEN:-none}"; echo "leak $V" >&2', 'sh', '{SECRET_FILE}'], { envVar: 'V' });
@@ -122,6 +173,23 @@ describe('runWithSecret', () => {
   it('masks JSON secret values', async () => {
     const r = await run(JSON.stringify({ token: 'json-token-98765' }), ['sh', '-c', 'echo json-token-98765']);
     expect(r.out).toBe(`${MASK}\n`);
+  });
+
+  it('masks a whole secret of 4 to 7 characters, and a short value under a secret-looking key', async () => {
+    const pin = await run('4821\n', ['sh', '-c', 'echo "pin 4821 in a7f-48210"']);
+    expect(pin.out).toBe(`pin ${MASK} in a7f-${MASK}0\n`);
+    expect(pin.err).toBe('');
+    const env = await run('DB_HOST=db.local\nDB_USER=admin\nDB_PASSWORD=abc123\n', ['sh', '-c', 'echo "$DB_USER:$DB_PASSWORD@$DB_HOST"'], { dotenv: true });
+    expect(env.out).toBe(`admin:${MASK}@${MASK}\n`);
+    const json = await run(JSON.stringify({ user: 'admin', password: 'pa55w' }), ['sh', '-c', 'echo admin pa55w']);
+    expect(json.out).toBe(`admin ${MASK}\n`);
+  });
+
+  it('says on stderr, without the value, when a value is too short to mask', async () => {
+    const r = await run('API_TOKEN=x9\nREGION=eu\n', ['sh', '-c', 'echo "$API_TOKEN $REGION"'], { dotenv: true });
+    expect(r.out).toBe('x9 eu\n');
+    expect(r.err).toBe('aib secret run: 1 value of demo is under 4 characters and is not masked\n');
+    expect((await run('abc', ['sh', '-c', 'true'], { mask: false })).err).toBe('');
   });
 
 
