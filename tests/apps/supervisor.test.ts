@@ -216,17 +216,23 @@ describe('app backends', () => {
   it('start one process, not two, for concurrent calls that meet a re-sealed value', async () => {
     const store = new SecretStore();
     store.add({ id: 'sec-1', spaceId: 'space-1', itemId: 'item-1', field: 'password', value: 'old-sealed-value' });
-    const delays: number[] = [];
-    const s = supervisor({ secrets: async () => { await new Promise((r) => setTimeout(r, delays.shift() ?? 0)); return store; } });
+    // The second call's values are held back until the first has replaced the process.
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let gated = false;
+    const s = supervisor({ secrets: async () => { calls++; if (gated && calls === 1) await gate; return store; } });
     const v = version(12);
     const fill = [{ role: 'mail', item_id: 'item-1', space_id: 'space-1', fields: { user: 'me@example.test' },
       sealed: [{ field: 'password', secret_id: 'sec-1', space_id: 'space-1' }] }];
     const first = json(await s.handle(call(v, '/items', { fill })));
     store.add({ id: 'sec-1', spaceId: 'space-1', itemId: 'item-1', field: 'password', value: 'new-sealed-value-2' });
-    // The second call's values arrive long after the first has replaced the process.
-    delays.push(0, 600);
-    const [a, b] = await Promise.all([s.handle(call(v, '/items', { fill })), s.handle(call(v, '/items', { fill }))]);
-    const ja = json(a), jb = json(b);
+    calls = 0;
+    gated = true;
+    const pb = s.handle(call(v, '/items', { fill }));
+    const ja = json(await s.handle(call(v, '/items', { fill })));
+    release();
+    const jb = json(await pb);
     expect(ja.pid).not.toBe(first.pid);
     expect(jb.pid).toBe(ja.pid);
     expect(s.list()).toHaveLength(1);
