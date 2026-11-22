@@ -201,25 +201,30 @@ export class AppSupervisor {
     // The hosts it may reach are part of what the process was started with,
     // so a host granted or taken back starts a fresh one, as an item does.
     const chosen = `${fillFingerprint(call.fill)}|${JSON.stringify(hostsOf(call.backend))}|${call.backend.public_images === true}`;
-    const current = this.running.get(key);
     // What the sealed values ARE, not only which: a reconnect or a person
     // replacing a value seals it anew under the same secret id, so the fill
     // reads the same while the process still holds the old value (a refresh
     // token the service has since revoked). The store is the bridge's cached
-    // one, so this costs nothing between its refreshes. If it cannot be
-    // fetched, a process started with the same items keeps answering.
-    let values: string;
+    // one, so this costs nothing between its refreshes, and the same store
+    // fills the process if one starts. If it cannot be fetched, a process
+    // started with the same items keeps answering with what it holds.
+    let store: SecretStore;
     try {
-      values = sealedDigest(await this.options.secrets(sealedRefs(call.fill)), call.fill);
+      store = await this.options.secrets(sealedRefs(call.fill));
     } catch (err) {
-      if (current && !current.stopping && current.fillKey.startsWith(`${chosen}|`)) {
+      const kept = this.running.get(key);
+      if (kept && !kept.stopping && kept.fillKey.startsWith(`${chosen}|`)) {
         log.warn('could not check whether an app backend\'s sealed values changed; it keeps the ones it has', {
           app: call.app.name, error: err instanceof Error ? err.message : String(err) });
-        return current;
+        return kept;
       }
       throw err;
     }
-    const fillKey = `${chosen}|${values}`;
+    const fillKey = `${chosen}|${sealedDigest(store, call.fill)}`;
+    // Read only after that await, so what follows up to the first stop or
+    // start runs without yielding, as concurrent calls rely on: one that read
+    // the process before another replaced it would start a third beside it.
+    const current = this.running.get(key);
     if (current && current.fillKey === fillKey && !current.stopping) return current;
     if (current) await this.stop(current, 'its vault items, their sealed values or the hosts it may reach changed');
 
@@ -237,14 +242,13 @@ export class AppSupervisor {
         `started again for ${CRASH_COOLDOWN_MS / 1000} seconds. Its last words are in the bridge's log.`);
     }
 
-    const start = this.start(key, fillKey, call).finally(() => this.starting.delete(key));
+    const start = this.start(key, fillKey, call, store).finally(() => this.starting.delete(key));
     this.starting.set(key, start);
     return start;
   }
 
-  private async start(key: string, fillKey: string, call: AppCallMessage): Promise<Running> {
+  private async start(key: string, fillKey: string, call: AppCallMessage, store: SecretStore): Promise<Running> {
     const dir = await this.workingCopy(call);
-    const store = await this.options.secrets(sealedRefs(call.fill));
     const filled = fillRoles(store, call.fill);
 
     const env: NodeJS.ProcessEnv = {};

@@ -29,7 +29,7 @@ rl.on('line', (line) => {
   if (req.path === '/escape') { try { require('fs').readFileSync('/etc/hostname') } catch (e) { read = e.code } }
   const answer = () => process.stdout.write(JSON.stringify({ id: req.id, status: 201, headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ pid: process.pid, n: ++n, path: req.path, method: req.method, body: req.body, api: req.engram.api,
-      token: req.engram.token, secret: process.env.ENGRAM_MAIL_PASSWORD || null, plain: process.env.ENGRAM_MAIL_USER || null,
+      token: req.engram.token, secret: process.env.ENGRAM_MAIL_PASSWORD || null, slen: (process.env.ENGRAM_MAIL_PASSWORD || '').length, plain: process.env.ENGRAM_MAIL_USER || null,
       version: process.env.ENGRAM_APP_VERSION, read,
       vault: req.vault ? Object.keys(req.vault).sort() : null, vplain: req.vault?.ENGRAM_MAIL_USER ?? null,
       vsecret: req.vault?.ENGRAM_MAIL_PASSWORD ?? null }) }) + '\\n')
@@ -203,10 +203,32 @@ describe('app backends', () => {
     expect(json(await s.handle(call(v, '/items', { fill }))).pid).toBe(first.pid);
 
     // Re-sealed in place: same secret id, field and space, so the fill is identical.
-    store.add({ id: 'sec-1', spaceId: 'space-1', itemId: 'item-1', field: 'password', value: 'new-sealed-value' });
+    store.add({ id: 'sec-1', spaceId: 'space-1', itemId: 'item-1', field: 'password', value: 'new-sealed-value-2' });
     const after = json(await s.handle(call(v, '/items', { fill })));
     expect(after.pid).not.toBe(first.pid);
     expect(after.secret).toBe('[redacted: ENGRAM_MAIL_PASSWORD]');
+    // The new value, not the old one, is what the fresh process holds.
+    expect(first.slen).toBe('old-sealed-value'.length);
+    expect(after.slen).toBe('new-sealed-value'.length + 2);
+    expect(s.list()).toHaveLength(1);
+  });
+
+  it('start one process, not two, for concurrent calls that meet a re-sealed value', async () => {
+    const store = new SecretStore();
+    store.add({ id: 'sec-1', spaceId: 'space-1', itemId: 'item-1', field: 'password', value: 'old-sealed-value' });
+    const delays: number[] = [];
+    const s = supervisor({ secrets: async () => { await new Promise((r) => setTimeout(r, delays.shift() ?? 0)); return store; } });
+    const v = version(12);
+    const fill = [{ role: 'mail', item_id: 'item-1', space_id: 'space-1', fields: { user: 'me@example.test' },
+      sealed: [{ field: 'password', secret_id: 'sec-1', space_id: 'space-1' }] }];
+    const first = json(await s.handle(call(v, '/items', { fill })));
+    store.add({ id: 'sec-1', spaceId: 'space-1', itemId: 'item-1', field: 'password', value: 'new-sealed-value-2' });
+    // The second call's values arrive long after the first has replaced the process.
+    delays.push(0, 600);
+    const [a, b] = await Promise.all([s.handle(call(v, '/items', { fill })), s.handle(call(v, '/items', { fill }))]);
+    const ja = json(a), jb = json(b);
+    expect(ja.pid).not.toBe(first.pid);
+    expect(jb.pid).toBe(ja.pid);
     expect(s.list()).toHaveLength(1);
   });
 
