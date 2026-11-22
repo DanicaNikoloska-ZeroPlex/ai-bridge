@@ -178,9 +178,11 @@ export class CodexAdapter extends ProviderAdapter {
     // Wire up the bridge's MCP server. Server-declared tools are reached
     // through that channel only — Codex's own built-in `shell` tool is left
     // at its default sandbox (read-only, no network) unless the operator
-    // opted into `native` mode. With sandbox_mode=read-only and no
-    // approval_policy override the model cannot run arbitrary shell against
-    // the bridge operator's machine even with a creatively-worded prompt.
+    // opted into `native` mode. sandbox_mode=read-only stops writes and
+    // network, not reads: a shell command can still read any file the user
+    // can (the machine-secrets store included, docs/isolation.md), and with
+    // no approval_policy override the operator's ~/.codex/config.toml decides
+    // whether a command needs approval.
     //
     // Note: Codex's user-level `~/.codex/AGENTS.md`, skills, and plugins
     // still load in `isolated` mode (cwd is pinned but $HOME is not). Closing
@@ -555,8 +557,8 @@ export class CodexAdapter extends ProviderAdapter {
           }
           // function_call / function_call_output / local_shell_call items are
           // Codex's own internal tool execution and not relayed — in
-          // `isolated` mode local_shell_call is also blocked by the default
-          // read-only sandbox, so it should not produce useful output anyway.
+          // `isolated` mode local_shell_call runs in the read-only sandbox
+          // (no writes, no network; it can still read files).
           return;
         }
 
