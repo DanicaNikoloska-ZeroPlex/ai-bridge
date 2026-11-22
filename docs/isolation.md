@@ -159,8 +159,22 @@ model does with them. So a `workspace` or `native` turn on a machine that keeps
 secrets (`--machine-secrets`, `~/.ai-bridge/secrets`) can read them, whoever
 told the model to; the bridge warns at startup when the store is inside an
 `--allow-dir` folder or `--allow-native` is on, and does not refuse to start
-(decision 0022). An `isolated` turn has no shell and reads only its own
-attachments, so it cannot open the store with Claude's tools.
+(decision 0022). What an `isolated` turn can reach depends on the CLI:
+
+- **Claude:** no shell, and its file tools read only the turn's own
+  attachments, so it cannot open the store with Claude's tools (measured: both
+  the Read tool and `cat` in Bash were denied on a file outside the turn's
+  folder). Server-declared tools still run, and with `--local-tools` app
+  backends, and hooks in the operator's own `~/.claude` settings.
+- **Codex:** keeps a read-only shell (`sandbox_mode=read-only`), which can
+  read the store's files.
+- **Gemini:** has no lever that holds it to server tools (above), so nothing
+  keeps it from the store.
+
+A machine with secrets that must stay out of turns' reach runs Claude turns
+`isolated`, or keeps the secrets under another account; a single `isolated`
+turn (`ai_request.cli_isolation`) is refused on Codex and Gemini, never run
+wider (decision 0012).
 
 ## Checking it on your own machine
 
