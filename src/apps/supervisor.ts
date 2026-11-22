@@ -31,7 +31,7 @@
  */
 
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import { mkdir, rename, rm, writeFile, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -99,7 +99,7 @@ interface Running {
   key: string;
   app: string;
   version: number;
-  /** Which items filled which roles: a different choice is a different process. */
+  /** Which items filled which roles, and a digest of their sealed values: a different choice, or a value sealed anew, is a different process. */
   fillKey: string;
   child: ChildProcess;
   pending: Map<string, Pending>;
@@ -200,16 +200,39 @@ export class AppSupervisor {
     const key = `${call.app.space_id}:${call.app.hash}`;
     // The hosts it may reach are part of what the process was started with,
     // so a host granted or taken back starts a fresh one, as an item does.
-    const fillKey = `${fillFingerprint(call.fill)}|${JSON.stringify(hostsOf(call.backend))}|${call.backend.public_images === true}`;
+    const chosen = `${fillFingerprint(call.fill)}|${JSON.stringify(hostsOf(call.backend))}|${call.backend.public_images === true}`;
+    // What the sealed values ARE, not only which: a reconnect or a person
+    // replacing a value seals it anew under the same secret id, so the fill
+    // reads the same while the process still holds the old value (a refresh
+    // token the service has since revoked). The store is the bridge's cached
+    // one, so this costs nothing between its refreshes, and the same store
+    // fills the process if one starts. If it cannot be fetched, a process
+    // started with the same items keeps answering with what it holds.
+    let store: SecretStore;
+    try {
+      store = await this.options.secrets(sealedRefs(call.fill));
+    } catch (err) {
+      const kept = this.running.get(key);
+      if (kept && !kept.stopping && kept.fillKey.startsWith(`${chosen}|`)) {
+        log.warn('could not check whether an app backend\'s sealed values changed; it keeps the ones it has', {
+          app: call.app.name, error: err instanceof Error ? err.message : String(err) });
+        return kept;
+      }
+      throw err;
+    }
+    const fillKey = `${chosen}|${sealedDigest(store, call.fill)}`;
+    // Read only after that await, so what follows up to the first stop or
+    // start runs without yielding, as concurrent calls rely on: one that read
+    // the process before another replaced it would start a third beside it.
     const current = this.running.get(key);
     if (current && current.fillKey === fillKey && !current.stopping) return current;
-    if (current) await this.stop(current, 'its vault items or the hosts it may reach changed');
+    if (current) await this.stop(current, 'its vault items, their sealed values or the hosts it may reach changed');
 
     const inFlight = this.starting.get(key);
     if (inFlight) {
       const started = await inFlight;
       if (started.fillKey === fillKey) return started;
-      await this.stop(started, 'its vault items or the hosts it may reach changed');
+      await this.stop(started, 'its vault items, their sealed values or the hosts it may reach changed');
     }
 
     const recent = (this.crashes.get(key) ?? []).filter((t) => Date.now() - t < CRASH_WINDOW_MS);
@@ -219,14 +242,13 @@ export class AppSupervisor {
         `started again for ${CRASH_COOLDOWN_MS / 1000} seconds. Its last words are in the bridge's log.`);
     }
 
-    const start = this.start(key, fillKey, call).finally(() => this.starting.delete(key));
+    const start = this.start(key, fillKey, call, store).finally(() => this.starting.delete(key));
     this.starting.set(key, start);
     return start;
   }
 
-  private async start(key: string, fillKey: string, call: AppCallMessage): Promise<Running> {
+  private async start(key: string, fillKey: string, call: AppCallMessage, store: SecretStore): Promise<Running> {
     const dir = await this.workingCopy(call);
-    const store = await this.options.secrets(sealedRefs(call.fill));
     const filled = fillRoles(store, call.fill);
 
     const env: NodeJS.ProcessEnv = {};
@@ -498,6 +520,25 @@ export function nodeWasmHashes(node: string): Promise<string[]> {
 function fillFingerprint(fill: ItemFill[] | undefined): string {
   return JSON.stringify((fill ?? []).map((f) => [f.role, f.item_id, Object.entries(f.fields ?? {}).sort(),
     (f.sealed ?? []).map((s) => [s.field, s.secret_id, s.space_id]).sort()]).sort());
+}
+
+/**
+ * A digest of the sealed values a fill names, as the store holds them now: it
+ * changes when one is sealed anew under the same id. Never the values
+ * themselves, and keyed with a secret of this process only, so the key a
+ * process is kept under holds nothing a short value (a PIN) could be guessed
+ * back from.
+ */
+const DIGEST_KEY = randomBytes(32);
+function sealedDigest(store: SecretStore, fill: ItemFill[] | undefined): string {
+  const refs = sealedRefs(fill);
+  if (!refs.length) return '';
+  const h = createHmac('sha256', DIGEST_KEY);
+  for (const r of [...refs].sort((a, b) => `${a.space_id}:${a.secret_id}`.localeCompare(`${b.space_id}:${b.secret_id}`))) {
+    const held = store.byId(r.space_id, r.secret_id);
+    h.update(`${r.space_id}\0${r.secret_id}\0${held ? '1' : '0'}\0${held?.value ?? ''}\0`);
+  }
+  return h.digest('hex');
 }
 
 /** `~/x` is the person's home; everything else must already be absolute. */
