@@ -996,7 +996,7 @@ instead of asking GitHub, which would cost a call. The answer is one entry:
   absent when `GH_TOKEN`, `GITHUB_TOKEN` or another `GH_HOST` is in use, because the hosts file
   does not name that account.
 - **`no_credential`** — no `gh`, nobody signed in, or a revoked token (HTTP 401). **`failed`** —
-  anything else (a timeout, an unreadable answer). A bridge that predates this answers
+  anything else (a timeout, an unreadable answer, a proxy asking for its own sign-in: HTTP 407). A bridge that predates this answers
   `unsupported`, so a server can tell "too old" from "not signed in".
 
 ---

@@ -8,7 +8,7 @@
 
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { Bridge } from '../../src/bridge.js';
 import type { ProviderAdapter } from '../../src/providers/base.js';
@@ -45,7 +45,7 @@ describe('activeGitHubLogin', () => {
   it('follows GH_CONFIG_DIR like gh does', async () => {
     const path = await hosts('github.com:\n    user: from-config-dir\n');
     const before = process.env['GH_CONFIG_DIR'];
-    process.env['GH_CONFIG_DIR'] = path.replace(/\/hosts\.yml$/, '');
+    process.env['GH_CONFIG_DIR'] = dirname(path);
     try {
       expect(await activeGitHubLogin()).toBe('from-config-dir');
     } finally {
@@ -112,6 +112,30 @@ describe('readGitHubUsage', () => {
     } finally {
       if (before === undefined) delete process.env['GH_TOKEN'];
       else process.env['GH_TOKEN'] = before;
+    }
+  });
+
+  it('a proxy asking for its own sign-in (407): failed, not no_credential', async () => {
+    const answer = await readGitHubUsage(async () => {
+      throw Object.assign(new Error('exit 1'), { code: 1, stderr: 'error connecting to api.github.com: Proxy Authentication Required (407)' });
+    });
+    expect(answer).toEqual({ ok: false, reason: 'failed' });
+  });
+
+  it('follows XDG_CONFIG_HOME when GH_CONFIG_DIR is not set', async () => {
+    const path = await hosts('github.com:\n    user: from-xdg\n');
+    const saved = { gh: process.env['GH_CONFIG_DIR'], xdg: process.env['XDG_CONFIG_HOME'] };
+    delete process.env['GH_CONFIG_DIR'];
+    const xdg = await mkdtemp(join(tmpdir(), 'xdg-'));
+    const { mkdir, copyFile } = await import('node:fs/promises');
+    await mkdir(join(xdg, 'gh'));
+    await copyFile(path, join(xdg, 'gh', 'hosts.yml'));
+    process.env['XDG_CONFIG_HOME'] = xdg;
+    try {
+      expect(await activeGitHubLogin()).toBe('from-xdg');
+    } finally {
+      if (saved.gh === undefined) delete process.env['GH_CONFIG_DIR']; else process.env['GH_CONFIG_DIR'] = saved.gh;
+      if (saved.xdg === undefined) delete process.env['XDG_CONFIG_HOME']; else process.env['XDG_CONFIG_HOME'] = saved.xdg;
     }
   });
 

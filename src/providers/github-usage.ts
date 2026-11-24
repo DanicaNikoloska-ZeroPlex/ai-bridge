@@ -15,8 +15,19 @@ export const GITHUB_USAGE_PROVIDER = 'github';
 /** How long to wait on `gh` before giving up. Studio asks every few minutes; nobody waits on this. */
 const REQUEST_TIMEOUT_MS = 10_000;
 
-/** Where `gh` keeps its sign-in, honouring GH_CONFIG_DIR like `gh` itself does. */
-const GH_HOSTS = () => join(process.env['GH_CONFIG_DIR'] || join(homedir(), '.config', 'gh'), 'hosts.yml');
+/**
+ * Where `gh` keeps its sign-in, in `gh`'s own order: GH_CONFIG_DIR, then XDG_CONFIG_HOME/gh, then
+ * %AppData%/GitHub CLI on Windows, then ~/.config/gh. The wrong file would name an older login.
+ */
+const GH_HOSTS = (): string => {
+  const env = process.env;
+  const dir =
+    env['GH_CONFIG_DIR'] ||
+    (env['XDG_CONFIG_HOME'] ? join(env['XDG_CONFIG_HOME'], 'gh') : '') ||
+    (process.platform === 'win32' && env['AppData'] ? join(env['AppData'], 'GitHub CLI') : '') ||
+    join(homedir(), '.config', 'gh');
+  return join(dir, 'hosts.yml');
+};
 
 /**
  * What is left of the GitHub API allowance of the account this machine's AI sessions use.
@@ -26,8 +37,8 @@ const GH_HOSTS = () => join(process.env['GH_CONFIG_DIR'] || join(homedir(), '.co
  * counted against the allowance, and the login is read from `gh`'s own sign-in file rather than
  * asked (`gh auth status` would cost a call). The token never leaves the machine; only figures do.
  *
- * `no_credential` when `gh` is missing, nobody is signed in, or the token is revoked (HTTP 401);
- * `failed` for anything else.
+ * `no_credential` when `gh` is missing, nobody is signed in, or GitHub refuses the token (HTTP
+ * 401); `failed` for anything else, including a proxy that asks for its own sign-in (HTTP 407).
  */
 export async function readGitHubUsage(run: RunGh = runGh): Promise<UsageAnswer> {
   let raw: string;
@@ -35,7 +46,7 @@ export async function readGitHubUsage(run: RunGh = runGh): Promise<UsageAnswer> 
     raw = await run(['api', 'rate_limit']);
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { stderr?: string };
-    if (e.code === 'ENOENT' || /auth login|not logged in|authentication|HTTP 401|bad credentials/i.test(e.stderr ?? '')) {
+    if (e.code === 'ENOENT' || /gh auth login|not logged in|HTTP 401\b/i.test(e.stderr ?? '')) {
       return { ok: false, reason: 'no_credential' };
     }
     log.debug('Could not read the GitHub rate limit', { error: e.message });
