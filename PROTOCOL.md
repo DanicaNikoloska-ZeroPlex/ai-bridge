@@ -979,6 +979,26 @@ mistaken for a bill by anything downstream.
 `GET https://api.anthropic.com/api/oauth/usage`. The token is re-read on every request
 because the CLI refreshes it in place. Other CLIs answer `unsupported`.
 
+**GitHub.** `provider: "github"` is not a CLI: it asks for the hourly API allowance of the
+GitHub account `gh` on this machine is signed in as (5,000 calls an hour, shared by everything
+that account runs). `readGitHubUsage()` runs `gh api rate_limit`, which GitHub does not count
+against the allowance, and reads the login from `gh`'s `hosts.yml` (honouring `GH_CONFIG_DIR`)
+instead of asking GitHub, which would cost a call. The answer is one entry:
+
+```json
+{ "label": "GitHub API", "kind": "github_core", "percent": 85, "remaining": 750, "limit": 5000,
+  "resets_at": "2026-11-24T10:31:25.000Z", "account": "some-login" }
+```
+
+- **`remaining`** / **`limit`** — calls left in the hour and the hour's size. Optional fields,
+  present only on allowances counted in calls.
+- **`account`** — the login, present only when `gh` answered from its own github.com sign-in;
+  absent when `GH_TOKEN`, `GITHUB_TOKEN` or another `GH_HOST` is in use, because the hosts file
+  does not name that account.
+- **`no_credential`** — no `gh`, nobody signed in, or a revoked token (HTTP 401). **`failed`** —
+  anything else (a timeout, an unreadable answer). A bridge that predates this answers
+  `unsupported`, so a server can tell "too old" from "not signed in".
+
 ---
 
 ## AI Requests
@@ -3001,6 +3021,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 
 - `0.x` — Pre-release, breaking changes allowed between minor versions
 - `1.x` — Stable, semantic versioning applies
+
+**GitHub usage does not bump the version.** `provider: "github"` and the `remaining`, `limit` and `account` fields on a usage limit are additive: an older bridge answers `unsupported`, and an older server ignores the fields.
 
 **Helper activity does not bump the version either.** `parent_tool_use_id` on `block_start` and `tool_result`, the `task` stream event and `done.subagent_stats` are additive: absent means what it always meant, and a consumer ignores an event it does not know.
 

@@ -1,5 +1,5 @@
 /**
- * The GitHub API allowance a usage_request with provider `github` reports (D10042).
+ * The GitHub API allowance a usage_request with provider `github` reports.
  *
  * Worth guarding: it must cost no API call (rate_limit is free; the login comes from gh's own
  * file, never `gh auth status`), it must never answer for an account it cannot name the way gh
@@ -27,14 +27,31 @@ async function hosts(content: string): Promise<string> {
 describe('activeGitHubLogin', () => {
   it('reads the active account, not a nested users entry', async () => {
     const path = await hosts(
-      'github.com:\n    users:\n        old-account:\n            oauth_token: x\n        Danica-ZP:\n            oauth_token: y\n    user: Danica-ZP\n    oauth_token: y\n    git_protocol: https\n',
+      'github.com:\n    users:\n        old-account:\n            oauth_token: x\n        current-account:\n            oauth_token: y\n    user: current-account\n    oauth_token: y\n    git_protocol: https\n',
     );
-    expect(await activeGitHubLogin(path)).toBe('Danica-ZP');
+    expect(await activeGitHubLogin(path)).toBe('current-account');
   });
 
   it('ignores another host', async () => {
     const path = await hosts('git.example.org:\n    user: someone\n');
     expect(await activeGitHubLogin(path)).toBeNull();
+  });
+
+  it('accepts an underscore login (Enterprise Managed Users)', async () => {
+    const path = await hosts('github.com:\n    user: name_short\n');
+    expect(await activeGitHubLogin(path)).toBe('name_short');
+  });
+
+  it('follows GH_CONFIG_DIR like gh does', async () => {
+    const path = await hosts('github.com:\n    user: from-config-dir\n');
+    const before = process.env['GH_CONFIG_DIR'];
+    process.env['GH_CONFIG_DIR'] = path.replace(/\/hosts\.yml$/, '');
+    try {
+      expect(await activeGitHubLogin()).toBe('from-config-dir');
+    } finally {
+      if (before === undefined) delete process.env['GH_CONFIG_DIR'];
+      else process.env['GH_CONFIG_DIR'] = before;
+    }
   });
 
   it('is null without a hosts file', async () => {
@@ -79,6 +96,25 @@ describe('readGitHubUsage', () => {
     expect(answer).toEqual({ ok: false, reason: 'no_credential' });
   });
 
+  it('a revoked or bad token: no_credential, not failed', async () => {
+    const answer = await readGitHubUsage(async () => {
+      throw Object.assign(new Error('exit 1'), { code: 1, stderr: 'HTTP 401: Bad credentials (https://api.github.com/rate_limit)' });
+    });
+    expect(answer).toEqual({ ok: false, reason: 'no_credential' });
+  });
+
+  it('names no account when gh answers for a token in the environment', async () => {
+    const before = process.env['GH_TOKEN'];
+    process.env['GH_TOKEN'] = 'not-a-real-token';
+    try {
+      const answer = await readGitHubUsage(async () => RATE);
+      expect(answer.ok && answer.limits[0]?.account).toBeFalsy();
+    } finally {
+      if (before === undefined) delete process.env['GH_TOKEN'];
+      else process.env['GH_TOKEN'] = before;
+    }
+  });
+
   it('timeout or other error: failed', async () => {
     const answer = await readGitHubUsage(async () => {
       throw Object.assign(new Error('timed out'), { killed: true, signal: 'SIGTERM' });
@@ -93,7 +129,11 @@ describe('readGitHubUsage', () => {
 });
 
 describe('usage_request with provider github', () => {
-  it('is answered exactly once, also on a machine whose only CLI is claude', async () => {
+  it('is answered exactly once with the reading, also on a machine whose only CLI is claude', async () => {
+    const reading = { ok: true as const, limits: [{ label: 'GitHub API', kind: 'github_core', percent: 85, remaining: 750, limit: 5000, account: 'current-account' }] };
+    const module = await import('../../src/providers/github-usage.js');
+    const spy = vi.spyOn(module, 'readGitHubUsage').mockResolvedValue(reading);
+
     const bridge = new Bridge({
       serverUrl: 'wss://example.test/bridge',
       token: 'irrelevant',
@@ -109,11 +149,8 @@ describe('usage_request with provider github', () => {
 
     inner.onMessage(Buffer.from(JSON.stringify({ type: 'usage_request', id: 'g1', provider: 'github' })));
 
-    await vi.waitFor(() => expect(sent).toHaveLength(1), { timeout: 15_000 });
-    const answer = sent[0] as UsageResultMessage;
-    expect(answer.type).toBe('usage_result');
-    expect(answer.id).toBe('g1');
-    // Whatever this machine's gh says, it is never the Claude path's "unsupported".
-    expect(answer.reason).not.toBe('unsupported');
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    expect(sent[0] as UsageResultMessage).toEqual({ type: 'usage_result', id: 'g1', ok: true, limits: reading.limits });
+    spy.mockRestore();
   });
 });

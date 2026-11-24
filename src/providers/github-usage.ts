@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { createLogger } from '../utils/logger.js';
+import { stripCredentials } from './env.js';
 import type { UsageAnswer } from './usage.js';
 
 const log = createLogger('github-usage');
@@ -33,7 +34,7 @@ export async function readGitHubUsage(run: RunGh = runGh): Promise<UsageAnswer> 
     raw = await run(['api', 'rate_limit']);
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { stderr?: string };
-    if (e.code === 'ENOENT' || /auth login|not logged in|authentication/i.test(e.stderr ?? '')) {
+    if (e.code === 'ENOENT' || /auth login|not logged in|authentication|401|bad credentials/i.test(e.stderr ?? '')) {
       return { ok: false, reason: 'no_credential' };
     }
     log.debug('Could not read the GitHub rate limit', { error: e.message });
@@ -54,7 +55,10 @@ export async function readGitHubUsage(run: RunGh = runGh): Promise<UsageAnswer> 
     return { ok: false, reason: 'failed' };
   }
 
-  const account = await activeGitHubLogin();
+  // The login names the account only when gh used its own sign-in for these figures: with a
+  // token in the environment, or another host, the figures belong to an account the hosts
+  // file does not name. Then no name rather than a wrong one.
+  const account = usesOwnSignIn() ? await activeGitHubLogin() : null;
 
   return {
     ok: true,
@@ -84,16 +88,26 @@ export async function activeGitHubLogin(path: string = GH_HOSTS()): Promise<stri
   // hosts.yml: a `github.com:` block whose direct `user:` key (4 spaces in) is the active account.
   // Nested `users:` entries sit deeper and are never matched.
   const block = /^github\.com:\s*\n((?:[ \t]+.*\n?)*)/m.exec(text)?.[1] ?? '';
-  const user = /^ {4}user:\s*["']?([A-Za-z0-9-]+)["']?\s*$/m.exec(block)?.[1];
+  const user = /^ {4}user:\s*["']?([A-Za-z0-9_-]+)["']?\s*$/m.exec(block)?.[1];
 
   return user ?? null;
+}
+
+/** Whether gh answers from its own github.com sign-in, the one the hosts file names. */
+function usesOwnSignIn(): boolean {
+  const host = process.env['GH_HOST'];
+  return !process.env['GH_TOKEN'] && !process.env['GITHUB_TOKEN'] && (!host || host === 'github.com');
 }
 
 export type RunGh = (args: string[]) => Promise<string>;
 
 function runGh(args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile('gh', args, { timeout: REQUEST_TIMEOUT_MS, env: { ...process.env, GH_PROMPT_DISABLED: '1' } }, (err, stdout, stderr) => {
+    execFile('gh', args, {
+        timeout: REQUEST_TIMEOUT_MS,
+        // The bridge's own credentials never reach a spawned process.
+        env: stripCredentials({ ...process.env, GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1' }),
+      }, (err, stdout, stderr) => {
       if (err) {
         reject(Object.assign(err, { stderr: String(stderr ?? '') }));
         return;

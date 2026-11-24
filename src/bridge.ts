@@ -1202,12 +1202,6 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * sent ten calls can tell which one answered.
    */
   /**
-   * Answer a usage_request, once, whatever happens.
-   *
-   * Never throws and never stays silent: an unanswered request leaves the asker waiting out
-   * a timeout and then unable to tell "this bridge is too old" from "the vendor was slow".
-   */
-  /**
    * Which CLI a usage_request is about, or null when that cannot be known.
    *
    * The server's answer wins when it gives one. Otherwise this only answers for a machine
@@ -1225,7 +1219,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
 
   private handleUsageRequestMessage(message: UsageRequestMessage): void {
     // Not a CLI: the GitHub account this machine's AI sessions use, whose hourly API
-    // allowance is shared by everything that person runs (D10042). Asked by name only.
+    // allowance is shared by everything that person runs. Asked by name only.
     if (message.provider === GITHUB_USAGE_PROVIDER) {
       this.answerUsage(message.id, readGitHubUsage());
       return;
@@ -1245,7 +1239,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.answerUsage(message.id, readClaudeUsage());
   }
 
-  /** Send exactly one usage_result for this id, whatever the reading does. */
+  /**
+   * Answer a usage_request, once, whatever happens.
+   *
+   * Never throws and never stays silent: an unanswered request leaves the asker waiting out
+   * a timeout and then unable to tell "this bridge is too old" from "the vendor was slow".
+   */
   private answerUsage(id: string, reading: Promise<UsageAnswer>): void {
     reading.then(
       (answer) => {
