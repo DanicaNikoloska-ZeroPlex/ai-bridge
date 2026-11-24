@@ -26,7 +26,8 @@ const GH_HOSTS = () => join(process.env['GH_CONFIG_DIR'] || join(homedir(), '.co
  * counted against the allowance, and the login is read from `gh`'s own sign-in file rather than
  * asked (`gh auth status` would cost a call). The token never leaves the machine; only figures do.
  *
- * `no_credential` when `gh` is missing or nobody is signed in; `failed` for anything else.
+ * `no_credential` when `gh` is missing, nobody is signed in, or the token is revoked (HTTP 401);
+ * `failed` for anything else.
  */
 export async function readGitHubUsage(run: RunGh = runGh): Promise<UsageAnswer> {
   let raw: string;
@@ -34,7 +35,7 @@ export async function readGitHubUsage(run: RunGh = runGh): Promise<UsageAnswer> 
     raw = await run(['api', 'rate_limit']);
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { stderr?: string };
-    if (e.code === 'ENOENT' || /auth login|not logged in|authentication|401|bad credentials/i.test(e.stderr ?? '')) {
+    if (e.code === 'ENOENT' || /auth login|not logged in|authentication|HTTP 401|bad credentials/i.test(e.stderr ?? '')) {
       return { ok: false, reason: 'no_credential' };
     }
     log.debug('Could not read the GitHub rate limit', { error: e.message });
