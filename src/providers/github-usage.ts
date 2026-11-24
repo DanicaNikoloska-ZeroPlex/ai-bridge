@@ -33,7 +33,8 @@ const GH_HOSTS = (): string => {
  * What is left of the GitHub API allowance of the account this machine's AI sessions use.
  *
  * GitHub allows 5,000 calls an hour per ACCOUNT, shared by every session, machine and token of
- * that person, and only reports the total left. Asking costs nothing: `gh api rate_limit` is not
+ * that person, and only reports the total left. It keeps two such budgets, REST (`core`) and
+ * GraphQL (`graphql`); both are reported. Asking costs nothing: `gh api rate_limit` is not
  * counted against the allowance, and the login is read from `gh`'s own sign-in file rather than
  * asked (`gh auth status` would cost a call). The token never leaves the machine; only figures do.
  *
@@ -53,17 +54,10 @@ export async function readGitHubUsage(run: RunGh = runGh): Promise<UsageAnswer> 
     return { ok: false, reason: 'failed' };
   }
 
-  let core: { limit?: unknown; remaining?: unknown; reset?: unknown } | undefined;
+  let resources: Record<string, Bucket | undefined> | undefined;
   try {
-    core = (JSON.parse(raw) as { resources?: { core?: typeof core } }).resources?.core;
+    resources = (JSON.parse(raw) as { resources?: Record<string, Bucket | undefined> }).resources;
   } catch {
-    return { ok: false, reason: 'failed' };
-  }
-
-  const limit = core?.limit;
-  const remaining = core?.remaining;
-  const reset = core?.reset;
-  if (typeof limit !== 'number' || typeof remaining !== 'number' || limit <= 0) {
     return { ok: false, reason: 'failed' };
   }
 
@@ -72,21 +66,42 @@ export async function readGitHubUsage(run: RunGh = runGh): Promise<UsageAnswer> 
   // file does not name. Then no name rather than a wrong one.
   const account = usesOwnSignIn() ? await activeGitHubLogin() : null;
 
-  return {
-    ok: true,
-    limits: [
+  // GitHub keeps two hourly budgets per account and running out of either locks the person out
+  // of part of their work: the REST API (`core`, Composer and most tools) and GraphQL
+  // (`graphql`, spent by `gh pr` and friends). Each becomes its own entry; one that is missing
+  // or unreadable is left out, and an answer with neither is `failed`.
+  const limits = BUCKETS.flatMap(({ resource, label, kind }) => {
+    const bucket = resources?.[resource];
+    const limit = bucket?.limit;
+    const remaining = bucket?.remaining;
+    const reset = bucket?.reset;
+    if (typeof limit !== 'number' || typeof remaining !== 'number' || limit <= 0) {
+      return [];
+    }
+
+    return [
       {
-        label: 'GitHub API',
-        kind: 'github_core',
+        label,
+        kind,
         percent: Math.min(100, Math.max(0, Math.round(((limit - remaining) / limit) * 100))),
         remaining,
         limit,
         ...(typeof reset === 'number' ? { resets_at: new Date(reset * 1000).toISOString() } : {}),
         ...(account ? { account } : {}),
       },
-    ],
-  };
+    ];
+  });
+
+  return limits.length > 0 ? { ok: true, limits } : { ok: false, reason: 'failed' };
 }
+
+type Bucket = { limit?: unknown; remaining?: unknown; reset?: unknown };
+
+/** The budgets reported, in this order: `resources.<resource>` of `gh api rate_limit`. */
+const BUCKETS = [
+  { resource: 'core', label: 'GitHub API', kind: 'github_core' },
+  { resource: 'graphql', label: 'GitHub GraphQL API', kind: 'github_graphql' },
+] as const;
 
 /** The active github.com login from `gh`'s hosts file, or null. Never calls GitHub. */
 export async function activeGitHubLogin(path: string = GH_HOSTS()): Promise<string | null> {

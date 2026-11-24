@@ -979,25 +979,31 @@ mistaken for a bill by anything downstream.
 `GET https://api.anthropic.com/api/oauth/usage`. The token is re-read on every request
 because the CLI refreshes it in place. Other CLIs answer `unsupported`.
 
-**GitHub.** `provider: "github"` is not a CLI: it asks for the hourly API allowance of the
-GitHub account `gh` on this machine is signed in as (5,000 calls an hour, shared by everything
-that account runs). `readGitHubUsage()` runs `gh api rate_limit`, which GitHub does not count
-against the allowance, and reads the login from `gh`'s `hosts.yml` (honouring `GH_CONFIG_DIR`)
-instead of asking GitHub, which would cost a call. The answer is one entry:
+**GitHub.** `provider: "github"` is not a CLI: it asks for the hourly API allowances of the
+GitHub account `gh` on this machine is signed in as (5,000 an hour each, shared by everything
+that account runs). GitHub keeps two: the REST API (`core`, used by Composer and most tools) and
+GraphQL (`graphql`, spent by `gh pr` and similar commands); running out of either locks the
+account out of part of its work. `readGitHubUsage()` runs `gh api rate_limit`, which GitHub does
+not count against either allowance, and reads the login from `gh`'s `hosts.yml` (honouring
+`GH_CONFIG_DIR`) instead of asking GitHub, which would cost a call. The answer has one entry per
+allowance, REST first; one that is missing or unreadable is left out, and an answer with neither
+is `failed`:
 
 ```json
 { "label": "GitHub API", "kind": "github_core", "percent": 85, "remaining": 750, "limit": 5000,
   "resets_at": "2026-11-24T10:31:25.000Z", "account": "some-login" }
+{ "label": "GitHub GraphQL API", "kind": "github_graphql", "percent": 6, "remaining": 4700,
+  "limit": 5000, "resets_at": "2026-11-24T10:44:10.000Z", "account": "some-login" }
 ```
 
-- **`remaining`** / **`limit`** — calls left in the hour and the hour's size. Optional fields,
+- **`remaining`** / **`limit`** — calls (GraphQL: points) left in the hour and the hour's size. Optional fields,
   present only on allowances counted in calls.
 - **`account`** — the login, present only when `gh` answered from its own github.com sign-in;
   absent when `GH_TOKEN`, `GITHUB_TOKEN` or another `GH_HOST` is in use, because the hosts file
   does not name that account.
 - **`no_credential`** — no `gh`, nobody signed in, or a revoked token (HTTP 401). **`failed`** —
-  anything else (a timeout, an unreadable answer, a proxy asking for its own sign-in: HTTP 407). A bridge that predates this answers
-  `unsupported`, so a server can tell "too old" from "not signed in".
+  anything else (a timeout, an unreadable answer, a proxy asking for its own sign-in: HTTP 407).
+  A bridge that predates this answers `unsupported`, so a server can tell "too old" from "not signed in".
 
 ---
 

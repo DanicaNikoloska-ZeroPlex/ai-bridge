@@ -75,6 +75,25 @@ describe('readGitHubUsage', () => {
     });
   });
 
+  it('reports the GraphQL budget as its own entry next to the REST one', async () => {
+    const both = JSON.stringify({ resources: {
+      core: { limit: 5000, remaining: 4500, reset: 1795516285 },
+      graphql: { limit: 5000, remaining: 300, reset: 1795517000 },
+      search: { limit: 30, remaining: 1, reset: 1795516000 },
+    } });
+    const answer = await readGitHubUsage(async () => both);
+    expect(answer.ok).toBe(true);
+    if (!answer.ok) return;
+    expect(answer.limits.map((l) => l.kind)).toEqual(['github_core', 'github_graphql']);
+    expect(answer.limits[1]).toMatchObject({ label: 'GitHub GraphQL API', remaining: 300, limit: 5000, percent: 94,
+      resets_at: new Date(1795517000 * 1000).toISOString() });
+  });
+
+  it('a readable GraphQL budget still answers when the REST one is unreadable', async () => {
+    const answer = await readGitHubUsage(async () => JSON.stringify({ resources: { core: {}, graphql: { limit: 5000, remaining: 10 } } }));
+    expect(answer.ok && answer.limits.map((l) => l.kind)).toEqual(['github_graphql']);
+  });
+
   it('asks gh for rate_limit only (free), never auth status or user', async () => {
     const run = vi.fn(async () => RATE);
     await readGitHubUsage(run);
@@ -104,14 +123,22 @@ describe('readGitHubUsage', () => {
   });
 
   it('names no account when gh answers for a token in the environment', async () => {
-    const before = process.env['GH_TOKEN'];
-    process.env['GH_TOKEN'] = 'not-a-real-token';
+    // A hosts file that DOES name a login, so this fails if the guard is removed.
+    const path = await hosts('github.com:\n    user: hosts-file-login\n');
+    const before = { token: process.env['GH_TOKEN'], dir: process.env['GH_CONFIG_DIR'] };
+    process.env['GH_CONFIG_DIR'] = dirname(path);
     try {
+      const named = await readGitHubUsage(async () => RATE);
+      expect(named.ok && named.limits[0]?.account).toBe('hosts-file-login');
+
+      process.env['GH_TOKEN'] = 'not-a-real-token';
       const answer = await readGitHubUsage(async () => RATE);
       expect(answer.ok && answer.limits[0]?.account).toBeFalsy();
     } finally {
-      if (before === undefined) delete process.env['GH_TOKEN'];
-      else process.env['GH_TOKEN'] = before;
+      if (before.token === undefined) delete process.env['GH_TOKEN'];
+      else process.env['GH_TOKEN'] = before.token;
+      if (before.dir === undefined) delete process.env['GH_CONFIG_DIR'];
+      else process.env['GH_CONFIG_DIR'] = before.dir;
     }
   });
 
