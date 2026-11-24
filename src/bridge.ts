@@ -54,7 +54,8 @@ import { TurnInputPort } from './providers/turn-input.js';
 import { PROTOCOL_VERSION, BRIDGE_VERSION } from './protocol/version.js';
 import { ProviderAdapter, type ExecutionContext, type AdapterStreamEvent } from './providers/base.js';
 import { detectProviders } from './providers/detector.js';
-import { readClaudeUsage } from './providers/usage.js';
+import { readClaudeUsage, type UsageAnswer } from './providers/usage.js';
+import { GITHUB_USAGE_PROVIDER, readGitHubUsage } from './providers/github-usage.js';
 import { ToolResolver } from './tools/resolver.js';
 import { toolResolveAnswer } from './tools/content.js';
 import { LOCAL_EXECUTION_OFF, refusalReason, runsLocally, type LocalExecutionConfig } from './local/gate.js';
@@ -1223,6 +1224,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   }
 
   private handleUsageRequestMessage(message: UsageRequestMessage): void {
+    // Not a CLI: the GitHub account this machine's AI sessions use, whose hourly API
+    // allowance is shared by everything that person runs (D10042). Asked by name only.
+    if (message.provider === GITHUB_USAGE_PROVIDER) {
+      this.answerUsage(message.id, readGitHubUsage());
+      return;
+    }
+
     const target = this.usageTargetFor(message.provider);
 
     // Only Claude has a subscription allowance to report. Anything else, including "we cannot
@@ -1234,20 +1242,25 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       return;
     }
 
-    readClaudeUsage().then(
+    this.answerUsage(message.id, readClaudeUsage());
+  }
+
+  /** Send exactly one usage_result for this id, whatever the reading does. */
+  private answerUsage(id: string, reading: Promise<UsageAnswer>): void {
+    reading.then(
       (answer) => {
         this.send(
           answer.ok
-            ? { type: 'usage_result', id: message.id, ok: true, limits: answer.limits }
-            : { type: 'usage_result', id: message.id, ok: false, reason: answer.reason },
+            ? { type: 'usage_result', id, ok: true, limits: answer.limits }
+            : { type: 'usage_result', id, ok: false, reason: answer.reason },
         );
       },
       (err: unknown) => {
         log.error('could not answer a usage_request', {
-          id: message.id,
+          id,
           error: err instanceof Error ? err.message : String(err),
         });
-        this.send({ type: 'usage_result', id: message.id, ok: false, reason: 'failed' });
+        this.send({ type: 'usage_result', id, ok: false, reason: 'failed' });
       },
     );
   }

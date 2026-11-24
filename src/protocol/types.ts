@@ -623,6 +623,10 @@ export interface UsageLimitFrame {
   resets_at?: string;
   kind?: string;
   group?: string;
+  /** GitHub: calls left in the hour, the hour's size, and the login it belongs to. */
+  remaining?: number;
+  limit?: number;
+  account?: string;
 }
 
 /**

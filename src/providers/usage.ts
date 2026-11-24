@@ -28,6 +28,12 @@ export interface UsageLimit {
   kind?: string;
   /** Coarse grouping the CLI puts the window in (e.g. session, weekly). */
   group?: string;
+  /** Calls left in this window, for allowances counted in calls (GitHub). */
+  remaining?: number;
+  /** Size of the window, for allowances counted in calls (GitHub). */
+  limit?: number;
+  /** The account the allowance belongs to, when it is not the CLI's own (GitHub login). */
+  account?: string;
 }
 
 export type UsageAnswer =
